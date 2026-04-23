@@ -1,0 +1,79 @@
+{
+  "name": "niftispy",
+  "displayName": "NiftiSpy",
+  "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
+  "version": "1.0.0",
+  "publisher": "MaiwulanjiangMaiming",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/MaiwulanjiangMaiming/NiftiSpy"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Visualization"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "niftispy.nifti",
+        "displayName": "NiftiSpy",
+        "selector": [
+          {
+            "filenamePattern": "*.nii"
+          },
+          {
+            "filenamePattern": "*.nii.gz"
+          },
+          {
+            "filenamePattern": "*.hdr"
+          }
+        ],
+        "priority": "default"
+      }
+    ],
+    "configuration": {
+      "title": "NIfTI Fast View",
+      "properties": {
+        "niiFastView.proxyPort": {
+          "type": "number",
+          "default": 0,
+          "description": "HTTP proxy port (0 = auto assign)"
+        },
+        "niiFastView.defaultColormap": {
+          "type": "string",
+          "default": "gray",
+          "enum": ["gray", "hot", "cool", "viridis", "jet", "inferno"],
+          "description": "Default colormap"
+        },
+        "niiFastView.enableLOD": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable progressive LOD loading for .nii.gz"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build:ext": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=dist/extension.js --sourcemap",
+    "build:viewer": "esbuild webview/viewer.ts --bundle --platform=browser --target=es2020 --outfile=dist/viewer.js --sourcemap",
+    "build:worker": "esbuild webview/worker.ts --bundle --platform=browser --target=es2020 --outfile=dist/worker.js --sourcemap",
+    "build": "npm run build:ext && npm run build:viewer && npm run build:worker",
+    "watch": "concurrently \"npm run build:ext -- --watch\" \"npm run build:viewer -- --watch\" \"npm run build:worker -- --watch\"",
+    "package": "npm run build && vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "concurrently": "^8.2.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "fflate": "^0.8.2"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.vsix
+.vscode/
+.claude/
+good-examples/
+*.nii
+*.nii.gz
+*.hdr
+.DS_Store
+Thumbs.db
+*.map
