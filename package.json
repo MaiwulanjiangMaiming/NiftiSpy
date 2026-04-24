@@ -16,7 +16,9 @@
   "categories": [
     "Visualization"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onCustomEditor:niftispy.nifti"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "customEditors": [
