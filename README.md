@@ -7,6 +7,7 @@
 **High-performance NIfTI medical image viewer for VS Code**
 
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.85+-blue?logo=visualstudiocode)](https://code.visualstudio.com/)
+[![Open VSX](https://img.shields.io/badge/Open%20VSX-niftispy-blue?logo=eclipse)](https://open-vsx.org/extension/maiwulanjiangmaiming/niftispy)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-NiftiSpy-181717?logo=github)](https://github.com/MaiwulanjiangMaiming/NiftiSpy)
 

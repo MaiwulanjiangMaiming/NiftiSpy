@@ -14,8 +14,23 @@
     "vscode": "^1.85.0"
   },
   "categories": [
-    "Visualization"
+    "Visualization",
+    "Data Science",
+    "Machine Learning"
   ],
+  "keywords": [
+    "nifti",
+    "nii",
+    "medical imaging",
+    "neuroimaging",
+    "brain",
+    "mri",
+    "viewer"
+  ],
+  "homepage": "https://github.com/MaiwulanjiangMaiming/NiftiSpy",
+  "bugs": {
+    "url": "https://github.com/MaiwulanjiangMaiming/NiftiSpy/issues"
+  },
   "activationEvents": [
     "onCustomEditor:niftispy.nifti"
   ],
