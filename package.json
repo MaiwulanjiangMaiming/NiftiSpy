@@ -36,6 +36,24 @@
         "priority": "default"
       }
     ],
+    "languages": [
+      {
+        "id": "nifti",
+        "aliases": ["NIfTI"],
+        "extensions": [".nii", ".nii.gz", ".hdr"],
+        "icon": {
+          "light": "./File-Icons-clean.png",
+          "dark": "./File-Icons-clean.png"
+        }
+      }
+    ],
+    "iconThemes": [
+      {
+        "id": "niftispy-icons",
+        "label": "NiftiSpy File Icons",
+        "path": "./dist/niftispy-icon-theme.json"
+      }
+    ],
     "configuration": {
       "title": "NIfTI Fast View",
       "properties": {

@@ -202,16 +202,10 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 .image-item-name{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .image-item-remove{width:16px;height:16px;background:rgba(255,71,87,.2);border:1px solid var(--danger);border-radius:2px;color:var(--danger);cursor:pointer;font-size:8px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .image-item-remove:hover{background:var(--danger);color:#fff}
-#main.compare-mode #views{grid-template-columns:1fr 1fr!important;grid-template-rows:1fr 1fr!important}
-#main.compare-mode #sidebar{width:0!important;min-width:0!important;overflow:hidden;padding:0!important;border:none!important}
-#main.compare-mode #sidebar-toggle{display:flex!important;right:0!important}
-#compare-views{display:none;flex:1;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr 1fr;gap:2px;background:var(--bg);padding:2px}
-#main.compare-mode #views{display:none!important}
-#main.compare-mode #compare-views{display:grid!important}
-.cmp-vc{position:relative;overflow:hidden;background:#000;display:flex;align-items:center;justify-content:center}
-.cmp-vc canvas{display:block;image-rendering:pixelated;cursor:crosshair}
-.cmp-label{position:absolute;top:5px;left:8px;font-size:12px;color:var(--success);pointer-events:none;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5}
-.cmp-name{position:absolute;top:5px;right:8px;font-size:10px;color:var(--accent);pointer-events:none;font-family:monospace;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5}
+.overlay-label{position:absolute;bottom:40px;right:8px;font-size:9px;color:var(--warning);pointer-events:none;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5;background:rgba(0,0,0,.6);padding:2px 6px;border-radius:3px;display:none;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sbs-label{position:absolute;top:22px;font-size:8px;pointer-events:none;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:2px;display:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sbs-label-l{left:4px;color:var(--success)}
+.sbs-label-r{right:4px;color:var(--warning)}
 </style>
 </head>
 <body>
@@ -222,28 +216,19 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
     <div class="file-detail" id="file-detail"></div>
   </div>
   <button class="btn btn-fit" id="btn-fit" title="Zoom to Fit">Fit</button>
-  <button class="btn" id="btn-auto" title="Auto Contrast">Auto</button>
+  <button class="btn" id="btn-auto" title="Auto Contrast">Auto Contrast</button>
   <button class="btn" id="btn-reset" title="Reset View">Reset</button>
   <button class="btn" id="btn-crosshair" title="Toggle Crosshair">✛</button>
-  <div class="tg"><label>Coord</label><select id="coord-system"><option value="RAS">RAS</option><option value="LAS">LAS</option><option value="LPS">LPS</option><option value="RPS">RPS</option></select></div>
   <div class="tg"><label>W</label><input id="ww-slider" type="range" min="1" max="200" value="100"></div>
   <div class="tg"><label>L</label><input id="wl-slider" type="range" min="0" max="100" value="50"></div>
   <div class="tg"><label>Map</label><select id="colormap"><option value="gray">Gray</option><option value="hot">Hot</option><option value="cool">Cool</option><option value="jet">Jet</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option></select></div>
 </div>
 <div id="main">
   <div id="views">
-    <div class="vc" id="axial-c"><canvas id="axial"></canvas><span class="vl">Axial</span><span class="vi" id="axial-info"></span><button class="vb" data-view="axial">A</button><div class="ssc"><input id="axial-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">A</span><span class="dir-label dir-p">P</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div></div>
-    <div class="vc" id="coronal-c"><canvas id="coronal"></canvas><span class="vl">Coronal</span><span class="vi" id="coronal-info"></span><button class="vb" data-view="coronal">C</button><div class="ssc"><input id="coronal-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div></div>
-    <div class="vc" id="sagittal-c"><canvas id="sagittal"></canvas><span class="vl">Sagittal</span><span class="vi" id="sagittal-info"></span><button class="vb" data-view="sagittal">S</button><div class="ssc"><input id="sagittal-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">A</span><span class="dir-label dir-r">P</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div></div>
+    <div class="vc" id="axial-c"><canvas id="axial"></canvas><span class="vl">Axial</span><span class="vi" id="axial-info"></span><button class="vb" data-view="axial">A</button><div class="ssc"><input id="axial-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">A</span><span class="dir-label dir-p">P</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-axial"></span><span class="sbs-label sbs-label-l" id="sbs-l-axial"></span><span class="sbs-label sbs-label-r" id="sbs-r-axial"></span></div>
+    <div class="vc" id="coronal-c"><canvas id="coronal"></canvas><span class="vl">Coronal</span><span class="vi" id="coronal-info"></span><button class="vb" data-view="coronal">C</button><div class="ssc"><input id="coronal-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-coronal"></span><span class="sbs-label sbs-label-l" id="sbs-l-coronal"></span><span class="sbs-label sbs-label-r" id="sbs-r-coronal"></span></div>
+    <div class="vc" id="sagittal-c"><canvas id="sagittal"></canvas><span class="vl">Sagittal</span><span class="vi" id="sagittal-info"></span><button class="vb" data-view="sagittal">S</button><div class="ssc"><input id="sagittal-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">A</span><span class="dir-label dir-r">P</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-sagittal"></span><span class="sbs-label sbs-label-l" id="sbs-l-sagittal"></span><span class="sbs-label sbs-label-r" id="sbs-r-sagittal"></span></div>
     <div class="vc" id="mip-c"><canvas id="mip"></canvas><span class="vl">3D MIP</span><span class="vi">Drag to rotate</span><button class="vb" data-view="mip">M</button></div>
-  </div>
-  <div id="compare-views">
-    <div class="cmp-vc" id="cmp-ax0-c"><canvas id="cmp-ax0"></canvas><span class="cmp-label">Axial</span><span class="cmp-name" id="cmp-ax0-name"></span></div>
-    <div class="cmp-vc" id="cmp-ax1-c"><canvas id="cmp-ax1"></canvas><span class="cmp-label">Axial</span><span class="cmp-name" id="cmp-ax1-name"></span></div>
-    <div class="cmp-vc" id="cmp-co0-c"><canvas id="cmp-co0"></canvas><span class="cmp-label">Coronal</span><span class="cmp-name" id="cmp-co0-name"></span></div>
-    <div class="cmp-vc" id="cmp-co1-c"><canvas id="cmp-co1"></canvas><span class="cmp-label">Coronal</span><span class="cmp-name" id="cmp-co1-name"></span></div>
-    <div class="cmp-vc" id="cmp-sa0-c"><canvas id="cmp-sa0"></canvas><span class="cmp-label">Sagittal</span><span class="cmp-name" id="cmp-sa0-name"></span></div>
-    <div class="cmp-vc" id="cmp-sa1-c"><canvas id="cmp-sa1"></canvas><span class="cmp-label">Sagittal</span><span class="cmp-name" id="cmp-sa1-name"></span></div>
   </div>
   <div id="sidebar">
     <div id="sidebar-resize"></div>
@@ -257,7 +242,11 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
       <h3>Images</h3>
       <div id="image-list"></div>
       <button class="btn" id="btn-add-img" style="width:100%;margin-top:6px">+ Add Image</button>
-      <button class="btn" id="btn-compare" style="width:100%;margin-top:4px">Side-by-Side</button>
+      <button class="btn" id="btn-compare" style="width:100%;margin-top:4px">⊞ Compare</button>
+      <div id="overlay-controls" style="display:none;margin-top:4px">
+        <div class="sr"><label>Opacity:</label><input id="opacity-slider" type="range" min="0" max="100" value="50" style="flex:1"><span class="sv" id="opacity-val">50</span></div>
+        <div class="sr"><label>Color:</label><select id="overlay-colormap" style="flex:1"><option value="hot">Hot</option><option value="jet">Jet</option><option value="cool">Cool</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option><option value="gray">Gray</option></select></div>
+      </div>
     </div>
     <div class="ss">
       <h3>Pointer Info</h3>

@@ -30,12 +30,15 @@ let initialWindowLevel = 0.5;
 const sliceIdx = { axial: 0, coronal: 0, sagittal: 0 };
 let windowWidth = 1.0;
 let windowLevel = 0.5;
+let overlayOpacity = 0.5;
+let overlayColormap = 'hot';
+type CompareLayout = 'overlay' | 'sideBySide';
+let compareLayout: CompareLayout = 'overlay';
 let colormap = 'gray';
 let fileUrl = '';
 let isGzip = false;
 let fileName = '';
 let crosshairVisible = true;
-let coordSystem = 'RAS';
 
 const viewState = {
   axial: { zoom: 1, panX: 0, panY: 0 },
@@ -273,10 +276,10 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   cw = Math.floor(cw * zoom);
   ch = Math.floor(ch * zoom);
 
-  canvas.style.width = cw + 'px';
-  canvas.style.height = ch + 'px';
-  canvas.width = cw * dpr;
-  canvas.height = ch * dpr;
+  canvas.style.width = dw + 'px';
+  canvas.style.height = dh + 'px';
+  canvas.width = dw * dpr;
+  canvas.height = dh * dpr;
 
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
@@ -311,8 +314,10 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const offsetX = (canvas.width - cw * dpr) / 2;
-  const offsetY = (canvas.height + ch * dpr) / 2;
+  const imgLeft = (dw - cw) / 2 + panX;
+  const imgTop = (dh - ch) / 2 + panY;
+  const offsetX = imgLeft * dpr;
+  const offsetY = (imgTop + ch) * dpr;
   const scaleX = cw * dpr / w;
   const scaleY = -ch * dpr / h;
 
@@ -429,8 +434,8 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   imgH *= zoom;
 
   // Image position in container (centered)
-  const imgLeft = (containerRect.width - imgW) / 2 - panX;
-  const imgTop = (containerRect.height - imgH) / 2 - panY;
+  const imgLeft = (containerRect.width - imgW) / 2 + panX;
+  const imgTop = (containerRect.height - imgH) / 2 + panY;
 
   // Crosshair position in screen coordinates
   // Canvas Y is flipped relative to anatomical Y
@@ -571,6 +576,17 @@ function renderAllViews() {
   if (!header || !volumeData) return;
   const { nx, ny, nz, dx, dy, dz } = header;
 
+  if (!compareMode) {
+    ['axial', 'coronal', 'sagittal'].forEach(axis => {
+      const label = document.getElementById(`overlay-label-${axis}`);
+      if (label) label.style.display = 'none';
+      const sbsL = document.getElementById(`sbs-l-${axis}`);
+      const sbsR = document.getElementById(`sbs-r-${axis}`);
+      if (sbsL) sbsL.style.display = 'none';
+      if (sbsR) sbsR.style.display = 'none';
+    });
+  }
+
   if (compareMode && images.length >= 2) {
     renderCompareViews();
     return;
@@ -591,56 +607,62 @@ function renderAllViews() {
   paintMIP();
 
   updateAllInfo();
+  if (crosshairVisible) updateCoordInfoFromCenter();
 }
 
-function paintCompareSlice(canvasId: string, containerId: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
-  const canvas = document.getElementById(canvasId) as HTMLCanvasElement;
-  const container = document.getElementById(containerId);
-  if (!canvas || !container || !data || data.length === 0) return;
+function updateCoordInfoFromCenter() {
+  const coordEl = document.getElementById('coord-info');
+  if (!coordEl || !header || !volumeData) return;
 
-  const dpr = window.devicePixelRatio || 1;
-  const dw = container.clientWidth;
-  const dh = container.clientHeight;
-  if (dw === 0 || dh === 0) return;
+  const cx = sliceIdx.sagittal;
+  const cy = sliceIdx.coronal;
+  const cz = sliceIdx.axial;
 
-  const ar = pixelW / pixelH;
-  let cw: number, ch: number;
-  if (dw / dh > ar) { ch = dh; cw = Math.floor(dh * ar); }
-  else { cw = dw; ch = Math.floor(dw / ar); }
-
-  canvas.style.width = cw + 'px';
-  canvas.style.height = ch + 'px';
-  canvas.width = cw * dpr;
-  canvas.height = ch * dpr;
-
-  const ctx = canvas.getContext('2d')!;
-  ctx.imageSmoothingEnabled = false;
-
-  const imgData = ctx.createImageData(w, h);
-  const pixels = imgData.data;
-  const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
-  const lo = windowLevel - windowWidth * 0.5;
-  const hi = windowLevel + windowWidth * 0.5;
-  const range = hi - lo || 1;
-  const dataRange = globalMax - globalMin || 1;
-  const n = w * h;
-
-  for (let i = 0; i < n; i++) {
-    const norm = (data[i] - globalMin) / dataRange;
-    const t = Math.max(0, Math.min(1, (norm - lo) / range));
-    const [r, g, b] = cmapFn(t);
-    const idx = i * 4;
-    pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
+  if (compareMode && images.length >= 2) {
+    const img0 = images[0];
+    const img1 = images[1];
+    const h0 = img0.header;
+    const h1 = img1.header;
+    if (cx < 0 || cx >= h0.nx || cy < 0 || cy >= h0.ny || cz < 0 || cz >= h0.nz) {
+      coordEl.textContent = '';
+      return;
+    }
+    const v0 = img0.data[cz * h0.ny * h0.nx + cy * h0.nx + cx] * img0.slope + img0.inter;
+    const [wx, wy, wz] = voxelToWorld(h0, cx, cy, cz);
+    const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+    const ix1 = Math.round(vx1), iy1 = Math.round(vy1), iz1 = Math.round(vz1);
+    let v1 = '---';
+    if (ix1 >= 0 && ix1 < h1.nx && iy1 >= 0 && iy1 < h1.ny && iz1 >= 0 && iz1 < h1.nz) {
+      v1 = (img1.data[iz1 * h1.ny * h1.nx + iy1 * h1.nx + ix1] * img1.slope + img1.inter).toFixed(4);
+    }
+    coordEl.textContent = `x=${cx} y=${cy} z=${cz}\n${img0.name}: ${v0.toFixed(4)}\n${img1.name}: ${v1}`;
+    return;
   }
 
-  const tc = document.createElement('canvas');
-  tc.width = w; tc.height = h;
-  const tctx = tc.getContext('2d')!;
-  tctx.putImageData(imgData, 0, 0);
+  if (cx < 0 || cx >= header.nx || cy < 0 || cy >= header.ny || cz < 0 || cz >= header.nz) {
+    coordEl.textContent = '';
+    return;
+  }
+  const val = volumeData[cz * header.ny * header.nx + cy * header.nx + cx] * dataSlope + dataInter;
+  coordEl.textContent = `x=${cx} y=${cy} z=${cz}\nValue: ${val.toFixed(4)}`;
+}
 
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.drawImage(tc, 0, 0, canvas.width, canvas.height);
+function extractSliceFromImage(img: VolumeImage, axis: 'axial' | 'coronal' | 'sagittal', idx: number): Float32Array {
+  const savedHeader = header;
+  const savedData = volumeData;
+  const savedSlope = dataSlope;
+  const savedInter = dataInter;
+  header = img.header;
+  volumeData = img.data;
+  dataSlope = img.slope;
+  dataInter = img.inter;
+  const maxIdx = axis === 'axial' ? img.header.nz - 1 : axis === 'coronal' ? img.header.ny - 1 : img.header.nx - 1;
+  const slice = extractSlice(axis, Math.max(0, Math.min(maxIdx, idx)));
+  header = savedHeader;
+  volumeData = savedData;
+  dataSlope = savedSlope;
+  dataInter = savedInter;
+  return slice;
 }
 
 function renderCompareViews() {
@@ -650,46 +672,258 @@ function renderCompareViews() {
   const h0 = img0.header;
   const h1 = img1.header;
 
-  const savedHeader = header;
-  const savedData = volumeData;
-  const savedMin = globalMin;
-  const savedMax = globalMax;
-  const savedSlope = dataSlope;
-  const savedInter = dataInter;
-
   const [wx, wy, wz] = voxelToWorld(h0, sliceIdx.sagittal, sliceIdx.coronal, sliceIdx.axial);
   const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
-  const ax1 = Math.max(0, Math.min(h1.nz - 1, Math.round(vz1)));
-  const co1 = Math.max(0, Math.min(h1.ny - 1, Math.round(vy1)));
-  const sa1 = Math.max(0, Math.min(h1.nx - 1, Math.round(vx1)));
+  const img1Idx = {
+    axial: Math.max(0, Math.min(h1.nz - 1, Math.round(vz1))),
+    coronal: Math.max(0, Math.min(h1.ny - 1, Math.round(vy1))),
+    sagittal: Math.max(0, Math.min(h1.nx - 1, Math.round(vx1))),
+  };
 
-  header = h0; volumeData = img0.data; globalMin = img0.min; globalMax = img0.max; dataSlope = img0.slope; dataInter = img0.inter;
-  const axSlice0 = extractSlice('axial', Math.min(sliceIdx.axial, h0.nz - 1));
-  const coSlice0 = extractSlice('coronal', Math.min(sliceIdx.coronal, h0.ny - 1));
-  const saSlice0 = extractSlice('sagittal', Math.min(sliceIdx.sagittal, h0.nx - 1));
+  const axes: ('axial' | 'coronal' | 'sagittal')[] = ['axial', 'coronal', 'sagittal'];
+  for (const axis of axes) {
+    const idx0 = axis === 'axial' ? sliceIdx.axial : axis === 'coronal' ? sliceIdx.coronal : sliceIdx.sagittal;
+    const slice0 = extractSliceFromImage(img0, axis, idx0);
+    const slice1 = extractSliceFromImage(img1, axis, img1Idx[axis]);
+    const w0 = axis === 'sagittal' ? h0.ny : h0.nx;
+    const h0_ = axis === 'axial' ? h0.ny : h0.nz;
+    const pw0 = axis === 'sagittal' ? h0.ny * h0.dy : h0.nx * h0.dx;
+    const ph0 = axis === 'axial' ? h0.ny * h0.dy : h0.nz * h0.dz;
+    const w1 = axis === 'sagittal' ? h1.ny : h1.nx;
+    const h1_ = axis === 'axial' ? h1.ny : h1.nz;
+    const pw1 = axis === 'sagittal' ? h1.ny * h1.dy : h1.nx * h1.dx;
+    const ph1 = axis === 'axial' ? h1.ny * h1.dy : h1.nz * h1.dz;
 
-  header = h1; volumeData = img1.data; globalMin = img1.min; globalMax = img1.max; dataSlope = img1.slope; dataInter = img1.inter;
-  const axSlice1 = extractSlice('axial', ax1);
-  const coSlice1 = extractSlice('coronal', co1);
-  const saSlice1 = extractSlice('sagittal', sa1);
+    if (compareLayout === 'sideBySide') {
+      paintSideBySideSlice(axis, slice0, slice1, w0, h0_, w1, h1_, pw0, ph0, pw1, ph1, img0, img1);
+    } else {
+      paintOverlaySlice(axis, slice0, slice1, w0, h0_, w1, h1_, pw0, ph0, pw1, ph1, img0, img1);
+    }
 
-  header = savedHeader; volumeData = savedData; globalMin = savedMin; globalMax = savedMax; dataSlope = savedSlope; dataInter = savedInter;
+    const overlayLabel = document.getElementById(`overlay-label-${axis}`);
+    if (overlayLabel) {
+      overlayLabel.textContent = img1.name;
+      overlayLabel.style.display = compareLayout === 'overlay' ? '' : 'none';
+    }
+    const sbsL = document.getElementById(`sbs-l-${axis}`);
+    const sbsR = document.getElementById(`sbs-r-${axis}`);
+    if (sbsL) { sbsL.textContent = img0.name; sbsL.style.display = compareLayout === 'sideBySide' ? '' : 'none'; }
+    if (sbsR) { sbsR.textContent = img1.name; sbsR.style.display = compareLayout === 'sideBySide' ? '' : 'none'; }
+  }
+  paintMIP();
+  updateAllInfo();
+}
 
-  globalMin = img0.min; globalMax = img0.max;
-  paintCompareSlice('cmp-ax0', 'cmp-ax0-c', axSlice0, h0.nx, h0.ny, h0.nx * h0.dx, h0.ny * h0.dy);
-  paintCompareSlice('cmp-co0', 'cmp-co0-c', coSlice0, h0.nx, h0.nz, h0.nx * h0.dx, h0.nz * h0.dz);
-  paintCompareSlice('cmp-sa0', 'cmp-sa0-c', saSlice0, h0.ny, h0.nz, h0.ny * h0.dy, h0.nz * h0.dz);
+function renderSliceToTempCanvas(data: Float32Array, w: number, h: number, imgMin: number, imgMax: number, cmapName: string): HTMLCanvasElement {
+  const tc = document.createElement('canvas');
+  tc.width = w; tc.height = h;
+  const tctx = tc.getContext('2d')!;
+  const imgData = tctx.createImageData(w, h);
+  const pixels = imgData.data;
+  const cmapFn = COLORMAPS[cmapName] || COLORMAPS.gray;
+  const lo = windowLevel - windowWidth * 0.5;
+  const hi = windowLevel + windowWidth * 0.5;
+  const range = hi - lo || 1;
+  const dataRange = imgMax - imgMin || 1;
+  const n = w * h;
+  for (let i = 0; i < n; i++) {
+    const norm = (data[i] - imgMin) / dataRange;
+    const t = Math.max(0, Math.min(1, (norm - lo) / range));
+    const [r, g, b] = cmapFn(t);
+    const idx = i * 4;
+    pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
+  }
+  tctx.putImageData(imgData, 0, 0);
+  return tc;
+}
 
-  globalMin = img1.min; globalMax = img1.max;
-  paintCompareSlice('cmp-ax1', 'cmp-ax1-c', axSlice1, h1.nx, h1.ny, h1.nx * h1.dx, h1.ny * h1.dy);
-  paintCompareSlice('cmp-co1', 'cmp-co1-c', coSlice1, h1.nx, h1.nz, h1.nx * h1.dx, h1.nz * h1.dz);
-  paintCompareSlice('cmp-sa1', 'cmp-sa1-c', saSlice1, h1.ny, h1.nz, h1.ny * h1.dy, h1.nz * h1.dz);
-  globalMin = savedMin; globalMax = savedMax;
+function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Array,
+  w0: number, h0_: number, w1: number, h1_: number,
+  pw0: number, ph0: number, pw1: number, ph1: number,
+  img0: VolumeImage, img1: VolumeImage) {
+  const canvas = canvases[axis as keyof typeof canvases];
+  if (!canvas || !data0 || !data1) return;
 
-  const nameEl0 = document.getElementById('cmp-ax0-name');
-  const nameEl1 = document.getElementById('cmp-ax1-name');
-  if (nameEl0) nameEl0.textContent = img0.name;
-  if (nameEl1) nameEl1.textContent = img1.name;
+  const vs = viewState[axis as keyof typeof viewState] as { zoom: number; panX: number; panY: number };
+  const zoom = vs.zoom;
+  const dpr = window.devicePixelRatio || 1;
+  const container = canvas.parentElement!;
+  const dw = container.clientWidth;
+  const dh = container.clientHeight;
+  if (dw === 0 || dh === 0) return;
+
+  const ar0 = pw0 / ph0;
+  let cw: number, ch: number;
+  if (dw / dh > ar0) { ch = dh; cw = Math.floor(dh * ar0); }
+  else { cw = dw; ch = Math.floor(dw / ar0); }
+  cw = Math.floor(cw * zoom);
+  ch = Math.floor(ch * zoom);
+
+  canvas.style.width = cw + 'px';
+  canvas.style.height = ch + 'px';
+  canvas.width = cw * dpr;
+  canvas.height = ch * dpr;
+
+  const ctx = canvas.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+
+  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, colormap);
+  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, overlayColormap);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const offsetX = (canvas.width - cw * dpr) / 2;
+  const offsetY = (canvas.height + ch * dpr) / 2;
+
+  ctx.save();
+  ctx.translate(offsetX, offsetY);
+  ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
+  ctx.globalAlpha = 1.0;
+  ctx.drawImage(tc0, 0, 0);
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(offsetX, offsetY);
+  ctx.scale(cw * dpr / w1, -ch * dpr / h1_);
+  ctx.globalAlpha = overlayOpacity;
+  ctx.drawImage(tc1, 0, 0);
+  ctx.restore();
+
+  ctx.globalAlpha = 1.0;
+
+  updateDirectionLabels(axis);
+  updateCrosshair(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch);
+  updateScaleBar(axis, pw0, ph0, zoom, cw);
+  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch);
+}
+
+function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32Array,
+  w0: number, h0_: number, w1: number, h1_: number,
+  pw0: number, ph0: number, pw1: number, ph1: number,
+  img0: VolumeImage, img1: VolumeImage) {
+  const canvas = canvases[axis as keyof typeof canvases];
+  if (!canvas || !data0 || !data1) return;
+
+  const vs = viewState[axis as keyof typeof viewState] as { zoom: number; panX: number; panY: number };
+  const zoom = vs.zoom;
+  const dpr = window.devicePixelRatio || 1;
+  const container = canvas.parentElement!;
+  const dw = container.clientWidth;
+  const dh = container.clientHeight;
+  if (dw === 0 || dh === 0) return;
+
+  const halfW = Math.floor(dw / 2);
+
+  const ar0 = pw0 / ph0;
+  let cw0: number, ch0: number;
+  if (halfW / dh > ar0) { ch0 = dh; cw0 = Math.floor(dh * ar0); }
+  else { cw0 = halfW; ch0 = Math.floor(halfW / ar0); }
+  cw0 = Math.floor(cw0 * zoom);
+  ch0 = Math.floor(ch0 * zoom);
+
+  const ar1 = pw1 / ph1;
+  let cw1: number, ch1: number;
+  if (halfW / dh > ar1) { ch1 = dh; cw1 = Math.floor(dh * ar1); }
+  else { cw1 = halfW; ch1 = Math.floor(halfW / ar1); }
+  cw1 = Math.floor(cw1 * zoom);
+  ch1 = Math.floor(ch1 * zoom);
+
+  canvas.style.width = dw + 'px';
+  canvas.style.height = dh + 'px';
+  canvas.width = dw * dpr;
+  canvas.height = dh * dpr;
+
+  const ctx = canvas.getContext('2d')!;
+  ctx.imageSmoothingEnabled = false;
+
+  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, colormap);
+  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, overlayColormap);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const offsetX0 = (halfW * dpr - cw0 * dpr) / 2;
+  const offsetY0 = (dh * dpr + ch0 * dpr) / 2;
+  ctx.save();
+  ctx.translate(offsetX0, offsetY0);
+  ctx.scale(cw0 * dpr / w0, -ch0 * dpr / h0_);
+  ctx.drawImage(tc0, 0, 0);
+  ctx.restore();
+
+  const offsetX1 = halfW * dpr + (halfW * dpr - cw1 * dpr) / 2;
+  const offsetY1 = (dh * dpr + ch1 * dpr) / 2;
+  ctx.save();
+  ctx.translate(offsetX1, offsetY1);
+  ctx.scale(cw1 * dpr / w1, -ch1 * dpr / h1_);
+  ctx.drawImage(tc1, 0, 0);
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(233,69,96,0.7)';
+  ctx.lineWidth = 2 * dpr;
+  ctx.beginPath();
+  ctx.moveTo(halfW * dpr, 0);
+  ctx.lineTo(halfW * dpr, dh * dpr);
+  ctx.stroke();
+
+  if (crosshairVisible && img0.header) {
+    const h0 = img0.header;
+    const cursorX = sliceIdx.sagittal;
+    const cursorY = sliceIdx.coronal;
+    const cursorZ = sliceIdx.axial;
+    let sliceX0: number, sliceY0: number;
+    if (axis === 'axial') { sliceX0 = cursorX; sliceY0 = cursorY; }
+    else if (axis === 'coronal') { sliceX0 = cursorX; sliceY0 = cursorZ; }
+    else { sliceX0 = cursorY; sliceY0 = cursorZ; }
+    const nx0 = axis === 'sagittal' ? h0.ny : h0.nx;
+    const ny0 = axis === 'sagittal' ? h0.nz : (axis === 'coronal' ? h0.nz : h0.ny);
+    const cx0 = sliceX0 / (nx0 - 1 || 1);
+    const cy0 = sliceY0 / (ny0 - 1 || 1);
+
+    const imgLeft0 = (halfW - cw0) / 2 - vs.panX;
+    const imgTop0 = (dh - ch0) / 2 - vs.panY;
+    const sx0 = (imgLeft0 + cx0 * cw0) * dpr;
+    const sy0 = (imgTop0 + (1 - cy0) * ch0) * dpr;
+
+    ctx.strokeStyle = 'rgba(255,0,0,0.6)';
+    ctx.lineWidth = 1 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(0, sy0); ctx.lineTo(halfW * dpr, sy0);
+    ctx.moveTo(sx0, 0); ctx.lineTo(sx0, dh * dpr);
+    ctx.stroke();
+
+    const h1 = img1.header;
+    const [wx, wy, wz] = voxelToWorld(h0, cursorX, cursorY, cursorZ);
+    const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+    let sliceX1: number, sliceY1: number;
+    if (axis === 'axial') { sliceX1 = Math.round(vx1); sliceY1 = Math.round(vy1); }
+    else if (axis === 'coronal') { sliceX1 = Math.round(vx1); sliceY1 = Math.round(vz1); }
+    else { sliceX1 = Math.round(vy1); sliceY1 = Math.round(vz1); }
+    const nx1 = axis === 'sagittal' ? h1.ny : h1.nx;
+    const ny1 = axis === 'sagittal' ? h1.nz : (axis === 'coronal' ? h1.nz : h1.ny);
+    const cx1 = Math.max(0, Math.min(1, sliceX1 / (nx1 - 1 || 1)));
+    const cy1 = Math.max(0, Math.min(1, sliceY1 / (ny1 - 1 || 1)));
+
+    const imgLeft1 = halfW + (halfW - cw1) / 2 - vs.panX;
+    const imgTop1 = (dh - ch1) / 2 - vs.panY;
+    const sx1 = (imgLeft1 + cx1 * cw1) * dpr;
+    const sy1 = (imgTop1 + (1 - cy1) * ch1) * dpr;
+
+    ctx.strokeStyle = 'rgba(255,200,0,0.6)';
+    ctx.lineWidth = 1 * dpr;
+    ctx.beginPath();
+    ctx.moveTo(halfW * dpr, sy1); ctx.lineTo(dw * dpr, sy1);
+    ctx.moveTo(sx1, 0); ctx.lineTo(sx1, dh * dpr);
+    ctx.stroke();
+  }
+
+  const vc = canvas.parentElement!;
+  const htmlCrosshair = vc.querySelector('.crosshair') as HTMLDivElement;
+  if (htmlCrosshair) htmlCrosshair.style.display = 'none';
+
+  updateDirectionLabels(axis);
+  updateScaleBar(axis, pw0, ph0, zoom, cw0);
+  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw0, ch0);
 }
 
 function paintMIP() {
@@ -762,6 +996,7 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
 
   updateSliceInfo(axis);
   updateSliderValues();
+  if (crosshairVisible) updateCoordInfoFromCenter();
 }
 
 function updateAllInfo() {
@@ -869,6 +1104,7 @@ function resetViews() {
 }
 
 function toggleMaximize(view: string) {
+  if (compareMode && compareLayout === 'sideBySide') return;
   const viewsContainer = document.getElementById('views') as HTMLDivElement;
   const viewContainers = document.querySelectorAll('.vc');
 
@@ -1232,11 +1468,50 @@ function setupInteraction() {
   const btnCompare = document.getElementById('btn-compare') as HTMLButtonElement;
   btnCompare?.addEventListener('click', () => {
     if (images.length < 2) return;
-    compareMode = !compareMode;
+    if (!compareMode) {
+      compareMode = true;
+      compareLayout = 'overlay';
+    } else if (compareLayout === 'overlay') {
+      compareLayout = 'sideBySide';
+    } else {
+      compareMode = false;
+      compareLayout = 'overlay';
+    }
     btnCompare.classList.toggle('active', compareMode);
-    const main = document.getElementById('main');
-    if (main) main.classList.toggle('compare-mode', compareMode);
+    btnCompare.textContent = !compareMode ? '⊞ Compare' : compareLayout === 'overlay' ? '◑ Overlay' : '◫ SBS';
+    const overlayControls = document.getElementById('overlay-controls');
+    if (overlayControls) overlayControls.style.display = compareMode ? 'block' : 'none';
+    if (compareMode) {
+      const img0 = images[0];
+      header = img0.header;
+      volumeData = img0.data;
+      dataSlope = img0.slope;
+      dataInter = img0.inter;
+      globalMin = img0.min;
+      globalMax = img0.max;
+      activeImageIdx = 0;
+      sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
+      sliceIdx.coronal = Math.min(sliceIdx.coronal, img0.header.ny - 1);
+      sliceIdx.sagittal = Math.min(sliceIdx.sagittal, img0.header.nx - 1);
+      updateImagePicker();
+      updateFileInfo();
+      updateSliderValues();
+    }
     renderAllViews();
+  });
+
+  const opacitySlider = document.getElementById('opacity-slider') as HTMLInputElement;
+  const opacityVal = document.getElementById('opacity-val');
+  opacitySlider?.addEventListener('input', () => {
+    overlayOpacity = parseInt(opacitySlider.value) / 100;
+    if (opacityVal) opacityVal.textContent = opacitySlider.value;
+    if (compareMode) renderAllViews();
+  });
+
+  const overlayCmapSelect = document.getElementById('overlay-colormap') as HTMLSelectElement;
+  overlayCmapSelect?.addEventListener('change', () => {
+    overlayColormap = overlayCmapSelect.value;
+    if (compareMode) renderAllViews();
   });
 
   const btnAddImg = document.getElementById('btn-add-img') as HTMLButtonElement;
@@ -1248,16 +1523,12 @@ function setupInteraction() {
   btnCrosshair?.addEventListener('click', () => {
     crosshairVisible = !crosshairVisible;
     btnCrosshair.classList.toggle('active', crosshairVisible);
+    const coordEl = document.getElementById('coord-info');
+    if (crosshairVisible) updateCoordInfoFromCenter();
+    else if (coordEl) coordEl.textContent = 'Hover over image';
     renderAllViews();
   });
   if (crosshairVisible) btnCrosshair?.classList.add('active');
-
-  const coordSystemSelect = document.getElementById('coord-system') as HTMLSelectElement;
-  coordSystemSelect?.addEventListener('change', () => {
-    coordSystem = coordSystemSelect.value;
-    updateAllDirectionLabels();
-    renderAllViews();
-  });
 
   helpBtn?.addEventListener('click', () => helpPopup.classList.toggle('show'));
   document.addEventListener('click', (e) => {
@@ -1267,21 +1538,6 @@ function setupInteraction() {
   });
 
   sidebarToggle?.addEventListener('click', () => {
-    if (compareMode) {
-      compareMode = false;
-      const btnCompare = document.getElementById('btn-compare');
-      btnCompare?.classList.remove('active');
-      const main = document.getElementById('main');
-      main?.classList.remove('compare-mode');
-      sidebarCollapsed = false;
-      sidebar.classList.remove('collapsed');
-      sidebar.style.width = sidebarWidth + 'px';
-      sidebar.style.minWidth = sidebarWidth + 'px';
-      sidebarToggle.style.right = sidebarWidth + 'px';
-      sidebarToggle.textContent = '◀';
-      renderAllViews();
-      return;
-    }
     sidebarCollapsed = !sidebarCollapsed;
     if (sidebarCollapsed) {
       sidebarWidth = sidebar.offsetWidth;
@@ -1375,6 +1631,9 @@ function setupInteraction() {
 
     let isDragging = false;
     let lastX = 0, lastY = 0;
+    let dragStartX = 0, dragStartY = 0;
+    let dragMoved = false;
+    let suppressClickUntil = 0;
     let isPinching = false;
     let lastPinchDist = 0;
 
@@ -1383,6 +1642,9 @@ function setupInteraction() {
         isDragging = true;
         lastX = e.clientX;
         lastY = e.clientY;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        dragMoved = false;
         canvas.style.cursor = 'grabbing';
       }
     });
@@ -1391,8 +1653,11 @@ function setupInteraction() {
       if (isDragging) {
         const dx = e.clientX - lastX;
         const dy = e.clientY - lastY;
-        viewState[axis].panX -= dx;
-        viewState[axis].panY -= dy;
+        viewState[axis].panX += dx;
+        viewState[axis].panY += dy;
+        if (Math.abs(e.clientX - dragStartX) > 3 || Math.abs(e.clientY - dragStartY) > 3) {
+          dragMoved = true;
+        }
         lastX = e.clientX;
         lastY = e.clientY;
         updateSingleView(axis);
@@ -1403,6 +1668,7 @@ function setupInteraction() {
       if (isDragging) {
         isDragging = false;
         canvas.style.cursor = 'crosshair';
+        if (dragMoved) suppressClickUntil = Date.now() + 180;
       }
     });
 
@@ -1416,6 +1682,9 @@ function setupInteraction() {
         isDragging = true;
         lastX = e.touches[0].clientX;
         lastY = e.touches[0].clientY;
+        dragStartX = lastX;
+        dragStartY = lastY;
+        dragMoved = false;
       }
     }, { passive: true });
 
@@ -1431,8 +1700,11 @@ function setupInteraction() {
       } else if (isDragging && e.touches.length === 1) {
         const dx = e.touches[0].clientX - lastX;
         const dy = e.touches[0].clientY - lastY;
-        viewState[axis].panX -= dx;
-        viewState[axis].panY -= dy;
+        viewState[axis].panX += dx;
+        viewState[axis].panY += dy;
+        if (Math.abs(e.touches[0].clientX - dragStartX) > 3 || Math.abs(e.touches[0].clientY - dragStartY) > 3) {
+          dragMoved = true;
+        }
         lastX = e.touches[0].clientX;
         lastY = e.touches[0].clientY;
         updateSingleView(axis);
@@ -1440,18 +1712,82 @@ function setupInteraction() {
     }, { passive: true });
 
     canvas.addEventListener('touchend', () => {
+      if (isDragging && dragMoved) suppressClickUntil = Date.now() + 180;
       isDragging = false;
       isPinching = false;
     });
 
     canvas.addEventListener('click', (e) => {
-      if (Math.abs(e.clientX - lastX) > 5 || Math.abs(e.clientY - lastY) > 5) return;
+      if (Date.now() < suppressClickUntil) return;
       if (!header) return;
       const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const { nx, ny, nz, dx, dy } = header;
+      const clickX = e.clientX - rect.left;
+      const clickY = e.clientY - rect.top;
 
-      // Calculate actual image display size and position (same as paintSlice)
+      if (compareMode && compareLayout === 'sideBySide' && images.length >= 2) {
+        const img0 = images[0];
+        const img1 = images[1];
+        const h0 = img0.header;
+        const h1 = img1.header;
+        const halfW = rect.width / 2;
+        const vs = viewState[axis];
+        const isRight = clickX >= halfW;
+
+        if (isRight) {
+          const pw1 = axis === 'sagittal' ? h1.ny * h1.dy : h1.nx * h1.dx;
+          const ph1 = axis === 'axial' ? h1.ny * h1.dy : h1.nz * h1.dz;
+          const ar1 = pw1 / ph1;
+          let cw1: number, ch1: number;
+          if (halfW / rect.height > ar1) { ch1 = rect.height; cw1 = ch1 * ar1; }
+          else { cw1 = halfW; ch1 = cw1 / ar1; }
+          cw1 *= vs.zoom; ch1 *= vs.zoom;
+          const imgLeft1 = halfW + (halfW - cw1) / 2 + vs.panX;
+          const imgTop1 = (rect.height - ch1) / 2 + vs.panY;
+          if (clickX < imgLeft1 || clickX > imgLeft1 + cw1 || clickY < imgTop1 || clickY > imgTop1 + ch1) return;
+          const nx_click = (clickX - imgLeft1) / cw1;
+          const ny_click = (clickY - imgTop1) / ch1;
+          const w1 = axis === 'sagittal' ? h1.ny : h1.nx;
+          const h1_ = axis === 'axial' ? h1.ny : h1.nz;
+          let vx: number, vy: number, vz: number;
+          if (axis === 'axial') { vx = nx_click * w1; vy = (1 - ny_click) * h1_; vz = sliceIdx.axial; }
+          else if (axis === 'coronal') { vx = nx_click * w1; vy = sliceIdx.coronal; vz = (1 - ny_click) * h1_; }
+          else { vx = sliceIdx.sagittal; vy = nx_click * w1; vz = (1 - ny_click) * h1_; }
+          const [wx, wy, wz] = voxelToWorld(h1, vx, vy, vz);
+          const [svx, svy, svz] = worldToVoxel(h0, wx, wy, wz);
+          sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.round(svx)));
+          sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.round(svy)));
+          sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.round(svz)));
+        } else {
+          const pw0 = axis === 'sagittal' ? h0.ny * h0.dy : h0.nx * h0.dx;
+          const ph0 = axis === 'axial' ? h0.ny * h0.dy : h0.nz * h0.dz;
+          const ar0 = pw0 / ph0;
+          let cw0: number, ch0: number;
+          if (halfW / rect.height > ar0) { ch0 = rect.height; cw0 = ch0 * ar0; }
+          else { cw0 = halfW; ch0 = cw0 / ar0; }
+          cw0 *= vs.zoom; ch0 *= vs.zoom;
+          const imgLeft0 = (halfW - cw0) / 2 + vs.panX;
+          const imgTop0 = (rect.height - ch0) / 2 + vs.panY;
+          if (clickX < imgLeft0 || clickX > imgLeft0 + cw0 || clickY < imgTop0 || clickY > imgTop0 + ch0) return;
+          const nx_click = (clickX - imgLeft0) / cw0;
+          const ny_click = (clickY - imgTop0) / ch0;
+          const w0 = axis === 'sagittal' ? h0.ny : h0.nx;
+          const h0_ = axis === 'axial' ? h0.ny : h0.nz;
+          if (axis === 'axial') {
+            sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.floor(nx_click * w0)));
+            sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.floor((1 - ny_click) * h0_)));
+          } else if (axis === 'coronal') {
+            sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.floor(nx_click * w0)));
+            sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor((1 - ny_click) * h0_)));
+          } else {
+            sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.floor(nx_click * w0)));
+            sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor((1 - ny_click) * h0_)));
+          }
+        }
+        renderAllViews();
+        return;
+      }
+
+      const { nx, ny, nz, dx, dy } = header;
       const pixelW = nx * dx;
       const pixelH = ny * dy;
       const ar = pixelW / pixelH;
@@ -1462,19 +1798,12 @@ function setupInteraction() {
       cw *= vs.zoom;
       ch *= vs.zoom;
 
-      // Image offset in canvas (centered)
-      const imgLeft = (rect.width - cw) / 2 - vs.panX;
-      const imgTop = (rect.height - ch) / 2 - vs.panY;
+      const imgLeft = (rect.width - cw) / 2 + vs.panX;
+      const imgTop = (rect.height - ch) / 2 + vs.panY;
 
-      // Click position relative to image
-      const clickX = e.clientX - rect.left;
-      const clickY = e.clientY - rect.top;
-
-      // Check if click is within image bounds
       if (clickX < imgLeft || clickX > imgLeft + cw ||
           clickY < imgTop || clickY > imgTop + ch) return;
 
-      // Normalize to image coordinates (0-1)
       const nx_click = (clickX - imgLeft) / cw;
       const ny_click = (clickY - imgTop) / ch;
 
@@ -1494,11 +1823,98 @@ function setupInteraction() {
 
     canvas.addEventListener('mousemove', (e) => {
       if (!header || !volumeData) return;
+      if (crosshairVisible) {
+        updateCoordInfoFromCenter();
+        return;
+      }
       const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      const coordEl = document.getElementById('coord-info');
+      if (!coordEl) return;
+
+      if (compareMode && images.length >= 2) {
+        const img0 = images[0];
+        const img1 = images[1];
+        const h0 = img0.header;
+        const h1 = img1.header;
+        const vs = viewState[axis];
+
+        if (compareLayout === 'sideBySide') {
+          const halfW = rect.width / 2;
+          const isRight = mouseX >= halfW;
+          const img = isRight ? img1 : img0;
+          const hi = img.header;
+          const pw = axis === 'sagittal' ? hi.ny * hi.dy : hi.nx * hi.dx;
+          const ph = axis === 'axial' ? hi.ny * hi.dy : hi.nz * hi.dz;
+          const ar = pw / ph;
+          let iw: number, ih: number;
+          if (halfW / rect.height > ar) { ih = rect.height; iw = ih * ar; }
+          else { iw = halfW; ih = iw / ar; }
+          iw *= vs.zoom; ih *= vs.zoom;
+          const il = (isRight ? halfW : 0) + (halfW - iw) / 2 + vs.panX;
+          const it = (rect.height - ih) / 2 + vs.panY;
+          if (mouseX < il || mouseX > il + iw || mouseY < it || mouseY > it + ih) { coordEl.textContent = ''; return; }
+          const nx_m = (mouseX - il) / iw;
+          const ny_m = (mouseY - it) / ih;
+          const w = axis === 'sagittal' ? hi.ny : hi.nx;
+          const h_ = axis === 'axial' ? hi.ny : hi.nz;
+          let px: number, py: number, pz: number;
+          if (axis === 'axial') { px = Math.floor(nx_m * w); py = Math.floor((1 - ny_m) * h_); pz = sliceIdx.axial; }
+          else if (axis === 'coronal') { px = Math.floor(nx_m * w); pz = Math.floor((1 - ny_m) * h_); py = sliceIdx.coronal; }
+          else { py = Math.floor(nx_m * w); pz = Math.floor((1 - ny_m) * h_); px = sliceIdx.sagittal; }
+          if (px >= 0 && px < hi.nx && py >= 0 && py < hi.ny && pz >= 0 && pz < hi.nz) {
+            const val = img.data[pz * hi.ny * hi.nx + py * hi.nx + px] * img.slope + img.inter;
+            const [wx, wy, wz] = voxelToWorld(hi, px, py, pz);
+            const other = isRight ? img0 : img1;
+            const oh = other.header;
+            const [ox, oy, oz] = worldToVoxel(oh, wx, wy, wz);
+            const oxi = Math.round(ox), oyi = Math.round(oy), ozi = Math.round(oz);
+            let otherVal: string;
+            if (oxi >= 0 && oxi < oh.nx && oyi >= 0 && oyi < oh.ny && ozi >= 0 && ozi < oh.nz) {
+              const ov = other.data[ozi * oh.ny * oh.nx + oyi * oh.nx + oxi] * other.slope + other.inter;
+              otherVal = ov.toFixed(4);
+            } else { otherVal = '---'; }
+            const name0 = isRight ? other.name : img.name;
+            const name1 = isRight ? img.name : other.name;
+            const v0 = isRight ? otherVal : val.toFixed(4);
+            const v1 = isRight ? val.toFixed(4) : otherVal;
+            coordEl.textContent = `${name0}: ${v0}\n${name1}: ${v1}`;
+          }
+        } else {
+          const { nx, ny, nz, dx, dy } = h0;
+          const pixelW = nx * dx;
+          const pixelH = ny * dy;
+          const ar = pixelW / pixelH;
+          let imgW: number, imgH: number;
+          if (rect.width / rect.height > ar) { imgH = rect.height; imgW = imgH * ar; }
+          else { imgW = rect.width; imgH = imgW / ar; }
+          imgW *= vs.zoom; imgH *= vs.zoom;
+          const imgLeft = (rect.width - imgW) / 2 + vs.panX;
+          const imgTop = (rect.height - imgH) / 2 + vs.panY;
+          if (mouseX < imgLeft || mouseX > imgLeft + imgW || mouseY < imgTop || mouseY > imgTop + imgH) { coordEl.textContent = ''; return; }
+          const nx_mouse = (mouseX - imgLeft) / imgW;
+          const ny_mouse = (mouseY - imgTop) / imgH;
+          let px: number, py: number, pz: number;
+          if (axis === 'axial') { px = Math.floor(nx_mouse * nx); py = Math.floor((1 - ny_mouse) * ny); pz = sliceIdx.axial; }
+          else if (axis === 'coronal') { px = Math.floor(nx_mouse * nx); pz = Math.floor((1 - ny_mouse) * nz); py = sliceIdx.coronal; }
+          else { py = Math.floor(nx_mouse * ny); pz = Math.floor((1 - ny_mouse) * nz); px = sliceIdx.sagittal; }
+          if (px >= 0 && px < nx && py >= 0 && py < ny && pz >= 0 && pz < nz) {
+            const val0 = img0.data[pz * ny * nx + py * nx + px] * img0.slope + img0.inter;
+            const [wx, wy, wz] = voxelToWorld(h0, px, py, pz);
+            const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+            const ix1 = Math.round(vx1), iy1 = Math.round(vy1), iz1 = Math.round(vz1);
+            let val1Str: string;
+            if (ix1 >= 0 && ix1 < h1.nx && iy1 >= 0 && iy1 < h1.ny && iz1 >= 0 && iz1 < h1.nz) {
+              val1Str = (img1.data[iz1 * h1.ny * h1.nx + iy1 * h1.nx + ix1] * img1.slope + img1.inter).toFixed(4);
+            } else { val1Str = '---'; }
+            coordEl.textContent = `${img0.name}: ${val0.toFixed(4)}\n${img1.name}: ${val1Str}`;
+          }
+        }
+        return;
+      }
 
       const { nx, ny, nz, dx, dy } = header;
-
-      // Calculate actual image display size and position (same as paintSlice)
       const pixelW = nx * dx;
       const pixelH = ny * dy;
       const ar = pixelW / pixelH;
@@ -1509,19 +1925,12 @@ function setupInteraction() {
       imgW *= vs.zoom;
       imgH *= vs.zoom;
 
-      // Image offset in canvas (centered)
-      const imgLeft = (rect.width - imgW) / 2 - vs.panX;
-      const imgTop = (rect.height - imgH) / 2 - vs.panY;
+      const imgLeft = (rect.width - imgW) / 2 + vs.panX;
+      const imgTop = (rect.height - imgH) / 2 + vs.panY;
 
-      // Mouse position relative to image
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-
-      // Check if mouse is within image bounds
       if (mouseX < imgLeft || mouseX > imgLeft + imgW ||
           mouseY < imgTop || mouseY > imgTop + imgH) return;
 
-      // Normalize to image coordinates (0-1)
       const nx_mouse = (mouseX - imgLeft) / imgW;
       const ny_mouse = (mouseY - imgTop) / imgH;
 
@@ -1543,10 +1952,7 @@ function setupInteraction() {
 
       if (px >= 0 && px < nx && py >= 0 && py < ny && pz >= 0 && pz < nz) {
         const val = volumeData[pz * ny * nx + py * nx + px];
-        const coordEl = document.getElementById('coord-info');
-        if (coordEl) {
-          coordEl.textContent = `x=${px} y=${py} z=${pz}\nValue: ${val.toFixed(4)}`;
-        }
+        coordEl.textContent = `x=${px} y=${py} z=${pz}\nValue: ${val.toFixed(4)}`;
       }
     });
 
