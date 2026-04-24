@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="Icon.png" width="140" alt="NiftiSpy Logo">
+<img src="Icon.png" width="200" alt="NiftiSpy Logo">
 
 # NiftiSpy
 
