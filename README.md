@@ -1,13 +1,13 @@
 <div align="center">
 
-<img src="Icon.png" width="200" alt="NiftiSpy Logo">
+<img src="Icon.png" width="180" alt="NiftiSpy Logo">
 
 # NiftiSpy
 
 **High-performance NIfTI medical image viewer for VS Code**
 
-[![VS Code](https://img.shields.io/badge/VS%20Code-1.85+-blue?logo=visualstudiocode)](https://code.visualstudio.com/)
-[![Open VSX](https://img.shields.io/badge/Open%20VSX-niftispy-blue?logo=eclipse)](https://open-vsx.org/extension/maiwulanjiangmaiming/niftispy)
+[![VS Code Marketplace](https://img.shields.io/badge/VS%20Code%20Marketplace-NiftiSpy-007ACC?logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=MaiwulanjiangMaiming.niftispy)
+[![Open VSX](https://img.shields.io/badge/Open%20VSX-NiftiSpy-2C2255?logo=eclipseide)](https://open-vsx.org/extension/maiwulanjiangmaiming/niftispy)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-NiftiSpy-181717?logo=github)](https://github.com/MaiwulanjiangMaiming/NiftiSpy)
 
@@ -33,8 +33,15 @@ A blazing-fast NIfTI medical image viewer that runs entirely inside VS Code. Ope
 
 ## Installation
 
-1. Install from the [VS Code Marketplace](https://marketplace.visualstudio.com/) (coming soon)
-2. Or build from source:
+### From VS Code Marketplace
+
+Search for **"NiftiSpy"** in the Extensions view (`Cmd+Shift+X`) or click the badge above.
+
+### From Open VSX
+
+Available on [Open VSX Registry](https://open-vsx.org/extension/maiwulanjiangmaiming/niftispy).
+
+### From VSIX File
 
 ```bash
 git clone https://github.com/MaiwulanjiangMaiming/NiftiSpy.git
@@ -87,12 +94,4 @@ VS Code Extension Host
 
 This project was built upon and inspired by the following open-source projects. We are deeply grateful for their excellent work:
 
-- **[ITK-SNAP](http://www.itksnap.org/)** — An open-source software application for segmenting structures in 3D medical images. Our orientation handling, coordinate mapping (`voxelToWorld` / `worldToVoxel`), and anatomical direction label logic are based on ITK-SNAP's `ImageCoordinateGeometry` and `GenericSliceModel` implementations. Licensed under GPL.
-
-- **[niivue](https://github.com/niivue/niivue)** — A lightweight web-based NIfTI viewer. Our NIfTI parsing approach and webview rendering architecture were inspired by niivue's design. Licensed under BSD-2-Clause.
-
----
-
-## License
-
-[MIT](LICENSE) © Maiwulanjiang Maiming
+- **[ITK-SNAP](http://www.itksnap.org/)** — An open-source software application for segmenting structures in 3D medical images. Our orientation handling, coordinate mapping (`voxelToWorld` / `worldToVoxel`), and anatomical direction label logic are based on IT
