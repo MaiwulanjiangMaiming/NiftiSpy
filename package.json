@@ -9,6 +9,7 @@
     "url": "https://github.com/MaiwulanjiangMaiming/NiftiSpy"
   },
   "license": "MIT",
+  "icon": "Icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
