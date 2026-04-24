@@ -4,16 +4,16 @@
 
 # NiftiSpy
 
-**High-performance NIfTI medical image viewer for VS Code**
+**Fast NIfTI medical image viewer for VS Code**
 
 [![VS Code Marketplace](https://img.shields.io/badge/VS%20Code%20Marketplace-NiftiSpy-007ACC?logo=visualstudiocode)](https://marketplace.visualstudio.com/items?itemName=MaiwulanjiangMaiming.niftispy)
-[![Open VSX](https://img.shields.io/badge/Open%20VSX-NiftiSpy-2C2255?logo=eclipseide)](https://open-vsx.org/extension/maiwulanjiangmaiming/niftispy)
+[![Open VSX](https://img.shields.io/badge/Open%20VSX-Download-2C2255?logo=eclipse&logoColor=white)](https://open-vsx.org/extension/maiwulanjiangmaiming/niftispy)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![GitHub](https://img.shields.io/badge/GitHub-NiftiSpy-181717?logo=github)](https://github.com/MaiwulanjiangMaiming/NiftiSpy)
 
 </div>
 
-A blazing-fast NIfTI medical image viewer that runs entirely inside VS Code. Open `.nii`, `.nii.gz`, or `.hdr` files locally or from remote SSH servers — no external tools required.
+A fast NIfTI medical image viewer that runs entirely inside VS Code. Open `.nii`, `.nii.gz`, or `.hdr` files locally or from remote SSH servers — no external tools required.
 
 ---
 
@@ -94,4 +94,12 @@ VS Code Extension Host
 
 This project was built upon and inspired by the following open-source projects. We are deeply grateful for their excellent work:
 
-- **[ITK-SNAP](http://www.itksnap.org/)** — An open-source software application for segmenting structures in 3D medical images. Our orientation handling, coordinate mapping (`voxelToWorld` / `worldToVoxel`), and anatomical direction label logic are based on IT
+- **[ITK-SNAP](http://www.itksnap.org/)** — An open-source software application for segmenting structures in 3D medical images. Our orientation handling, coordinate mapping (`voxelToWorld` / `worldToVoxel`), and anatomical direction label logic are based on ITK-SNAP's `ImageCoordinateGeometry` and `GenericSliceModel` implementations. Licensed under GPL.
+
+- **[niivue](https://github.com/niivue/niivue)** — A lightweight web-based NIfTI viewer. Our NIfTI parsing approach and webview rendering architecture were inspired by niivue's design. Licensed under BSD-2-Clause.
+
+---
+
+## License
+
+[MIT](LICENSE) © Maiwulanjiang Maiming
