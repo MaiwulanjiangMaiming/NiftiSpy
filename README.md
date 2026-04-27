@@ -187,13 +187,6 @@ npm run package
 - Completes the optional native build flow so `npm run build:native` copies the compiled binding to `native/index.node`
 - Cleans release hygiene for GitHub and VSIX packaging with updated ignore rules and clearer documentation
 
-### Next: 1.0.2
-
-- Strengthen benchmark automation so local and remote loading regressions are easier to catch
-- Expand native-path coverage and fallback validation beyond the current smoke-level tests
-- Continue optimizing rapid multi-file switching and remote high-latency browsing
-- Add a more explicit release changelog workflow for future versions
-
 
 ## Acknowledgments
 
