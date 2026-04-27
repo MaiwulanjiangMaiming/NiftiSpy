@@ -5,13 +5,45 @@ const vscode = acquireVsCodeApi();
 
 interface VolumeImage {
   header: NiiHeader;
-  data: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+  data: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | null;
   min: number;
   max: number;
   name: string;
   url: string;
   slope: number;
   inter: number;
+  preview?: {
+    axial: Float32Array;
+    coronal: Float32Array;
+    sagittal: Float32Array;
+  };
+  state: 'preview' | 'loading' | 'ready' | 'error';
+  lastAccess: number;
+  loadPromise?: Promise<void>;
+}
+
+type Axis = 'axial' | 'coronal' | 'sagittal';
+
+interface SliceFrame {
+  data: Float32Array;
+  width: number;
+  height: number;
+  factor: number;
+}
+
+interface ViewerConfig {
+  previewMode: 'binary' | 'json';
+  renderBackend: 'webgl' | 'canvas';
+  fullVolumePolicy: 'manual' | 'debounced' | 'eager';
+  nativeAcceleration: 'off' | 'auto' | 'force';
+}
+
+interface PerformanceProfile {
+  tier: 'high' | 'medium' | 'low';
+  gpuAvailable: boolean;
+  maxTextureSize: number;
+  cores: number;
+  memoryMB: number;
 }
 
 const images: VolumeImage[] = [];
@@ -39,6 +71,77 @@ let fileUrl = '';
 let isGzip = false;
 let fileName = '';
 let crosshairVisible = true;
+let isRemoteSource = false;
+let fullVolumeLoaded = false;
+let interactionInitialized = false;
+
+const MAX_RESIDENT_IMAGE_DATA = 2;
+const MAX_PARALLEL_VOLUME_LOADS = 1;
+const ACTIVE_FULL_LOAD_DEBOUNCE_MS = 180;
+let activeVolumeLoads = 0;
+type VolumeLoadPriority = 'active' | 'background';
+interface QueuedVolumeLoad {
+  key: string;
+  priority: VolumeLoadPriority;
+  cancelled: boolean;
+  run: () => void;
+  reject: (reason?: any) => void;
+}
+const volumeLoadQueue: QueuedVolumeLoad[] = [];
+let nextStreamRequestId = 2000;
+const workerStreamHandlers = new Map<number, (msg: any) => void>();
+let activeVolumeLoadKey: string | null = null;
+const volumeWorkers = new Map<string, Worker>();
+let activeLoadDebounceTimer: number | null = null;
+let scheduledActiveIndex: number | null = null;
+
+const currentSlices: Record<Axis, SliceFrame | null> = {
+  axial: null,
+  coronal: null,
+  sagittal: null,
+};
+
+const perfMonitor = {
+  previewLoads: [] as number[],
+  fullLoads: [] as number[],
+  failures: 0,
+  evictions: 0,
+};
+
+const viewerConfig: ViewerConfig = {
+  previewMode: 'binary',
+  renderBackend: 'canvas',
+  fullVolumePolicy: 'debounced',
+  nativeAcceleration: 'auto',
+};
+
+const previewRequestCache = new Map<string, Promise<any | null>>();
+let thumbnailObserver: IntersectionObserver | null = null;
+
+function publishPerfMonitor() {
+  (window as any).__niftiPerf = {
+    previewLoads: [...perfMonitor.previewLoads],
+    fullLoads: [...perfMonitor.fullLoads],
+    failures: perfMonitor.failures,
+    evictions: perfMonitor.evictions,
+    queuedLoads: volumeLoadQueue.length,
+    activeLoads: activeVolumeLoads,
+    residentImages: images.filter(img => !!img.data).length,
+    activeVolumeLoadKey,
+    scheduledActiveIndex,
+  };
+}
+
+function makeAbortError(): Error {
+  const err = new Error('Load superseded by newer selection');
+  err.name = 'AbortError';
+  return err;
+}
+
+let nextWorkerRequestId = 1;
+const workerRequests = new Map<number, { resolve: (value: any) => void; reject: (reason?: any) => void }>();
+const sliceQualityTimers: Partial<Record<Axis, number>> = {};
+let workerStreamListener: ((message: any) => void) | null = null;
 
 const viewState = {
   axial: { zoom: 1, panX: 0, panY: 0 },
@@ -50,6 +153,342 @@ const viewState = {
 let maximizedView: string | null = null;
 let sidebarCollapsed = false;
 let sidebarWidth = 180;
+
+const perfProfile = detectPerformance();
+const sliceRenderCache = new Map<string, { canvas: HTMLCanvasElement; timestamp: number }>();
+const MAX_SLICE_CACHE = perfProfile.tier === 'high' ? 64 : perfProfile.tier === 'medium' ? 32 : 16;
+const PRELOAD_RANGE = perfProfile.tier === 'high' ? 5 : perfProfile.tier === 'medium' ? 3 : 1;
+
+const glRenderers: Partial<Record<Axis | 'mip', WebGLRenderer>> = {};
+
+class BufferPool {
+  private pools: Map<number, ArrayBuffer[]> = new Map();
+  private maxSize: number;
+
+  constructor(maxSize: number = 50) {
+    this.maxSize = maxSize;
+  }
+
+  acquire(size: number): ArrayBuffer {
+    const key = this.nearestPowerOf2(size);
+    const pool = this.pools.get(key);
+    if (pool && pool.length > 0) {
+      return pool.pop()!;
+    }
+    return new ArrayBuffer(key);
+  }
+
+  release(buf: ArrayBuffer): void {
+    const key = this.nearestPowerOf2(buf.byteLength);
+    let pool = this.pools.get(key);
+    if (!pool) {
+      pool = [];
+      this.pools.set(key, pool);
+    }
+    if (pool.length < this.maxSize) {
+      pool.push(buf);
+    }
+  }
+
+  private nearestPowerOf2(n: number): number {
+    let p = 1;
+    while (p < n) p <<= 1;
+    return p;
+  }
+
+  clear(): void {
+    this.pools.clear();
+  }
+}
+
+const bufferPool = new BufferPool();
+
+class Float32Pool {
+  private pool: Float32Array[] = [];
+  private maxSize: number;
+
+  constructor(maxSize: number = 30) {
+    this.maxSize = maxSize;
+  }
+
+  acquire(length: number): Float32Array {
+    for (let i = 0; i < this.pool.length; i++) {
+      if (this.pool[i].length >= length) {
+        const arr = this.pool.splice(i, 1)[0];
+        return arr.subarray(0, length);
+      }
+    }
+    return new Float32Array(length);
+  }
+
+  release(arr: Float32Array): void {
+    if (this.pool.length < this.maxSize) {
+      this.pool.push(arr);
+    }
+  }
+
+  clear(): void {
+    this.pool = [];
+  }
+}
+
+const float32Pool = new Float32Pool();
+
+class BandwidthEstimator {
+  private samples: { bytes: number; durationMs: number }[] = [];
+  private maxSamples = 10;
+  private _estimatedBps: number = 10 * 1024 * 1024;
+
+  get estimatedBps(): number {
+    return this._estimatedBps;
+  }
+
+  addSample(bytes: number, durationMs: number): void {
+    if (durationMs <= 0) return;
+    this.samples.push({ bytes, durationMs });
+    if (this.samples.length > this.maxSamples) {
+      this.samples.shift();
+    }
+    let totalBytes = 0;
+    let totalMs = 0;
+    for (const s of this.samples) {
+      totalBytes += s.bytes;
+      totalMs += s.durationMs;
+    }
+    this._estimatedBps = (totalBytes / totalMs) * 1000 * 8;
+  }
+
+  get qualityLevel(): 'high' | 'medium' | 'low' {
+    const mbps = this._estimatedBps / (1024 * 1024);
+    if (mbps > 50) return 'high';
+    if (mbps > 10) return 'medium';
+    return 'low';
+  }
+}
+
+const bandwidthEstimator = new BandwidthEstimator();
+
+class WebGLRenderer {
+  private gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
+  private program: WebGLProgram | null = null;
+  private texture: WebGLTexture | null = null;
+  private lutTexture: WebGLTexture | null = null;
+  private posBuffer: WebGLBuffer | null = null;
+  private texCoordBuffer: WebGLBuffer | null = null;
+  private ready = false;
+  private currentLut: string = '';
+  private supportsFloatTexture = false;
+
+  private vertexShaderSource = `#version 100
+attribute vec2 a_position;
+attribute vec2 a_texCoord;
+varying vec2 v_texCoord;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_texCoord = a_texCoord;
+}`;
+
+  private fragmentShaderSource = `#version 100
+precision highp float;
+varying vec2 v_texCoord;
+uniform sampler2D u_image;
+uniform sampler2D u_lut;
+uniform float u_lo;
+uniform float u_hi;
+uniform float u_range;
+void main() {
+  float val = texture2D(u_image, v_texCoord).r;
+  float t = clamp((val - u_lo) / u_range, 0.0, 1.0);
+  vec4 color = texture2D(u_lut, vec2(t, 0.5));
+  gl_FragColor = color;
+}`;
+
+  init(canvas: HTMLCanvasElement): boolean {
+    const gl2 = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
+    if (gl2) {
+      this.gl = gl2;
+      this.supportsFloatTexture = false;
+      return false;
+    }
+    const gl1 = canvas.getContext('webgl', { premultipliedAlpha: false, preserveDrawingBuffer: true });
+    if (gl1) {
+      this.gl = gl1;
+      this.supportsFloatTexture = !!gl1.getExtension('OES_texture_float');
+      if (!this.supportsFloatTexture) return false;
+      return this.setupProgram();
+    }
+    return false;
+  }
+
+  private setupProgram(): boolean {
+    const gl = this.gl!;
+    const vs = this.compileShader(gl.VERTEX_SHADER, this.vertexShaderSource);
+    const fs = this.compileShader(gl.FRAGMENT_SHADER, this.fragmentShaderSource);
+    if (!vs || !fs) return false;
+
+    this.program = gl.createProgram()!;
+    gl.attachShader(this.program, vs);
+    gl.attachShader(this.program, fs);
+    gl.linkProgram(this.program);
+    if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) return false;
+
+    this.texture = gl.createTexture();
+    this.lutTexture = gl.createTexture();
+    this.posBuffer = gl.createBuffer();
+    this.texCoordBuffer = gl.createBuffer();
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]), gl.STATIC_DRAW);
+
+    this.ready = true;
+    return true;
+  }
+
+  private compileShader(type: number, source: string): WebGLShader | null {
+    const gl = this.gl!;
+    const shader = gl.createShader(type);
+    if (!shader) return null;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+      gl.deleteShader(shader);
+      return null;
+    }
+    return shader;
+  }
+
+  renderSlice(canvas: HTMLCanvasElement, sliceData: Float32Array, w: number, h: number,
+    lo: number, range: number, cmapName: string): boolean {
+    if (!this.ready || !this.gl || !this.program || !this.supportsFloatTexture) return false;
+    const gl = this.gl;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = canvas.clientHeight * dpr;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    gl.useProgram(this.program);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const normalized = new Float32Array(w * h);
+    const dataRange = globalMax - globalMin || 1;
+    for (let i = 0; i < w * h; i++) {
+      normalized[i] = (sliceData[i] - globalMin) / dataRange;
+    }
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, w, h, 0, gl.LUMINANCE, gl.FLOAT, normalized);
+    } catch {
+      return false;
+    }
+    if (gl.getError() !== gl.NO_ERROR) return false;
+
+    if (this.currentLut !== cmapName) {
+      this.updateLUT(cmapName);
+      this.currentLut = cmapName;
+    }
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
+
+    const uImage = gl.getUniformLocation(this.program, 'u_image');
+    const uLut = gl.getUniformLocation(this.program, 'u_lut');
+    const uLo = gl.getUniformLocation(this.program, 'u_lo');
+    const uHi = gl.getUniformLocation(this.program, 'u_hi');
+    const uRange = gl.getUniformLocation(this.program, 'u_range');
+
+    gl.uniform1i(uImage, 0);
+    gl.uniform1i(uLut, 1);
+    gl.uniform1f(uLo, lo);
+    gl.uniform1f(uHi, lo + range);
+    gl.uniform1f(uRange, range);
+
+    const aPos = gl.getAttribLocation(this.program, 'a_position');
+    const aTex = gl.getAttribLocation(this.program, 'a_texCoord');
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+    gl.enableVertexAttribArray(aTex);
+    gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (gl.getError() !== gl.NO_ERROR) return false;
+    return true;
+  }
+
+  private updateLUT(cmapName: string): void {
+    const gl = this.gl!;
+    const cmapFn = COLORMAPS[cmapName] || COLORMAPS.gray;
+    const lutData = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) {
+      const t = i / 255;
+      const [r, g, b] = cmapFn(t);
+      lutData[i * 4] = r;
+      lutData[i * 4 + 1] = g;
+      lutData[i * 4 + 2] = b;
+      lutData[i * 4 + 3] = 255;
+    }
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutData);
+  }
+
+  isReady(): boolean {
+    return this.ready;
+  }
+
+  destroy(): void {
+    if (!this.gl) return;
+    if (this.program) this.gl.deleteProgram(this.program);
+    if (this.texture) this.gl.deleteTexture(this.texture);
+    if (this.lutTexture) this.gl.deleteTexture(this.lutTexture);
+    if (this.posBuffer) this.gl.deleteBuffer(this.posBuffer);
+    if (this.texCoordBuffer) this.gl.deleteBuffer(this.texCoordBuffer);
+    this.ready = false;
+    this.gl = null;
+  }
+}
+
+function detectPerformance(): PerformanceProfile {
+  const nav = navigator as any;
+  const cores = nav.hardwareConcurrency || 4;
+  const memoryMB = nav.deviceMemory ? nav.deviceMemory * 1024 : 4096;
+
+  let gpuAvailable = false;
+  let maxTextureSize = 4096;
+  try {
+    const testCanvas = document.createElement('canvas');
+    const gl = testCanvas.getContext('webgl2') || testCanvas.getContext('webgl');
+    if (gl) {
+      gpuAvailable = true;
+      maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+    }
+  } catch { }
+
+  let tier: 'high' | 'medium' | 'low';
+  if (cores >= 8 && memoryMB >= 4096 && gpuAvailable) {
+    tier = 'high';
+  } else if (cores >= 4 && memoryMB >= 2048) {
+    tier = 'medium';
+  } else {
+    tier = 'low';
+  }
+
+  return { tier, gpuAvailable, maxTextureSize, cores, memoryMB };
+}
 
 function voxelToWorld(h: NiiHeader, vx: number, vy: number, vz: number): [number, number, number] {
   if (h.sform_code !== 0) {
@@ -147,19 +586,346 @@ const INFERNO_LUT = buildLUT([[0,0,0,4],[0.13,40,11,84],[0.25,101,21,110],[0.38,
 let cachedWorker: Worker | null = null;
 let cachedBlobUrl: string | null = null;
 
-async function getWorker(): Promise<Worker> {
-  if (cachedWorker) return cachedWorker;
-  if (cachedBlobUrl) {
-    cachedWorker = new Worker(cachedBlobUrl);
-    return cachedWorker;
-  }
+async function ensureWorkerBlobUrl(): Promise<string> {
+  if ((window as any).__NII_WORKER_BLOB_URL__) return (window as any).__NII_WORKER_BLOB_URL__;
+  if (cachedBlobUrl) return cachedBlobUrl;
   const workerResp = await fetch((window as any).WORKER_URL);
   if (!workerResp.ok) throw new Error(`Worker fetch failed: ${workerResp.status}`);
   const workerSrc = await workerResp.text();
   const blob = new Blob([workerSrc], { type: 'application/javascript' });
   cachedBlobUrl = URL.createObjectURL(blob);
-  cachedWorker = new Worker(cachedBlobUrl);
+  (window as any).__NII_WORKER_BLOB_URL__ = cachedBlobUrl;
+  return cachedBlobUrl;
+}
+
+function attachWorkerRouter(worker: Worker) {
+  if ((worker as any).__routerAttached) return;
+  (worker as any).__routerAttached = true;
+  worker.onmessage = (ev) => {
+    const msg = ev.data;
+    if (msg?.type === 'bandwidthSample') {
+      bandwidthEstimator.addSample(msg.bytes || 0, msg.durationMs || 0);
+      return;
+    }
+    const streamHandler = workerStreamHandlers.get(msg.id);
+    if (streamHandler) {
+      streamHandler(msg);
+      return;
+    }
+    const pending = workerRequests.get(msg.id);
+    if (pending && msg?.type !== 'progress' && msg?.type !== 'preview' && msg?.type !== 'volume') {
+      workerRequests.delete(msg.id);
+      if (msg.type === 'error') pending.reject(new Error(msg.error || 'Worker error'));
+      else pending.resolve(msg);
+      return;
+    }
+    if (msg?.type === 'progress' || msg?.type === 'preview' || msg?.type === 'volume' || msg?.type === 'error') {
+      workerStreamListener?.(msg);
+    }
+  };
+}
+
+async function getWorker(): Promise<Worker> {
+  if (cachedWorker) return cachedWorker;
+  cachedWorker = new Worker(await ensureWorkerBlobUrl());
+  attachWorkerRouter(cachedWorker);
   return cachedWorker;
+}
+
+function sendWorkerRequest<T = any>(worker: Worker, payload: Record<string, any>): Promise<T> {
+  const id = nextWorkerRequestId++;
+  return new Promise<T>((resolve, reject) => {
+    workerRequests.set(id, { resolve, reject });
+    worker.postMessage({ ...payload, id });
+  });
+}
+
+function registerWorkerStream(requestId: number, handler: (msg: any) => void) {
+  workerStreamHandlers.set(requestId, handler);
+}
+
+function unregisterWorkerStream(requestId: number) {
+  workerStreamHandlers.delete(requestId);
+}
+
+function cancelVolumeLoadByKey(key: string | null): void {
+  if (!key) return;
+  const worker = volumeWorkers.get(key);
+  if (!worker) return;
+  volumeWorkers.delete(key);
+  if (activeVolumeLoadKey === key) activeVolumeLoadKey = null;
+  worker.terminate();
+  publishPerfMonitor();
+}
+
+function cancelQueuedVolumeLoads(exceptKey?: string): void {
+  for (const entry of volumeLoadQueue) {
+    if (exceptKey && entry.key === exceptKey) continue;
+    entry.cancelled = true;
+    entry.reject(makeAbortError());
+  }
+  for (let i = volumeLoadQueue.length - 1; i >= 0; i--) {
+    if (!exceptKey || volumeLoadQueue[i].key !== exceptKey) volumeLoadQueue.splice(i, 1);
+  }
+  publishPerfMonitor();
+}
+
+async function reprioritizeVolumeLoad(key: string, priority: VolumeLoadPriority): Promise<void> {
+  if (priority !== 'active') return;
+  cancelQueuedVolumeLoads(key);
+  if (activeVolumeLoadKey && activeVolumeLoadKey !== key) {
+    cancelVolumeLoadByKey(activeVolumeLoadKey);
+  }
+}
+
+function queueVolumeLoad<T>(key: string, task: () => Promise<T>, priority: VolumeLoadPriority = 'background'): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const entry: QueuedVolumeLoad = {
+      key,
+      priority,
+      cancelled: false,
+      reject,
+      run: () => {
+        if (entry.cancelled) {
+          reject(makeAbortError());
+          return;
+        }
+        activeVolumeLoads++;
+        activeVolumeLoadKey = key;
+        publishPerfMonitor();
+        task().then(resolve, reject).finally(() => {
+          activeVolumeLoads = Math.max(0, activeVolumeLoads - 1);
+          if (activeVolumeLoadKey === key) activeVolumeLoadKey = null;
+          const next = volumeLoadQueue.shift();
+          next?.run();
+          publishPerfMonitor();
+        });
+      },
+    };
+    if (activeVolumeLoads < MAX_PARALLEL_VOLUME_LOADS) entry.run();
+    else if (priority === 'active') volumeLoadQueue.unshift(entry);
+    else volumeLoadQueue.push(entry);
+    publishPerfMonitor();
+  });
+}
+
+function evictInactiveImageData(preferredIndices: number[] = []) {
+  const keep = new Set(preferredIndices);
+  if (compareMode && images.length >= 2) {
+    keep.add(0);
+    keep.add(1);
+  }
+  const loaded = images
+    .map((img, idx) => ({ img, idx }))
+    .filter(({ img }) => !!img.data);
+  if (loaded.length <= MAX_RESIDENT_IMAGE_DATA) return;
+  loaded
+    .filter(({ idx }) => !keep.has(idx))
+    .sort((a, b) => a.img.lastAccess - b.img.lastAccess)
+    .slice(0, Math.max(0, loaded.length - MAX_RESIDENT_IMAGE_DATA))
+    .forEach(({ img }) => {
+      img.data = null;
+      if (img.state === 'ready') img.state = 'preview';
+      perfMonitor.evictions++;
+    });
+  publishPerfMonitor();
+}
+
+function applyImageState(img: VolumeImage, preserveSlices = false) {
+  header = img.header;
+  volumeData = img.data;
+  dataSlope = img.slope;
+  dataInter = img.inter;
+  globalMin = img.min;
+  globalMax = img.max;
+  fileName = img.name;
+  img.lastAccess = Date.now();
+  if (!preserveSlices && img.preview) {
+    setCurrentSlice('axial', new Float32Array(img.preview.axial), img.header.nx, img.header.ny, 1);
+    setCurrentSlice('coronal', new Float32Array(img.preview.coronal), img.header.nx, img.header.nz, 1);
+    setCurrentSlice('sagittal', new Float32Array(img.preview.sagittal), img.header.ny, img.header.nz, 1);
+  }
+}
+
+async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void): Promise<any> {
+  const worker = new Worker(await ensureWorkerBlobUrl());
+  const requestId = nextStreamRequestId++;
+  return new Promise((resolve, reject) => {
+    volumeWorkers.set(loadKey, worker);
+    publishPerfMonitor();
+    const cleanup = () => {
+      if (volumeWorkers.get(loadKey) === worker) volumeWorkers.delete(loadKey);
+      worker.terminate();
+      publishPerfMonitor();
+    };
+    worker.onmessage = (ev) => {
+      const msg = ev.data;
+      if (msg.id !== requestId) return;
+      if (msg.type === 'progress' || msg.type === 'preview') {
+        progress?.(msg);
+        return;
+      }
+      if (msg.type === 'cancelled') {
+        cleanup();
+        reject(makeAbortError());
+        return;
+      }
+      if (msg.type === 'error') {
+        cleanup();
+        reject(new Error(msg.error || 'Load failed'));
+        return;
+      }
+      if (msg.type === 'volume') {
+        cleanup();
+        resolve(msg);
+      }
+    };
+    worker.onerror = (err) => {
+      cleanup();
+      reject(new Error(err.message || 'Worker error'));
+    };
+    worker.postMessage({ id: requestId, type: 'loadVolume', url, isGzip: gz });
+  });
+}
+
+function scheduleActiveImageLoad(index: number): void {
+  if (activeLoadDebounceTimer) {
+    window.clearTimeout(activeLoadDebounceTimer);
+    activeLoadDebounceTimer = null;
+  }
+  scheduledActiveIndex = index;
+  publishPerfMonitor();
+  activeLoadDebounceTimer = window.setTimeout(() => {
+    activeLoadDebounceTimer = null;
+    if (scheduledActiveIndex !== index || activeImageIdx !== index) return;
+    void ensureImageData(index, 'active').catch((err) => {
+      if ((err as any)?.name !== 'AbortError') {
+        console.error('Failed to activate image:', err);
+      }
+    });
+  }, ACTIVE_FULL_LOAD_DEBOUNCE_MS);
+}
+
+async function ensureImageData(index: number, priority: VolumeLoadPriority = 'background'): Promise<void> {
+  const img = images[index];
+  if (!img) return;
+  const loadKey = img.url;
+  await reprioritizeVolumeLoad(loadKey, priority);
+  if (img.data) {
+    img.lastAccess = Date.now();
+    evictInactiveImageData([index, activeImageIdx]);
+    return;
+  }
+  if (img.loadPromise) {
+    await img.loadPromise;
+    return;
+  }
+  img.state = 'loading';
+  img.loadPromise = queueVolumeLoad(loadKey, async () => {
+    const startedAt = performance.now();
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const result = await loadVolumeViaWorker(loadKey, img.url, img.url.endsWith('.gz'), (msg) => {
+          if (index === activeImageIdx && msg.type === 'progress') {
+            updateProgress(0.5 + msg.value * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
+          }
+        });
+        img.header = result.header;
+        img.data = result.voxelData;
+        img.min = result.globalMin;
+        img.max = result.globalMax;
+        img.slope = result.slope || 1;
+        img.inter = result.inter || 0;
+        img.state = 'ready';
+        img.lastAccess = Date.now();
+        perfMonitor.fullLoads.push(performance.now() - startedAt);
+        publishPerfMonitor();
+        if (index === activeImageIdx) {
+          applyImageState(img, true);
+          updateFileInfo();
+          updateSliderValues();
+          renderAllViews();
+          updateImagePicker();
+        }
+        evictInactiveImageData([index, activeImageIdx]);
+        return;
+      } catch (err) {
+        if ((err as any)?.name === 'AbortError') throw err;
+        lastError = err;
+      }
+    }
+    perfMonitor.failures++;
+    publishPerfMonitor();
+    throw lastError;
+  }, priority).catch((err) => {
+    img.state = (err as any)?.name === 'AbortError' ? 'preview' : 'error';
+    throw err;
+  }).finally(() => {
+    img.loadPromise = undefined;
+  });
+  await img.loadPromise;
+}
+
+function setCurrentSlice(axis: Axis, data: Float32Array, width: number, height: number, factor = 1) {
+  currentSlices[axis] = { data, width, height, factor };
+}
+
+function getAxisGeometry(axis: Axis, hdr: NiiHeader = header!): { width: number; height: number; pixelW: number; pixelH: number; maxIndex: number } {
+  if (axis === 'axial') {
+    return { width: hdr.nx, height: hdr.ny, pixelW: hdr.nx * hdr.dx, pixelH: hdr.ny * hdr.dy, maxIndex: hdr.nz - 1 };
+  }
+  if (axis === 'coronal') {
+    return { width: hdr.nx, height: hdr.nz, pixelW: hdr.nx * hdr.dx, pixelH: hdr.nz * hdr.dz, maxIndex: hdr.ny - 1 };
+  }
+  return { width: hdr.ny, height: hdr.nz, pixelW: hdr.ny * hdr.dy, pixelH: hdr.nz * hdr.dz, maxIndex: hdr.nx - 1 };
+}
+
+function getActiveDownsample(): number {
+  const quality = bandwidthEstimator.qualityLevel;
+  if (perfProfile.tier === 'low' || quality === 'low') return 4;
+  if (perfProfile.tier === 'medium' || quality === 'medium') return 2;
+  return 1;
+}
+
+async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
+  if (!header) return;
+  const worker = await getWorker();
+  const geometry = getAxisGeometry(axis);
+  const response = await sendWorkerRequest<{
+    type: 'slice';
+    axis: Axis;
+    index: number;
+    factor: number;
+    width: number;
+    height: number;
+    data: Float32Array;
+  }>(worker, {
+    type: 'fetchSlice',
+    url: fileUrl,
+    axis,
+    index: sliceIdx[axis],
+    factor,
+    prefetch: PRELOAD_RANGE,
+    maxIndex: geometry.maxIndex,
+  });
+  if (response.index !== sliceIdx[axis]) return;
+  setCurrentSlice(axis, response.data, response.width || geometry.width, response.height || geometry.height, response.factor);
+}
+
+async function refreshSlices(axes: Axis[], interactive = false) {
+  if (!header) return;
+  const factor = interactive ? getActiveDownsample() : 1;
+  await Promise.all(axes.map((axis) => requestSliceFrame(axis, factor)));
+  renderAllViews();
+  if (interactive && factor > 1) {
+    for (const axis of axes) {
+      if (sliceQualityTimers[axis]) window.clearTimeout(sliceQualityTimers[axis]);
+      sliceQualityTimers[axis] = window.setTimeout(() => {
+        requestSliceFrame(axis, 1).then(() => renderAllViews()).catch(() => {});
+      }, 120);
+    }
+  }
 }
 
 function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Float32Array {
@@ -171,7 +937,7 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
   const needScale = s !== 1 || t !== 0;
 
   if (axis === 'axial') {
-    const slice = new Float32Array(nx * ny);
+    const slice = float32Pool.acquire(nx * ny);
     const base = idx * ny * nx;
     if (needScale) {
       for (let i = 0; i < nx * ny; i++) slice[i] = src[base + i] * s + t;
@@ -180,7 +946,7 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
     }
     return slice;
   } else if (axis === 'coronal') {
-    const slice = new Float32Array(nx * nz);
+    const slice = float32Pool.acquire(nx * nz);
     for (let z = 0; z < nz; z++) {
       const base = z * ny * nx + idx * nx;
       if (needScale) {
@@ -191,7 +957,7 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
     }
     return slice;
   } else {
-    const slice = new Float32Array(ny * nz);
+    const slice = float32Pool.acquire(ny * nz);
     for (let z = 0; z < nz; z++) {
       const base = z * ny * nx;
       if (needScale) {
@@ -253,6 +1019,87 @@ function computeMIP(rotX: number, rotY: number): Float32Array {
 
 const sliceImageDataCache: Record<string, ImageData> = {};
 
+function pruneSliceCache(): void {
+  if (sliceRenderCache.size <= MAX_SLICE_CACHE) return;
+  const entries = [...sliceRenderCache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
+  const toRemove = entries.slice(0, entries.length - MAX_SLICE_CACHE);
+  for (const [key] of toRemove) {
+    sliceRenderCache.delete(key);
+  }
+}
+
+function getCachedSliceRender(axis: string, idx: number): HTMLCanvasElement | null {
+  const key = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
+  const cached = sliceRenderCache.get(key);
+  if (cached) {
+    cached.timestamp = Date.now();
+    return cached.canvas;
+  }
+  return null;
+}
+
+function setCachedSliceRender(axis: string, idx: number, canvas: HTMLCanvasElement): void {
+  const key = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
+  sliceRenderCache.set(key, { canvas, timestamp: Date.now() });
+  pruneSliceCache();
+}
+
+function preloadSlices(axis: 'axial' | 'coronal' | 'sagittal', currentIdx: number): void {
+  if (!header || !volumeData) return;
+  const max = axis === 'axial' ? header.nz : axis === 'coronal' ? header.ny : header.nx;
+
+  for (let d = 1; d <= PRELOAD_RANGE; d++) {
+    for (const offset of [d, -d]) {
+      const idx = currentIdx + offset;
+      if (idx < 0 || idx >= max) continue;
+      const cacheKey = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
+      if (sliceRenderCache.has(cacheKey)) continue;
+
+      requestIdleCallback(() => {
+        if (!header || !volumeData) return;
+        const { nx, ny, nz, dx, dy, dz } = header;
+        const slice = extractSlice(axis, idx);
+        let w: number, h: number, pw: number, ph: number;
+        if (axis === 'axial') { w = nx; h = ny; pw = nx * dx; ph = ny * dy; }
+        else if (axis === 'coronal') { w = nx; h = nz; pw = nx * dx; ph = nz * dz; }
+        else { w = ny; h = nz; pw = ny * dy; ph = nz * dz; }
+
+        const tc = document.createElement('canvas');
+        tc.width = w; tc.height = h;
+        const tctx = tc.getContext('2d')!;
+        const imgData = tctx.createImageData(w, h);
+        const pixels = imgData.data;
+        const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
+        const lo = windowLevel - windowWidth * 0.5;
+        const range = windowWidth || 1;
+        const dataRange = globalMax - globalMin || 1;
+        const n = w * h;
+
+        for (let i = 0; i < n; i++) {
+          const norm = (slice[i] - globalMin) / dataRange;
+          const t = Math.max(0, Math.min(1, (norm - lo) / range));
+          const [r, g, b] = cmapFn(t);
+          const idx4 = i * 4;
+          pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
+        }
+        tctx.putImageData(imgData, 0, 0);
+        setCachedSliceRender(axis, idx, tc);
+        float32Pool.release(slice);
+      });
+    }
+  }
+}
+
+function getOrCreateRenderer(axis: Axis): WebGLRenderer | null {
+  if (viewerConfig.renderBackend !== 'webgl' || !perfProfile.gpuAvailable) return null;
+  const existing = glRenderers[axis];
+  if (existing?.isReady()) return existing;
+  const renderer = new WebGLRenderer();
+  if (!renderer.init(canvases[axis])) return null;
+  glRenderers[axis] = renderer;
+  return renderer;
+}
+
 function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
   const canvas = canvases[axis as keyof typeof canvases];
   if (!canvas || !data || data.length === 0) return;
@@ -280,6 +1127,15 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   canvas.style.height = dh + 'px';
   canvas.width = dw * dpr;
   canvas.height = dh * dpr;
+
+  const renderer = getOrCreateRenderer(axis as Axis);
+  if (renderer && zoom === 1 && panX === 0 && panY === 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap)) {
+    updateDirectionLabels(axis);
+    updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+    updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+    updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+    return;
+  }
 
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
@@ -385,47 +1241,32 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   crosshair.style.display = crosshairVisible ? 'block' : 'none';
   if (!crosshairVisible || !header) return;
 
-  const { nx, ny, nz } = header;
-
-  // Get cursor position in voxel coordinates (this is the 3D position all views share)
   const cursorX = sliceIdx.sagittal;
   const cursorY = sliceIdx.coronal;
   const cursorZ = sliceIdx.axial;
 
-  // Map 3D voxel cursor to 2D slice coordinates based on slice orientation
-  // This follows ITK-SNAP's DisplayToAnatomy transform approach
   let sliceX: number, sliceY: number;
 
   if (axis === 'axial') {
-    // Axial: shows XY plane, Z = sliceIdx.axial
-    // cursorX = sagittal index, cursorY = coronal index
-    // Display X = cursorX, Display Y = cursorY (but Y is flipped in canvas)
     sliceX = cursorX;
     sliceY = cursorY;
   } else if (axis === 'coronal') {
-    // Coronal: shows XZ plane, Y = sliceIdx.coronal
-    // Display X = cursorX (sagittal), Display Y = cursorZ (axial)
     sliceX = cursorX;
     sliceY = cursorZ;
   } else {
-    // Sagittal: shows YZ plane, X = sliceIdx.sagittal
-    // Display X = cursorY (coronal), Display Y = cursorZ (axial)
     sliceX = cursorY;
     sliceY = cursorZ;
   }
 
-  // Normalize to 0-1 range for this slice
-  const nx_axis = axis === 'sagittal' ? ny : nx;
-  const ny_axis = axis === 'sagittal' ? nz : (axis === 'coronal' ? nz : ny);
+  const nx_axis = axis === 'sagittal' ? header.ny : header.nx;
+  const ny_axis = axis === 'sagittal' ? header.nz : (axis === 'coronal' ? header.nz : header.ny);
   const cx_norm = sliceX / (nx_axis - 1 || 1);
   const cy_norm = sliceY / (ny_axis - 1 || 1);
 
-  // Get container dimensions
   const containerRect = container.getBoundingClientRect();
 
-  // Image display area calculation (same as paintSlice)
-  const pixelW = axis === 'axial' ? nx * header.dx : axis === 'coronal' ? nx * header.dx : ny * header.dy;
-  const pixelH = axis === 'axial' ? ny * header.dy : axis === 'coronal' ? nz * header.dz : nz * header.dz;
+  const pixelW = axis === 'axial' ? header.nx * header.dx : axis === 'coronal' ? header.nx * header.dx : header.ny * header.dy;
+  const pixelH = axis === 'axial' ? header.ny * header.dy : axis === 'coronal' ? header.nz * header.dz : header.nz * header.dz;
   const ar = pixelW / pixelH;
   let imgW: number, imgH: number;
   if (containerRect.width / containerRect.height > ar) { imgH = containerRect.height; imgW = imgH * ar; }
@@ -433,12 +1274,9 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   imgW *= zoom;
   imgH *= zoom;
 
-  // Image position in container (centered)
   const imgLeft = (containerRect.width - imgW) / 2 + panX;
   const imgTop = (containerRect.height - imgH) / 2 + panY;
 
-  // Crosshair position in screen coordinates
-  // Canvas Y is flipped relative to anatomical Y
   const screenX = imgLeft + cx_norm * imgW;
   const screenY = imgTop + (1 - cy_norm) * imgH;
 
@@ -453,10 +1291,6 @@ function updateScaleBar(axis: string, pixelW: number, pixelH: number, zoom: numb
   const scaleBar = container.querySelector('.scale-bar') as HTMLDivElement;
   if (!scaleBar || cw <= 0) return;
 
-  // pixelW and pixelH are already physical dimensions (nx*dx, ny*dy) in mm
-  // cw is canvas CSS width (already scaled by zoom)
-  // mmPerScreenPixel = physical width / canvas pixel width (without zoom)
-  // Since cw already includes zoom, we need: mmPerScreenPixel = (pixelW * zoom) / cw
   const mmPerScreenPixel = (pixelW * zoom) / cw;
 
   const targetWidth = Math.min(50, cw * 0.35);
@@ -515,7 +1349,6 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
         for (let my = 0; my < mh; my++) {
           for (let mx = 0; mx < mw; mx++) {
             const sx = Math.floor((mx / mw) * w);
-            // Apply Y-flip: minimap top shows slice bottom (same as paintSlice)
             const sy = h - 1 - Math.floor((my / mh) * h);
             const v = sliceData[sy * w + sx];
             const norm = (v - globalMin) / dataRange;
@@ -527,6 +1360,7 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
         }
         mctx.putImageData(imgData, 0, 0);
       }
+      float32Pool.release(sliceData);
     }
   }
 
@@ -573,7 +1407,7 @@ function updateAllDirectionLabels() {
 }
 
 function renderAllViews() {
-  if (!header || !volumeData) return;
+  if (!header) return;
   const { nx, ny, nz, dx, dy, dz } = header;
 
   if (!compareMode) {
@@ -587,32 +1421,35 @@ function renderAllViews() {
     });
   }
 
-  if (compareMode && images.length >= 2) {
+  if (compareMode && images.length >= 2 && volumeData) {
     renderCompareViews();
     return;
   }
 
-  const axialPixelW = nx * dx;
-  const axialPixelH = ny * dy;
-  paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, axialPixelW, axialPixelH);
-
-  const coronalPixelW = nx * dx;
-  const coronalPixelH = nz * dz;
-  paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, coronalPixelW, coronalPixelH);
-
-  const sagittalPixelW = ny * dy;
-  const sagittalPixelH = nz * dz;
-  paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, sagittalPixelW, sagittalPixelH);
-
-  paintMIP();
+  if (volumeData) {
+    paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
+    paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, nx * dx, nz * dz);
+    paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
+    paintMIP();
+  } else {
+    if (currentSlices.axial) paintSlice('axial', currentSlices.axial.data, currentSlices.axial.width, currentSlices.axial.height, nx * dx, ny * dy);
+    if (currentSlices.coronal) paintSlice('coronal', currentSlices.coronal.data, currentSlices.coronal.width, currentSlices.coronal.height, nx * dx, nz * dz);
+    if (currentSlices.sagittal) paintSlice('sagittal', currentSlices.sagittal.data, currentSlices.sagittal.width, currentSlices.sagittal.height, ny * dy, nz * dz);
+  }
 
   updateAllInfo();
   if (crosshairVisible) updateCoordInfoFromCenter();
+
+  if (volumeData) {
+    preloadSlices('axial', sliceIdx.axial);
+    preloadSlices('coronal', sliceIdx.coronal);
+    preloadSlices('sagittal', sliceIdx.sagittal);
+  }
 }
 
 function updateCoordInfoFromCenter() {
   const coordEl = document.getElementById('coord-info');
-  if (!coordEl || !header || !volumeData) return;
+  if (!coordEl || !header) return;
 
   const cx = sliceIdx.sagittal;
   const cy = sliceIdx.coronal;
@@ -621,6 +1458,10 @@ function updateCoordInfoFromCenter() {
   if (compareMode && images.length >= 2) {
     const img0 = images[0];
     const img1 = images[1];
+    if (!img0.data || !img1.data) {
+      coordEl.textContent = '';
+      return;
+    }
     const h0 = img0.header;
     const h1 = img1.header;
     if (cx < 0 || cx >= h0.nx || cy < 0 || cy >= h0.ny || cz < 0 || cz >= h0.nz) {
@@ -643,7 +1484,15 @@ function updateCoordInfoFromCenter() {
     coordEl.textContent = '';
     return;
   }
-  const val = volumeData[cz * header.ny * header.nx + cy * header.nx + cx] * dataSlope + dataInter;
+  let val: number;
+  if (volumeData) {
+    val = volumeData[cz * header.ny * header.nx + cy * header.nx + cx] * dataSlope + dataInter;
+  } else if (currentSlices.axial) {
+    val = currentSlices.axial.data[cy * currentSlices.axial.width + cx];
+  } else {
+    coordEl.textContent = '';
+    return;
+  }
   coordEl.textContent = `x=${cx} y=${cy} z=${cz}\nValue: ${val.toFixed(4)}`;
 }
 
@@ -931,7 +1780,6 @@ function paintMIP() {
   const { nx, ny, nz, dx, dy, dz } = header;
   const mipData = computeMIP(viewState.mip.rotationX, viewState.mip.rotationY);
 
-  // Apply same scale correction as scale bar for anisotropic voxels
   const scaleCorr = dz / Math.sqrt(dx * dy);
   const pixelW = nx * dx * scaleCorr;
   const pixelH = ny * dy;
@@ -983,20 +1831,34 @@ function paintMIP() {
 }
 
 function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
-  if (!header || !volumeData) return;
+  if (!header) return;
   const { nx, ny, nz, dx, dy, dz } = header;
 
-  if (axis === 'axial') {
-    paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
-  } else if (axis === 'coronal') {
-    paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, nx * dx, nz * dz);
+  if (volumeData) {
+    if (axis === 'axial') {
+      paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
+    } else if (axis === 'coronal') {
+      paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, nx * dx, nz * dz);
+    } else {
+      paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
+    }
   } else {
-    paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
+    const slice = currentSlices[axis];
+    if (!slice) return;
+    if (axis === 'axial') {
+      paintSlice('axial', slice.data, slice.width, slice.height, nx * dx, ny * dy);
+    } else if (axis === 'coronal') {
+      paintSlice('coronal', slice.data, slice.width, slice.height, nx * dx, nz * dz);
+    } else {
+      paintSlice('sagittal', slice.data, slice.width, slice.height, ny * dy, nz * dz);
+    }
   }
 
   updateSliceInfo(axis);
   updateSliderValues();
   if (crosshairVisible) updateCoordInfoFromCenter();
+
+  if (volumeData) preloadSlices(axis, sliceIdx[axis]);
 }
 
 function updateAllInfo() {
@@ -1079,7 +1941,8 @@ function autoContrast() {
   if (wwSlider) wwSlider.value = String(Math.round(windowWidth * 100));
   if (wlSlider) wlSlider.value = String(Math.round(windowLevel * 100));
 
-  renderAllViews();
+  if (volumeData) renderAllViews();
+  else void refreshSlices(['axial', 'coronal', 'sagittal']);
 }
 
 function resetViews() {
@@ -1127,7 +1990,133 @@ function toggleMaximize(view: string) {
   requestAnimationFrame(() => renderAllViews());
 }
 
+function applyPreviewData(previewData: any) {
+  header = previewData.header;
+  globalMin = previewData.globalMin;
+  globalMax = previewData.globalMax;
+  dataSlope = previewData.slope || 1;
+  dataInter = previewData.inter || 0;
+  sliceIdx.axial = previewData.sliceIdx.axial;
+  sliceIdx.coronal = previewData.sliceIdx.coronal;
+  sliceIdx.sagittal = previewData.sliceIdx.sagittal;
+
+  setCurrentSlice('axial', new Float32Array(previewData.slices.axial), header!.nx, header!.ny, 1);
+  setCurrentSlice('coronal', new Float32Array(previewData.slices.coronal), header!.nx, header!.nz, 1);
+  setCurrentSlice('sagittal', new Float32Array(previewData.slices.sagittal), header!.ny, header!.nz, 1);
+
+  windowLevel = 0.5;
+  windowWidth = 1.0;
+  initialWindowWidth = windowWidth;
+  initialWindowLevel = windowLevel;
+}
+
+function setPrimaryImageFromPreview(previewData: any) {
+  images.length = 0;
+  images.push({
+    header: previewData.header,
+    data: null,
+    min: previewData.globalMin,
+    max: previewData.globalMax,
+    name: fileName,
+    url: fileUrl,
+    slope: previewData.slope || 1,
+    inter: previewData.inter || 0,
+    preview: {
+      axial: new Float32Array(previewData.slices.axial),
+      coronal: new Float32Array(previewData.slices.coronal),
+      sagittal: new Float32Array(previewData.slices.sagittal),
+    },
+    state: 'preview',
+    lastAccess: Date.now(),
+  });
+  activeImageIdx = 0;
+  publishPerfMonitor();
+}
+
+function decodePreviewBinary(buffer: ArrayBuffer): any {
+  const view = new DataView(buffer);
+  let offset = 0;
+  const headerLen = view.getUint32(offset, true); offset += 4;
+  const headerJson = new TextDecoder().decode(new Uint8Array(buffer, offset, headerLen)); offset += headerLen;
+  const header = JSON.parse(headerJson);
+  const globalMin = view.getFloat32(offset, true); offset += 4;
+  const globalMax = view.getFloat32(offset, true); offset += 4;
+  const sliceIdxData = {
+    axial: view.getUint32(offset, true),
+    coronal: view.getUint32(offset + 4, true),
+    sagittal: view.getUint32(offset + 8, true),
+  };
+  offset += 12;
+  const axialLen = view.getUint32(offset, true); offset += 4;
+  const axial = new Float32Array(buffer.slice(offset, offset + axialLen)); offset += axialLen;
+  const coronalLen = view.getUint32(offset, true); offset += 4;
+  const coronal = new Float32Array(buffer.slice(offset, offset + coronalLen)); offset += coronalLen;
+  const sagittalLen = view.getUint32(offset, true); offset += 4;
+  const sagittal = new Float32Array(buffer.slice(offset, offset + sagittalLen));
+  return {
+    header,
+    globalMin,
+    globalMax,
+    sliceIdx: sliceIdxData,
+    slope: header.scl_slope || 1,
+    inter: header.scl_inter || 0,
+    slices: { axial, coronal, sagittal },
+  };
+}
+
+async function fetchWithRetry(url: string, responseType: 'json' | 'arrayBuffer'): Promise<any | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const fetchStart = Date.now();
+    const resp = await fetch(url);
+    if (resp.ok) {
+      const payload = responseType === 'arrayBuffer' ? await resp.arrayBuffer() : await resp.json();
+      const fetchDuration = Date.now() - fetchStart;
+      const contentLength = Number(resp.headers.get('Content-Length') || 0);
+      bandwidthEstimator.addSample(contentLength || (responseType === 'arrayBuffer' ? payload.byteLength : JSON.stringify(payload).length), Math.max(1, fetchDuration));
+      return payload;
+    }
+    const retryable = resp.status === 408 || resp.status === 425 || resp.status === 429 || resp.status >= 500;
+    if (!retryable || attempt === 2) return null;
+    await new Promise(resolve => window.setTimeout(resolve, 200 * Math.pow(2, attempt)));
+  }
+  return null;
+}
+
+async function fetchPreviewData(url: string = fileUrl): Promise<any | null> {
+  if (previewRequestCache.has(url)) {
+    return previewRequestCache.get(url)!;
+  }
+  const request = (async () => {
+    const startedAt = performance.now();
+    let previewData: any | null = null;
+    if (viewerConfig.previewMode === 'binary') {
+      const previewBinUrl = url.replace('/file/', '/preview-bin/');
+      const buffer = await fetchWithRetry(previewBinUrl, 'arrayBuffer');
+      if (buffer) {
+        previewData = decodePreviewBinary(buffer);
+      }
+    }
+    if (!previewData) {
+      const previewUrl = url.replace('/file/', '/preview/');
+      previewData = await fetchWithRetry(previewUrl, 'json');
+    }
+    if (previewData) {
+      perfMonitor.previewLoads.push(performance.now() - startedAt);
+      publishPerfMonitor();
+    }
+    return previewData;
+  })().finally(() => {
+    previewRequestCache.delete(url);
+  });
+  previewRequestCache.set(url, request);
+  return request;
+}
+
+let directPreviewReceived = false;
+let directPreviewTimer: number | null = null;
+
 window.addEventListener('DOMContentLoaded', () => {
+  publishPerfMonitor();
   vscode.postMessage({ type: 'ready' });
 });
 
@@ -1135,8 +2124,21 @@ window.addEventListener('message', async (e) => {
   const msg = e.data;
 
   if (msg.type === 'newImage') {
-    // Load new image from file picker result
-    loadNewImage(msg.fileUrl, msg.fileName, msg.isGzip);
+    loadNewImage(msg.fileUrl, msg.fileName, msg.isGzip, msg.isRemote);
+    return;
+  }
+
+  if (msg.type === 'preview') {
+    directPreviewReceived = true;
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+    handleDirectPreview(msg);
+    return;
+  }
+
+  if (msg.type === 'cachedVolume') {
+    directPreviewReceived = true;
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+    handleCachedVolume(msg);
     return;
   }
 
@@ -1145,11 +2147,177 @@ window.addEventListener('message', async (e) => {
   fileUrl = msg.fileUrl;
   fileName = msg.fileName;
   isGzip = fileName.endsWith('.gz');
+  isRemoteSource = !!msg.isRemote;
+  viewerConfig.previewMode = msg.previewMode || viewerConfig.previewMode;
+  viewerConfig.renderBackend = msg.renderBackend || viewerConfig.renderBackend;
+  viewerConfig.fullVolumePolicy = msg.fullVolumePolicy || viewerConfig.fullVolumePolicy;
+  viewerConfig.nativeAcceleration = msg.nativeAcceleration || viewerConfig.nativeAcceleration;
+  fullVolumeLoaded = false;
+  volumeData = null;
+  currentSlices.axial = null;
+  currentSlices.coronal = null;
+  currentSlices.sagittal = null;
   colormap = msg.defaultColormap || 'gray';
 
   const cmapSelect = document.getElementById('colormap') as HTMLSelectElement;
   if (cmapSelect && msg.defaultColormap) cmapSelect.value = msg.defaultColormap;
 
+  directPreviewReceived = false;
+  directPreviewTimer = window.setTimeout(() => {
+    directPreviewTimer = null;
+    if (!directPreviewReceived) {
+      fallbackToHttpPreview();
+    }
+  }, 800);
+});
+
+function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
+  if (val instanceof ArrayBuffer) return new Float32Array(val);
+  if (ArrayBuffer.isView(val)) return new Float32Array(val.buffer, val.byteOffset, val.byteLength / 4);
+  const arr = msg.slices?.[fallbackKey];
+  if (Array.isArray(arr)) return new Float32Array(arr);
+  if (Array.isArray(val)) return new Float32Array(val);
+  return new Float32Array(0);
+}
+
+function handleDirectPreview(msg: any): void {
+  header = msg.header;
+  globalMin = msg.globalMin;
+  globalMax = msg.globalMax;
+  dataSlope = msg.slope || 1;
+  dataInter = msg.inter || 0;
+  sliceIdx.axial = msg.sliceIdx.axial;
+  sliceIdx.coronal = msg.sliceIdx.coronal;
+  sliceIdx.sagittal = msg.sliceIdx.sagittal;
+
+  const axial = toFloat32Array(msg.axialSlice, 'axial', msg);
+  const coronal = toFloat32Array(msg.coronalSlice, 'coronal', msg);
+  const sagittal = toFloat32Array(msg.sagittalSlice, 'sagittal', msg);
+
+  if (axial.length === 0) {
+    fallbackToHttpPreview();
+    return;
+  }
+
+  setCurrentSlice('axial', axial, header!.nx, header!.ny, 1);
+  setCurrentSlice('coronal', coronal, header!.nx, header!.nz, 1);
+  setCurrentSlice('sagittal', sagittal, header!.ny, header!.nz, 1);
+
+  windowLevel = 0.5;
+  windowWidth = 1.0;
+  initialWindowWidth = windowWidth;
+  initialWindowLevel = windowLevel;
+
+  setPrimaryImageFromDirectPreview(msg, axial, coronal, sagittal);
+  updateFileInfo();
+  updateSliderValues();
+  updateImagePicker();
+  renderAllViews();
+  loading.style.display = 'none';
+  updateProgress(0.5);
+  setupInteraction();
+
+  if (msg.partialPreview || viewerConfig.fullVolumePolicy === 'debounced') {
+    scheduleActiveImageLoad(0);
+  } else if (viewerConfig.fullVolumePolicy === 'eager') {
+    void ensureImageData(0, 'active').catch((err) => {
+      if ((err as any)?.name !== 'AbortError') loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
+    });
+  }
+}
+
+function handleCachedVolume(msg: any): void {
+  header = msg.header;
+  globalMin = msg.globalMin;
+  globalMax = msg.globalMax;
+  dataSlope = msg.slope || 1;
+  dataInter = msg.inter || 0;
+  sliceIdx.axial = msg.sliceIdx.axial;
+  sliceIdx.coronal = msg.sliceIdx.coronal;
+  sliceIdx.sagittal = msg.sliceIdx.sagittal;
+
+  const datatype = msg.datatype || 16;
+  let voxelBuffer: ArrayBuffer | null = null;
+  if (msg.voxelData instanceof ArrayBuffer) {
+    voxelBuffer = msg.voxelData;
+  } else if (Array.isArray(msg.voxelData)) {
+    const f32 = new Float32Array(msg.voxelData);
+    voxelBuffer = f32.buffer.slice(f32.byteOffset, f32.byteOffset + f32.byteLength);
+  }
+
+  if (voxelBuffer) {
+    switch (datatype) {
+      case 2: volumeData = new Uint8Array(voxelBuffer); break;
+      case 4: volumeData = new Int16Array(voxelBuffer); break;
+      case 8: volumeData = new Int32Array(voxelBuffer); break;
+      case 16: volumeData = new Float32Array(voxelBuffer); break;
+      case 64: volumeData = new Float64Array(voxelBuffer); break;
+      case 256: volumeData = new Int8Array(voxelBuffer); break;
+      case 512: volumeData = new Uint16Array(voxelBuffer); break;
+      case 768: volumeData = new Uint32Array(voxelBuffer); break;
+      default: volumeData = new Float32Array(voxelBuffer); break;
+    }
+    fullVolumeLoaded = true;
+  }
+
+  if (!voxelBuffer) {
+    fallbackToHttpPreview();
+    return;
+  }
+
+  autoContrast();
+  initialWindowWidth = windowWidth;
+  initialWindowLevel = windowLevel;
+
+  images.length = 0;
+  images.push({
+    header: msg.header,
+    data: volumeData,
+    min: msg.globalMin,
+    max: msg.globalMax,
+    name: fileName,
+    url: fileUrl,
+    slope: msg.slope || 1,
+    inter: msg.inter || 0,
+    state: volumeData ? 'ready' : 'preview',
+    lastAccess: Date.now(),
+  });
+  activeImageIdx = 0;
+  publishPerfMonitor();
+
+  updateFileInfo();
+  updateSliderValues();
+  updateImagePicker();
+  renderAllViews();
+  loading.style.display = 'none';
+  updateProgress(1.0);
+  setupInteraction();
+
+  if (!volumeData) {
+    scheduleActiveImageLoad(0);
+  }
+}
+
+function setPrimaryImageFromDirectPreview(msg: any, axial: Float32Array, coronal: Float32Array, sagittal: Float32Array): void {
+  images.length = 0;
+  images.push({
+    header: msg.header,
+    data: null,
+    min: msg.globalMin,
+    max: msg.globalMax,
+    name: fileName,
+    url: fileUrl,
+    slope: msg.slope || 1,
+    inter: msg.inter || 0,
+    preview: { axial, coronal, sagittal },
+    state: 'preview',
+    lastAccess: Date.now(),
+  });
+  activeImageIdx = 0;
+  publishPerfMonitor();
+}
+
+async function fallbackToHttpPreview(): Promise<void> {
   try {
     loadingText.textContent = 'Loading preview...';
     updateProgress(0.01, 'Fetching preview...', 'Preview');
@@ -1157,41 +2325,26 @@ window.addEventListener('message', async (e) => {
     const worker = await getWorker();
     worker.onerror = (err) => { loadingText.textContent = 'Worker error: ' + (err.message || 'unknown'); };
 
-    const previewUrl = fileUrl.replace('/file/', '/preview/');
     try {
-      const previewResp = await fetch(previewUrl);
-      if (previewResp.ok) {
-        const previewData = await previewResp.json();
-        if (previewData && previewData.header && previewData.slices) {
-          header = previewData.header;
-          globalMin = previewData.globalMin;
-          globalMax = previewData.globalMax;
-          dataSlope = previewData.slope || 1;
-          dataInter = previewData.inter || 0;
-
-          sliceIdx.axial = previewData.sliceIdx.axial;
-          sliceIdx.coronal = previewData.sliceIdx.coronal;
-          sliceIdx.sagittal = previewData.sliceIdx.sagittal;
-
-          autoContrast();
-          initialWindowWidth = windowWidth;
-          initialWindowLevel = windowLevel;
-
-          const h = header!;
-          paintSlice('axial', new Float32Array(previewData.slices.axial), h.nx, h.ny, h.nx * h.dx, h.ny * h.dy);
-          paintSlice('coronal', new Float32Array(previewData.slices.coronal), h.nx, h.nz, h.nx * h.dx, h.nz * h.dz);
-          paintSlice('sagittal', new Float32Array(previewData.slices.sagittal), h.ny, h.nz, h.ny * h.dy, h.nz * h.dz);
-
-          updateFileInfo();
-          updateSliderValues();
-
-          loading.style.display = 'none';
-          updateProgress(0.5);
-          setupInteraction();
-
-          loadFullVolume(worker);
-          return;
+      const previewData = await fetchPreviewData();
+      if (previewData && previewData.header && previewData.slices) {
+        applyPreviewData(previewData);
+        setPrimaryImageFromPreview(previewData);
+        updateFileInfo();
+        updateSliderValues();
+        updateImagePicker();
+        renderAllViews();
+        loading.style.display = 'none';
+        updateProgress(0.5);
+        setupInteraction();
+        if (viewerConfig.fullVolumePolicy === 'eager') {
+          void ensureImageData(0, 'active').catch((err) => {
+            if ((err as any)?.name !== 'AbortError') loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
+          });
+        } else if (viewerConfig.fullVolumePolicy === 'debounced') {
+          scheduleActiveImageLoad(0);
         }
+        return;
       }
     } catch (_) {}
 
@@ -1199,11 +2352,10 @@ window.addEventListener('message', async (e) => {
   } catch (err: any) {
     loadingText.textContent = 'Error: ' + (err?.message ?? String(err));
   }
-});
+}
 
 async function loadFullVolume(worker: Worker) {
-  worker.onmessage = (ev) => {
-    const d = ev.data;
+  workerStreamListener = (d) => {
     if (d.type === 'progress') {
       updateProgress(0.5 + d.value * 0.5, undefined, d.stage ? `${d.stage}...` : undefined);
       return;
@@ -1245,10 +2397,38 @@ async function loadFullVolume(worker: Worker) {
     }
     if (d.type === 'volume') {
       volumeData = d.voxelData;
-
-      images.length = 0;
-      images.push({ header: d.header, data: d.voxelData, min: d.globalMin, max: d.globalMax, name: fileName, url: fileUrl, slope: d.slope || 1, inter: d.inter || 0 });
-      activeImageIdx = 0;
+      fullVolumeLoaded = true;
+      const primary = images[0];
+      if (primary) {
+        primary.header = d.header;
+        primary.data = d.voxelData;
+        primary.min = d.globalMin;
+        primary.max = d.globalMax;
+        primary.slope = d.slope || 1;
+        primary.inter = d.inter || 0;
+        primary.state = 'ready';
+        primary.lastAccess = Date.now();
+      } else {
+        images.push({
+          header: d.header,
+          data: d.voxelData,
+          min: d.globalMin,
+          max: d.globalMax,
+          name: fileName,
+          url: fileUrl,
+          slope: d.slope || 1,
+          inter: d.inter || 0,
+          preview: currentSlices.axial && currentSlices.coronal && currentSlices.sagittal ? {
+            axial: new Float32Array(currentSlices.axial.data),
+            coronal: new Float32Array(currentSlices.coronal.data),
+            sagittal: new Float32Array(currentSlices.sagittal.data),
+          } : undefined,
+          state: 'ready',
+          lastAccess: Date.now(),
+        });
+        activeImageIdx = 0;
+      }
+      publishPerfMonitor();
 
       updateImagePicker();
       updateProgress(1.0);
@@ -1266,7 +2446,7 @@ function updateProgress(value: number, text?: string, detail?: string) {
   if (detail !== undefined) loadingDetail.textContent = detail;
 }
 
-function switchToImage(idx: number) {
+async function switchToImage(idx: number) {
   if (idx < 0 || idx >= images.length) return;
 
   const prevHeader = header;
@@ -1274,13 +2454,7 @@ function switchToImage(idx: number) {
 
   activeImageIdx = idx;
   const img = images[idx];
-  header = img.header;
-  volumeData = img.data;
-  dataSlope = img.slope;
-  dataInter = img.inter;
-  globalMin = img.min;
-  globalMax = img.max;
-  fileName = img.name;
+  applyImageState(img);
 
   if (header) {
     if (prevHeader && images.length > 1) {
@@ -1299,6 +2473,10 @@ function switchToImage(idx: number) {
   viewState.coronal = { zoom: 1, panX: 0, panY: 0 };
   viewState.sagittal = { zoom: 1, panX: 0, panY: 0 };
   viewState.mip = { rotationX: 0, rotationY: 0 };
+  if (!img.data) {
+    primeSliceFramesFromPreview(img);
+    void refreshSlices(['axial', 'coronal', 'sagittal'], true).catch(() => {});
+  }
 
   autoContrast();
   initialWindowWidth = windowWidth;
@@ -1308,31 +2486,51 @@ function switchToImage(idx: number) {
   updateSliderValues();
   updateImagePicker();
   renderAllViews();
+  if (!img.data) {
+    scheduleActiveImageLoad(idx);
+  } else {
+    scheduledActiveIndex = null;
+    if (activeLoadDebounceTimer) {
+      window.clearTimeout(activeLoadDebounceTimer);
+      activeLoadDebounceTimer = null;
+    }
+    publishPerfMonitor();
+  }
 }
 
 function updateImagePicker() {
   const picker = document.getElementById('image-list');
   if (!picker) return;
+  if (!thumbnailObserver && 'IntersectionObserver' in window) {
+    thumbnailObserver = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const canvas = entry.target as HTMLCanvasElement;
+        const index = Number(canvas.dataset.imageIdx || '-1');
+        if (index >= 0 && images[index]) {
+          renderThumbnail(canvas, images[index]);
+        }
+        thumbnailObserver?.unobserve(canvas);
+      }
+    }, { root: picker, rootMargin: '48px' });
+  }
   picker.innerHTML = '';
   images.forEach((img, idx) => {
     const item = document.createElement('div');
     item.className = 'image-item' + (idx === activeImageIdx ? ' active' : '');
 
-    // Create thumbnail
     const thumb = document.createElement('div');
     thumb.className = 'image-item-thumb';
     const thumbCanvas = document.createElement('canvas');
     thumb.appendChild(thumbCanvas);
     item.appendChild(thumb);
 
-    // Create name
     const name = document.createElement('span');
     name.className = 'image-item-name';
     name.textContent = img.name;
     name.title = img.name;
     item.appendChild(name);
 
-    // Create remove button (only if more than 1 image)
     if (images.length > 1) {
       const remove = document.createElement('div');
       remove.className = 'image-item-remove';
@@ -1343,32 +2541,42 @@ function updateImagePicker() {
         if (images.length > 1) {
           images.splice(idx, 1);
           if (activeImageIdx >= images.length) activeImageIdx = images.length - 1;
-          switchToImage(activeImageIdx);
+          void switchToImage(activeImageIdx);
         }
       });
       item.appendChild(remove);
     }
 
-    item.addEventListener('click', () => switchToImage(idx));
+    item.addEventListener('click', () => void switchToImage(idx));
     picker.appendChild(item);
-
-    // Render thumbnail
-    renderThumbnail(thumbCanvas, img);
+    thumbCanvas.dataset.imageIdx = String(idx);
+    if (idx === activeImageIdx || idx < 3 || !thumbnailObserver) {
+      const renderThumb = () => renderThumbnail(thumbCanvas, img);
+      if ('requestIdleCallback' in window) {
+        (window as any).requestIdleCallback(renderThumb, { timeout: 120 });
+      } else {
+        globalThis.setTimeout(renderThumb, 0);
+      }
+    } else {
+      thumbnailObserver.observe(thumbCanvas);
+    }
   });
 }
 
 function renderThumbnail(canvas: HTMLCanvasElement, img: VolumeImage) {
-  if (!img.header || !img.data) return;
+  if (!img.header) return;
   const { nx, ny, nz } = img.header;
-  const sliceIdx = Math.floor(nz / 2);
-  const slice = new Float32Array(nx * ny);
-  const base = sliceIdx * nx * ny;
-  const s = img.slope, t = img.inter;
-  const needScale = s !== 1 || t !== 0;
-  if (needScale) {
-    for (let i = 0; i < nx * ny; i++) slice[i] = img.data[base + i] * s + t;
-  } else {
-    for (let i = 0; i < nx * ny; i++) slice[i] = img.data[base + i];
+  const slice = img.preview?.axial ? new Float32Array(img.preview.axial) : new Float32Array(nx * ny);
+  if (!img.preview?.axial && img.data) {
+    const sliceIdx = Math.floor(nz / 2);
+    const base = sliceIdx * nx * ny;
+    const s = img.slope, t = img.inter;
+    const needScale = s !== 1 || t !== 0;
+    if (needScale) {
+      for (let i = 0; i < nx * ny; i++) slice[i] = img.data[base + i] * s + t;
+    } else {
+      for (let i = 0; i < nx * ny; i++) slice[i] = img.data[base + i];
+    }
   }
 
   const dpr = 2;
@@ -1408,24 +2616,41 @@ function renderThumbnail(canvas: HTMLCanvasElement, img: VolumeImage) {
   ctx.restore();
 }
 
-async function loadNewImage(url: string, name: string, gz: boolean) {
+function primeSliceFramesFromPreview(img: VolumeImage): void {
+  if (!img.preview) return;
+  setCurrentSlice('axial', new Float32Array(img.preview.axial), img.header.nx, img.header.ny, 1);
+  setCurrentSlice('coronal', new Float32Array(img.preview.coronal), img.header.nx, img.header.nz, 1);
+  setCurrentSlice('sagittal', new Float32Array(img.preview.sagittal), img.header.ny, img.header.nz, 1);
+}
+
+async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: boolean) {
   try {
-    const worker = await getWorker();
-
-    worker.onmessage = (ev) => {
-      const d = ev.data;
-      if (d.type === 'progress') return;
-      if (d.type === 'error') {
-        console.error('Failed to load image:', d.error);
-        return;
-      }
-      if (d.type === 'volume') {
-        images.push({ header: d.header, data: d.voxelData, min: d.globalMin, max: d.globalMax, name, url, slope: d.slope || 1, inter: d.inter || 0 });
-        switchToImage(images.length - 1);
-      }
-    };
-
-    worker.postMessage({ id: images.length, type: 'loadVolume', url, isGzip: gz });
+    const previewData = await fetchPreviewData(url);
+    if (!previewData?.header || !previewData?.slices) {
+      throw new Error('Preview unavailable');
+    }
+    images.push({
+      header: previewData.header,
+      data: null,
+      min: previewData.globalMin,
+      max: previewData.globalMax,
+      name,
+      url,
+      slope: previewData.slope || 1,
+      inter: previewData.inter || 0,
+      preview: {
+        axial: new Float32Array(previewData.slices.axial),
+        coronal: new Float32Array(previewData.slices.coronal),
+        sagittal: new Float32Array(previewData.slices.sagittal),
+      },
+      state: 'preview',
+      lastAccess: Date.now(),
+    });
+    publishPerfMonitor();
+    updateImagePicker();
+    if (images.length === 2) {
+      void switchToImage(images.length - 1);
+    }
   } catch (err) {
     console.error('Failed to load image:', err);
   }
@@ -1433,6 +2658,8 @@ async function loadNewImage(url: string, name: string, gz: boolean) {
 
 function setupInteraction() {
   if (!header) return;
+  if (interactionInitialized) return;
+  interactionInitialized = true;
 
   const wwSlider = document.getElementById('ww-slider') as HTMLInputElement;
   const wlSlider = document.getElementById('wl-slider') as HTMLInputElement;
@@ -1453,7 +2680,7 @@ function setupInteraction() {
 
   wwSlider?.addEventListener('input', () => { windowWidth = Number(wwSlider.value) / 100; scheduleRender(); });
   wlSlider?.addEventListener('input', () => { windowLevel = Number(wlSlider.value) / 100; scheduleRender(); });
-  cmapSelect?.addEventListener('change', () => { colormap = cmapSelect.value; scheduleRender(); });
+  cmapSelect?.addEventListener('change', () => { colormap = cmapSelect.value; sliceRenderCache.clear(); scheduleRender(); });
   btnAuto?.addEventListener('click', autoContrast);
   btnReset?.addEventListener('click', resetViews);
 
@@ -1466,9 +2693,21 @@ function setupInteraction() {
   });
 
   const btnCompare = document.getElementById('btn-compare') as HTMLButtonElement;
-  btnCompare?.addEventListener('click', () => {
+  btnCompare?.addEventListener('click', async () => {
     if (images.length < 2) return;
+    if (activeLoadDebounceTimer) {
+      window.clearTimeout(activeLoadDebounceTimer);
+      activeLoadDebounceTimer = null;
+      scheduledActiveIndex = null;
+    }
     if (!compareMode) {
+      try {
+        await ensureImageData(0, 'active');
+        await ensureImageData(1, 'active');
+      } catch (err) {
+        console.error('Failed to prepare compare mode:', err);
+        return;
+      }
       compareMode = true;
       compareLayout = 'overlay';
     } else if (compareLayout === 'overlay') {
@@ -1483,12 +2722,7 @@ function setupInteraction() {
     if (overlayControls) overlayControls.style.display = compareMode ? 'block' : 'none';
     if (compareMode) {
       const img0 = images[0];
-      header = img0.header;
-      volumeData = img0.data;
-      dataSlope = img0.slope;
-      dataInter = img0.inter;
-      globalMin = img0.min;
-      globalMax = img0.max;
+      applyImageState(img0, true);
       activeImageIdx = 0;
       sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
       sliceIdx.coronal = Math.min(sliceIdx.coronal, img0.header.ny - 1);
@@ -1589,7 +2823,11 @@ function setupInteraction() {
   });
 
   const bindSlider = (sliderId: string, sideSliderId: string, axis: 'axial' | 'coronal' | 'sagittal') => {
-    const handler = (val: number) => { sliceIdx[axis] = val; updateSingleView(axis); };
+    const handler = (val: number) => {
+      sliceIdx[axis] = val;
+      if (volumeData) updateSingleView(axis);
+      else void refreshSlices([axis], true);
+    };
     const sl = document.getElementById(sliderId) as HTMLInputElement;
     const ssl = document.getElementById(sideSliderId) as HTMLInputElement;
     sl?.addEventListener('input', () => handler(parseInt(sl.value)));
@@ -1610,6 +2848,10 @@ function setupInteraction() {
   for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
     const canvas = canvases[axis];
 
+    let scrollAccumulator = 0;
+    const SCROLL_THRESHOLD = perfProfile.tier === 'low' ? 30 : 15;
+    let lastScrollTime = 0;
+
     canvas.addEventListener('wheel', (e) => {
       e.preventDefault();
       if (!header) return;
@@ -1617,14 +2859,27 @@ function setupInteraction() {
       if (e.ctrlKey || e.metaKey) {
         const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
         viewState[axis].zoom = Math.max(0.5, Math.min(10, viewState[axis].zoom * zoomFactor));
-        renderAllViews();
+        scheduleRender();
       } else {
-        const delta = e.deltaY > 0 ? 1 : -1;
-        const max = axis === 'axial' ? header.nz - 1 : axis === 'coronal' ? header.ny - 1 : header.nx - 1;
-        const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
-        if (newIdx !== sliceIdx[axis]) {
-          sliceIdx[axis] = newIdx;
-          renderAllViews();
+        const now = Date.now();
+        const timeDelta = now - lastScrollTime;
+        lastScrollTime = now;
+
+        const velocity = timeDelta > 0 ? Math.abs(e.deltaY) / timeDelta : 0;
+        const adaptiveStep = velocity > 2 ? 2 : 1;
+
+        scrollAccumulator += e.deltaY * (velocity > 2 ? 0.5 : 1);
+
+        if (Math.abs(scrollAccumulator) >= SCROLL_THRESHOLD) {
+          const delta = scrollAccumulator > 0 ? adaptiveStep : -adaptiveStep;
+          scrollAccumulator = 0;
+          const max = axis === 'axial' ? header.nz - 1 : axis === 'coronal' ? header.ny - 1 : header.nx - 1;
+          const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
+          if (newIdx !== sliceIdx[axis]) {
+            sliceIdx[axis] = newIdx;
+            if (volumeData) updateSingleView(axis);
+            else void refreshSlices([axis], true);
+          }
         }
       }
     }, { passive: false });
@@ -1783,7 +3038,8 @@ function setupInteraction() {
             sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor((1 - ny_click) * h0_)));
           }
         }
-        renderAllViews();
+        if (volumeData) renderAllViews();
+        else void refreshSlices(['axial', 'coronal', 'sagittal']);
         return;
       }
 
@@ -1818,11 +3074,12 @@ function setupInteraction() {
         sliceIdx.axial = Math.max(0, Math.min(nz - 1, Math.floor((1 - ny_click) * nz)));
       }
 
-      renderAllViews();
+      if (volumeData) renderAllViews();
+      else void refreshSlices(['axial', 'coronal', 'sagittal']);
     });
 
     canvas.addEventListener('mousemove', (e) => {
-      if (!header || !volumeData) return;
+      if (!header) return;
       if (crosshairVisible) {
         updateCoordInfoFromCenter();
         return;
@@ -1836,6 +3093,10 @@ function setupInteraction() {
       if (compareMode && images.length >= 2) {
         const img0 = images[0];
         const img1 = images[1];
+        if (!img0.data || !img1.data) {
+          coordEl.textContent = '';
+          return;
+        }
         const h0 = img0.header;
         const h1 = img1.header;
         const vs = viewState[axis];
@@ -1864,9 +3125,13 @@ function setupInteraction() {
           else if (axis === 'coronal') { px = Math.floor(nx_m * w); pz = Math.floor((1 - ny_m) * h_); py = sliceIdx.coronal; }
           else { py = Math.floor(nx_m * w); pz = Math.floor((1 - ny_m) * h_); px = sliceIdx.sagittal; }
           if (px >= 0 && px < hi.nx && py >= 0 && py < hi.ny && pz >= 0 && pz < hi.nz) {
+            const other = isRight ? img0 : img1;
+            if (!img.data || !other.data) {
+              coordEl.textContent = '';
+              return;
+            }
             const val = img.data[pz * hi.ny * hi.nx + py * hi.nx + px] * img.slope + img.inter;
             const [wx, wy, wz] = voxelToWorld(hi, px, py, pz);
-            const other = isRight ? img0 : img1;
             const oh = other.header;
             const [ox, oy, oz] = worldToVoxel(oh, wx, wy, wz);
             const oxi = Math.round(ox), oyi = Math.round(oy), ozi = Math.round(oz);
@@ -1900,6 +3165,10 @@ function setupInteraction() {
           else if (axis === 'coronal') { px = Math.floor(nx_mouse * nx); pz = Math.floor((1 - ny_mouse) * nz); py = sliceIdx.coronal; }
           else { py = Math.floor(nx_mouse * ny); pz = Math.floor((1 - ny_mouse) * nz); px = sliceIdx.sagittal; }
           if (px >= 0 && px < nx && py >= 0 && py < ny && pz >= 0 && pz < nz) {
+            if (!img0.data || !img1.data) {
+              coordEl.textContent = '';
+              return;
+            }
             const val0 = img0.data[pz * ny * nx + py * nx + px] * img0.slope + img0.inter;
             const [wx, wy, wz] = voxelToWorld(h0, px, py, pz);
             const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
@@ -1951,8 +3220,20 @@ function setupInteraction() {
       }
 
       if (px >= 0 && px < nx && py >= 0 && py < ny && pz >= 0 && pz < nz) {
-        const val = volumeData[pz * ny * nx + py * nx + px];
-        coordEl.textContent = `x=${px} y=${py} z=${pz}\nValue: ${val.toFixed(4)}`;
+        let val: number | null = null;
+        if (volumeData) {
+          val = volumeData[pz * ny * nx + py * nx + px] * dataSlope + dataInter;
+        } else {
+          const frame = currentSlices[axis];
+          const geometry = getAxisGeometry(axis);
+          if (frame) {
+            const sx = Math.max(0, Math.min(frame.width - 1, Math.floor((px / Math.max(1, geometry.width - 1)) * Math.max(1, frame.width - 1))));
+            const syBase = axis === 'axial' ? py : pz;
+            const sy = Math.max(0, Math.min(frame.height - 1, Math.floor((syBase / Math.max(1, geometry.height - 1)) * Math.max(1, frame.height - 1))));
+            val = frame.data[sy * frame.width + sx];
+          }
+        }
+        if (val !== null) coordEl.textContent = `x=${px} y=${py} z=${pz}\nValue: ${val.toFixed(4)}`;
       }
     });
 

@@ -3,6 +3,7 @@ dist/
 *.vsix
 .vscode/
 .claude/
+.trae/
 good-examples/
 *.nii
 *.nii.gz
@@ -10,3 +11,5 @@ good-examples/
 .DS_Store
 Thumbs.db
 *.map
+native/target/
+native/index.node

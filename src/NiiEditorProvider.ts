@@ -1,11 +1,81 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { LocalFileProxy } from './LocalFileProxy';
+import { VolumeCache } from './VolumeCache';
+
+interface LoadJob {
+  webviewId: string;
+  priority: number;
+  isRemote: boolean;
+  abortController: AbortController;
+  execute: () => Promise<void>;
+}
+
+class LoadQueue {
+  private queue: LoadJob[] = [];
+  private activeRemote = 0;
+  private activeLocal = 0;
+  private maxRemote = 1;
+  private maxLocal = 2;
+
+  enqueue(job: LoadJob): void {
+    this.queue.push(job);
+    this.queue.sort((a, b) => b.priority - a.priority);
+    this.processNext();
+  }
+
+  promote(webviewId: string): void {
+    const idx = this.queue.findIndex(j => j.webviewId === webviewId);
+    if (idx >= 0) {
+      this.queue[idx].priority = 100;
+      this.queue.sort((a, b) => b.priority - a.priority);
+    }
+  }
+
+  cancel(webviewId: string): void {
+    for (let i = this.queue.length - 1; i >= 0; i--) {
+      if (this.queue[i].webviewId === webviewId) {
+        this.queue[i].abortController.abort();
+        this.queue.splice(i, 1);
+      }
+    }
+  }
+
+  private processNext(): void {
+    while (this.queue.length > 0) {
+      const remoteOk = this.activeRemote < this.maxRemote;
+      const localOk = this.activeLocal < this.maxLocal;
+      if (!remoteOk && !localOk) break;
+
+      const idx = this.queue.findIndex(j => {
+        if (j.abortController.signal.aborted) return false;
+        return j.isRemote ? remoteOk : localOk;
+      });
+      if (idx < 0) break;
+
+      const job = this.queue.splice(idx, 1)[0];
+      if (job.isRemote) this.activeRemote++;
+      else this.activeLocal++;
+      job.execute().finally(() => {
+        if (job.isRemote) this.activeRemote--;
+        else this.activeLocal--;
+        this.processNext();
+      });
+    }
+  }
+}
 
 export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private proxy: LocalFileProxy | null = null;
+  private volumeCache: VolumeCache;
+  private loadQueue: LoadQueue;
+  private webviewCounter = 0;
+  private activeWebviews = new Map<string, { panel: vscode.WebviewPanel; abortController: AbortController }>();
 
-  constructor(private readonly context: vscode.ExtensionContext) {}
+  constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
+    this.volumeCache = volumeCache;
+    this.loadQueue = new LoadQueue();
+  }
 
   async openCustomDocument(
     uri: vscode.Uri,
@@ -22,6 +92,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   ): Promise<void> {
     const uri = document.uri;
     const webview = webviewPanel.webview;
+    const webviewId = String(this.webviewCounter++);
+
+    const abortController = new AbortController();
+    this.activeWebviews.set(webviewId, { panel: webviewPanel, abortController });
 
     webview.options = {
       enableScripts: true,
@@ -34,30 +108,57 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
     const isRemote = uri.scheme !== 'file';
     let fileUrl: string;
+    let entryId: string | null = null;
 
     if (isRemote) {
       if (!this.proxy) {
-        this.proxy = new LocalFileProxy();
+        this.proxy = new LocalFileProxy(this.volumeCache);
         await this.proxy.start();
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
       fileUrl = this.proxy.registerFile(uri);
+      entryId = fileUrl.split('/').pop()!;
     } else {
       fileUrl = webview.asWebviewUri(uri).toString();
     }
 
     webview.html = this.buildHtml(webview, fileUrl, uri.fsPath ?? uri.toString());
 
+    webviewPanel.onDidChangeViewState(() => {
+      if (webviewPanel.active) {
+        this.loadQueue.promote(webviewId);
+        this.volumeCache.setActive(uri.toString(), webviewId);
+      }
+    });
+
+    webviewPanel.onDidDispose(() => {
+      abortController.abort();
+      this.loadQueue.cancel(webviewId);
+      this.volumeCache.setActive(uri.toString(), null);
+      this.activeWebviews.delete(webviewId);
+    });
+
     webview.onDidReceiveMessage(async (msg) => {
       if (msg.type === 'ready') {
         const config = vscode.workspace.getConfiguration('niiFastView');
+
         webview.postMessage({
           type: 'config',
           enableLOD: config.get('enableLOD', true),
           defaultColormap: config.get('defaultColormap', 'gray'),
+          previewMode: config.get('previewMode', 'binary'),
+          renderBackend: config.get('renderBackend', 'canvas'),
+          fullVolumePolicy: config.get('fullVolumePolicy', 'debounced'),
+          nativeAcceleration: config.get('nativeAcceleration', 'auto'),
+          isRemote,
           fileUrl,
           fileName: path.basename(uri.fsPath ?? uri.toString()),
+          webviewId,
         });
+
+        if (isRemote && entryId) {
+          this.startPreviewLoad(entryId, webview, webviewId, uri, abortController.signal);
+        }
       } else if (msg.type === 'selectImage') {
         const files = await vscode.window.showOpenDialog({
           canSelectMany: false,
@@ -71,7 +172,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
           if (imgIsRemote) {
             if (!this.proxy) {
-              this.proxy = new LocalFileProxy();
+              this.proxy = new LocalFileProxy(this.volumeCache);
               await this.proxy.start();
               this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
             }
@@ -85,10 +186,102 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             fileUrl: imgUrl,
             fileName: path.basename(imgUri.fsPath ?? imgUri.toString()),
             isGzip: imgUri.fsPath?.endsWith('.gz') ?? false,
+            isRemote: imgIsRemote,
           });
         }
       }
     });
+  }
+
+  private startPreviewLoad(
+    entryId: string,
+    webview: vscode.Webview,
+    webviewId: string,
+    uri: vscode.Uri,
+    signal: AbortSignal
+  ): void {
+    const uriKey = uri.toString();
+    const cached = this.volumeCache.get(uriKey);
+
+    if (cached) {
+      this.volumeCache.setActive(uriKey, webviewId);
+      const voxelBuffer = cached.voxelData.buffer.slice(
+        cached.voxelData.byteOffset,
+        cached.voxelData.byteOffset + cached.voxelData.byteLength
+      );
+      webview.postMessage({
+        type: 'cachedVolume',
+        header: cached.header,
+        globalMin: cached.min,
+        globalMax: cached.max,
+        slope: cached.slope,
+        inter: cached.inter,
+        sliceIdx: {
+          axial: Math.floor(cached.header.nz / 2),
+          coronal: Math.floor(cached.header.ny / 2),
+          sagittal: Math.floor(cached.header.nx / 2),
+        },
+        voxelData: voxelBuffer,
+        datatype: cached.header.datatype,
+      });
+      return;
+    }
+
+    const isActive = this.isWebviewActive(webviewId);
+    const isRemote = uri.scheme !== 'file';
+
+    this.loadQueue.enqueue({
+      webviewId,
+      priority: isActive ? 100 : 1,
+      isRemote,
+      abortController: signal instanceof AbortController ? signal : new AbortController(),
+      execute: async () => {
+        if (signal.aborted) return;
+
+        try {
+          const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
+          if (!preview || signal.aborted) return;
+
+          this.volumeCache.setActive(uriKey, webviewId);
+
+          const axialBuffer = preview.slices.axial.buffer.slice(
+            preview.slices.axial.byteOffset,
+            preview.slices.axial.byteOffset + preview.slices.axial.byteLength
+          );
+          const coronalBuffer = preview.slices.coronal.buffer.slice(
+            preview.slices.coronal.byteOffset,
+            preview.slices.coronal.byteOffset + preview.slices.coronal.byteLength
+          );
+          const sagittalBuffer = preview.slices.sagittal.buffer.slice(
+            preview.slices.sagittal.byteOffset,
+            preview.slices.sagittal.byteOffset + preview.slices.sagittal.byteLength
+          );
+
+          webview.postMessage({
+            type: 'preview',
+            header: preview.header,
+            globalMin: preview.globalMin,
+            globalMax: preview.globalMax,
+            sliceIdx: preview.sliceIdx,
+            slope: preview.slope,
+            inter: preview.inter,
+            partialPreview: preview.partialPreview || false,
+            axialSlice: axialBuffer,
+            coronalSlice: coronalBuffer,
+            sagittalSlice: sagittalBuffer,
+          });
+        } catch (err: any) {
+          if (err?.name !== 'AbortError') {
+            console.error('Preview load error:', err);
+          }
+        }
+      },
+    });
+  }
+
+  private isWebviewActive(webviewId: string): boolean {
+    const entry = this.activeWebviews.get(webviewId);
+    return !!entry && entry.panel.active;
   }
 
   private buildHtml(
@@ -265,7 +458,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.0.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.0.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
