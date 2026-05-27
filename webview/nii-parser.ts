@@ -103,32 +103,42 @@ export function parseNiiHeader(buffer: ArrayBuffer, isGzip: boolean): NiiHeader 
 }
 
 function detectOrientation(srow_x: number[], srow_y: number[], srow_z: number[]): NiiHeader['orientation'] {
-  const dx0 = srow_x[0], dx1 = srow_x[1], dx2 = srow_x[2];
-  const dy0 = srow_y[0], dy1 = srow_y[1], dy2 = srow_y[2];
-  const dz0 = srow_z[0], dz1 = srow_z[1], dz2 = srow_z[2];
+  // ITK-Snap style: RAI codes for cardinal directions
+  const rai_start = "RAI";
+  const rai_end = "LPS";
+  let rai_out = "..." as any;
 
-  const domX = Math.abs(dx0) >= Math.abs(dx1) && Math.abs(dx0) >= Math.abs(dx2) ? 0 :
-               Math.abs(dx1) >= Math.abs(dx0) && Math.abs(dx1) >= Math.abs(dx2) ? 1 : 2;
-  const domY = Math.abs(dy0) >= Math.abs(dy1) && Math.abs(dy0) >= Math.abs(dy2) ? 0 :
-               Math.abs(dy1) >= Math.abs(dy0) && Math.abs(dy1) >= Math.abs(dy2) ? 1 : 2;
-  const domZ = Math.abs(dz0) >= Math.abs(dz1) && Math.abs(dz0) >= Math.abs(dz2) ? 0 :
-               Math.abs(dz1) >= Math.abs(dz0) && Math.abs(dz1) >= Math.abs(dz2) ? 1 : 2;
+  // Make the direction matrix (columns are the srow vectors)
+  const direction_matrix: number[][] = [
+    [srow_x[0], srow_y[0], srow_z[0]],
+    [srow_x[1], srow_y[1], srow_z[1]],
+    [srow_x[2], srow_y[2], srow_z[2]]
+  ];
 
-  const signX = [dx0, dx1, dx2][domX] >= 0 ? '+' : '-';
-  const signY = [dy0, dy1, dy2][domY] >= 0 ? '+' : '-';
-  const signZ = [dz0, dz1, dz2][domZ] >= 0 ? '+' : '-';
+  for (let i = 0; i < 3; i++) {
+    // Get the direction of the i-th voxel coordinate (column i)
+    const dir_i = [direction_matrix[0][i], direction_matrix[1][i], direction_matrix[2][i]];
 
-  const dirMap: Record<string, string> = {
-    '0+': 'R', '0-': 'L',
-    '1+': 'A', '1-': 'P',
-    '2+': 'S', '2-': 'I'
-  };
+    // Get the maximum absolute value
+    const abs_dir_i = [Math.abs(dir_i[0]), Math.abs(dir_i[1]), Math.abs(dir_i[2])];
+    const maxabs_i = Math.max(abs_dir_i[0], abs_dir_i[1], abs_dir_i[2]);
 
-  const code = (dirMap[domX + signX] || 'R') + (dirMap[domY + signY] || 'A') + (dirMap[domZ + signZ] || 'S');
+    // ITK-Snap trick: visit (i,i) first for tie-breaking
+    for (let off = 0; off < 3; off++) {
+      const j = (i + off) % 3;
+
+      if (Math.abs(dir_i[j]) === maxabs_i) {
+        rai_out = rai_out.substring(0, i) +
+          (dir_i[j] > 0 ? rai_start[j] : rai_end[j]) +
+          rai_out.substring(i + 1);
+        break;
+      }
+    }
+  }
 
   const knownOrientations: NiiHeader['orientation'][] = ['RAS', 'LAS', 'LPS', 'RPS', 'RSA', 'LSA', 'LIA', 'RIA', 'AIR', 'PIR', 'RIP', 'LIP'];
-  if (knownOrientations.includes(code as NiiHeader['orientation'])) {
-    return code as NiiHeader['orientation'];
+  if (knownOrientations.includes(rai_out)) {
+    return rai_out;
   }
 
   return 'unknown';

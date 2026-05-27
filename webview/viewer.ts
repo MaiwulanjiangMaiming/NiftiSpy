@@ -102,6 +102,12 @@ const currentSlices: Record<Axis, SliceFrame | null> = {
   sagittal: null,
 };
 
+const viewFlips: Record<string, { flipX: boolean, flipY: boolean }> = {
+  axial: { flipX: false, flipY: false },
+  coronal: { flipX: false, flipY: false },
+  sagittal: { flipX: false, flipY: false }
+};
+
 const perfMonitor = {
   previewLoads: [] as number[],
   fullLoads: [] as number[],
@@ -395,7 +401,7 @@ void main() {
   }
 
   renderSlice(canvas: HTMLCanvasElement, sliceData: Float32Array, w: number, h: number,
-    lo: number, range: number, cmapName: string): boolean {
+    lo: number, range: number, cmapName: string, flipX: boolean = false, flipY: boolean = false): boolean {
     if (!this.ready || !this.gl || !this.program || !this.supportsFloatTexture) return false;
     const gl = this.gl;
 
@@ -471,6 +477,9 @@ void main() {
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
+    const tx0 = flipX ? 1 : 0, tx1 = flipX ? 0 : 1;
+    const ty0 = flipY ? 0 : 1, ty1 = flipY ? 1 : 0;
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([tx0, ty0, tx1, ty0, tx0, ty1, tx1, ty1]), gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(aTex);
     gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
 
@@ -827,6 +836,7 @@ function evictInactiveImageData(preferredIndices: number[] = []) {
 
 function applyImageState(img: VolumeImage, preserveSlices = false) {
   header = img.header;
+  computeViewFlips();
   volumeData = img.data;
   dataSlope = img.slope;
   dataInter = img.inter;
@@ -1223,7 +1233,8 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   canvas.height = dh * dpr;
 
   const renderer = getOrCreateRenderer(axis as Axis);
-  if (renderer && zoom === 1 && panX === 0 && panY === 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap)) {
+  const flips = viewFlips[axis] || { flipX: false, flipY: false };
+  if (renderer && zoom === 1 && panX === 0 && panY === 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
     updateDirectionLabels(axis);
     updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
     updateScaleBar(axis, pixelW, pixelH, zoom, cw);
@@ -1266,14 +1277,14 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
 
   const imgLeft = (dw - cw) / 2 + panX;
   const imgTop = (dh - ch) / 2 + panY;
-  const offsetX = imgLeft * dpr;
-  const offsetY = (imgTop + ch) * dpr;
-  const scaleX = cw * dpr / w;
-  const scaleY = -ch * dpr / h;
+  const finalScaleX = flips.flipX ? -cw * dpr / w : cw * dpr / w;
+  const finalScaleY = flips.flipY ? ch * dpr / h : -ch * dpr / h;
+  const finalOffsetX = flips.flipX ? (imgLeft + cw) * dpr : imgLeft * dpr;
+  const finalOffsetY = flips.flipY ? imgTop * dpr : (imgTop + ch) * dpr;
 
   ctx.save();
-  ctx.translate(offsetX, offsetY);
-  ctx.scale(scaleX, scaleY);
+  ctx.translate(finalOffsetX, finalOffsetY);
+  ctx.scale(finalScaleX, finalScaleY);
   ctx.drawImage(tc, 0, 0);
   ctx.restore();
 
@@ -1283,45 +1294,61 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
 }
 
+// ITK-Snap style: Get dominant anatomical axis and direction from a srow vector
+// Returns { axis: 0(R/L), 1(A/P), 2(S/I), dir: 1(+), -1(-) }
+function getAnatomicalAxisDir(srow: number[]): { axis: number, dir: number } {
+  // Find which anatomical axis this direction vector is aligned with
+  const abs0 = Math.abs(srow[0]), abs1 = Math.abs(srow[1]), abs2 = Math.abs(srow[2]);
+  let domIdx = 0;
+  if (abs1 > abs0) domIdx = 1;
+  if (abs2 > abs0 && abs2 > abs1) domIdx = 2;
+
+  // The sign: positive is R/A/S, negative is L/P/I
+  const dir = srow[domIdx] >= 0 ? 1 : -1;
+
+  // domIdx 0 = R/L axis, 1 = A/P axis, 2 = S/I axis
+  return { axis: domIdx, dir };
+}
+
+function computeViewFlips() {
+  if (!header) return;
+  const srow_x = header.srow_x;
+  const srow_y = header.srow_y;
+  const srow_z = header.srow_z;
+
+  const xDir = getAnatomicalAxisDir(srow_x);
+  const yDir = getAnatomicalAxisDir(srow_y);
+  const zDir = getAnatomicalAxisDir(srow_z);
+
+  viewFlips.axial = {
+    flipX: xDir.dir > 0,
+    flipY: yDir.dir < 0
+  };
+
+  viewFlips.coronal = {
+    flipX: xDir.dir > 0,
+    flipY: zDir.dir < 0
+  };
+
+  viewFlips.sagittal = {
+    flipX: yDir.dir > 0,
+    flipY: zDir.dir < 0
+  };
+}
+
+// ITK-Snap style letter mapping: [anatomical axis][direction index]
+// direction 0 = negative (L/P/I), direction 1 = positive (R/A/S)
+const letters: string[][] = [["L", "R"], ["P", "A"], ["I", "S"]];
+
+// Get orientation labels based on view axis, srow vectors, and how we draw the slice
 function getCoordLabelX(axis: string): { left: string; right: string } {
-  const ori = header?.orientation || 'RAS';
-  if (axis === 'sagittal') {
-    switch (ori) {
-      case 'RAS': case 'RPS': case 'RSA': return { left: 'A', right: 'P' };
-      case 'LAS': case 'LPS': case 'LSA': return { left: 'P', right: 'A' };
-      default: return { left: 'A', right: 'P' };
-    }
-  }
-  switch (ori) {
-    case 'RAS': case 'RPS': case 'RSA': return { left: 'R', right: 'L' };
-    case 'LAS': case 'LPS': case 'LSA': return { left: 'L', right: 'R' };
-    default: return { left: 'R', right: 'L' };
-  }
+  if (axis === 'sagittal') return { left: 'A', right: 'P' };
+  return { left: 'R', right: 'L' };
 }
 
 function getCoordLabelY(axis: string): { top: string; bottom: string } {
-  const ori = header?.orientation || 'RAS';
-  if (axis === 'sagittal') {
-    switch (ori) {
-      case 'RAS': case 'LAS': case 'RSA': case 'LSA': return { top: 'S', bottom: 'I' };
-      case 'RPS': case 'LPS': return { top: 'I', bottom: 'S' };
-      default: return { top: 'S', bottom: 'I' };
-    }
-  }
-  if (axis === 'coronal') {
-    switch (ori) {
-      case 'RAS': case 'LAS': return { top: 'S', bottom: 'I' };
-      case 'RPS': case 'LPS': return { top: 'I', bottom: 'S' };
-      case 'RSA': case 'LSA': return { top: 'A', bottom: 'P' };
-      default: return { top: 'S', bottom: 'I' };
-    }
-  }
-  switch (ori) {
-    case 'RAS': case 'LAS': return { top: 'A', bottom: 'P' };
-    case 'RPS': case 'LPS': return { top: 'P', bottom: 'A' };
-    case 'RSA': case 'LSA': return { top: 'P', bottom: 'A' };
-    default: return { top: 'A', bottom: 'P' };
-  }
+  if (axis === 'axial') return { top: 'A', bottom: 'P' };
+  return { top: 'S', bottom: 'I' };
 }
 
 function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, cw: number, ch: number) {
@@ -1371,8 +1398,9 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   const imgLeft = (containerRect.width - imgW) / 2 + panX;
   const imgTop = (containerRect.height - imgH) / 2 + panY;
 
-  const screenX = imgLeft + cx_norm * imgW;
-  const screenY = imgTop + (1 - cy_norm) * imgH;
+  const flips = viewFlips[axis] || { flipX: false, flipY: false };
+  const screenX = flips.flipX ? imgLeft + (1 - cx_norm) * imgW : imgLeft + cx_norm * imgW;
+  const screenY = flips.flipY ? imgTop + cy_norm * imgH : imgTop + (1 - cy_norm) * imgH;
 
   crosshairH.style.top = screenY + 'px';
   crosshairV.style.left = screenX + 'px';
@@ -1440,10 +1468,11 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
         const range = hi - lo || 1;
         const dataRange = globalMax - globalMin || 1;
 
+        const mflips = viewFlips[axis] || { flipX: false, flipY: false };
         for (let my = 0; my < mh; my++) {
           for (let mx = 0; mx < mw; mx++) {
-            const sx = Math.floor((mx / mw) * w);
-            const sy = h - 1 - Math.floor((my / mh) * h);
+            const sx = mflips.flipX ? w - 1 - Math.floor((mx / mw) * w) : Math.floor((mx / mw) * w);
+            const sy = mflips.flipY ? Math.floor((my / mh) * h) : h - 1 - Math.floor((my / mh) * h);
             const v = sliceData[sy * w + sx];
             const norm = (v - globalMin) / dataRange;
             const t = Math.max(0, Math.min(1, (norm - lo) / range));
@@ -1460,13 +1489,18 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
 
   const rw = mw / zoom;
   const rh = mh / zoom;
-  
-  const maxPanX = (cw * zoom - cw) / 2;
-  const maxPanY = (ch * zoom - ch) / 2;
-  
-  const normPanX = maxPanX > 0 ? (panX + maxPanX) / (2 * maxPanX) : 0.5;
-  const normPanY = maxPanY > 0 ? (panY + maxPanY) / (2 * maxPanY) : 0.5;
-  
+
+  const dw = container.clientWidth;
+  const dh = container.clientHeight;
+  const maxPanX = Math.max(0, (cw - dw) / 2);
+  const maxPanY = Math.max(0, (ch - dh) / 2);
+
+  const indFlips = viewFlips[axis] || { flipX: false, flipY: false };
+  const rawNormPanX = maxPanX > 0 ? (panX + maxPanX) / (2 * maxPanX) : 0.5;
+  const rawNormPanY = maxPanY > 0 ? (panY + maxPanY) / (2 * maxPanY) : 0.5;
+  const normPanX = indFlips.flipX ? 1 - rawNormPanX : rawNormPanX;
+  const normPanY = indFlips.flipY ? 1 - rawNormPanY : rawNormPanY;
+
   const rx = Math.max(0, Math.min(mw - rw, normPanX * mw - rw / 2));
   const ry = Math.max(0, Math.min(mh - rh, normPanY * mh - rh / 2));
 
@@ -2195,6 +2229,7 @@ function toggleMaximize(view: string) {
 
 function applyPreviewData(previewData: any) {
   header = previewData.header;
+  computeViewFlips();
   globalMin = previewData.globalMin;
   globalMax = previewData.globalMax;
   dataSlope = previewData.slope || 1;
@@ -2389,6 +2424,7 @@ function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
 
 function handleDirectPreview(msg: any): void {
   header = msg.header;
+  computeViewFlips();
   globalMin = msg.globalMin;
   globalMax = msg.globalMax;
   dataSlope = msg.slope || 1;
@@ -2435,6 +2471,7 @@ function handleDirectPreview(msg: any): void {
 
 function handleCachedVolume(msg: any): void {
   header = msg.header;
+  computeViewFlips();
   globalMin = msg.globalMin;
   globalMax = msg.globalMax;
   dataSlope = msg.slope || 1;
@@ -2639,6 +2676,7 @@ function loadFullVolume(workers: Worker[]) {
       previewReceived = true;
       if (!header) {
         header = d.header;
+        computeViewFlips();
         globalMin = d.globalMin;
         globalMax = d.globalMax;
         dataSlope = d.slope || 1;
@@ -3514,16 +3552,32 @@ function setupInteraction() {
       const rect = minimap.getBoundingClientRect();
       const mx = (e.clientX - rect.left) / rect.width;
       const my = (e.clientY - rect.top) / rect.height;
-      
-      const { nx, ny, nz } = header;
+
       const zoom = viewState[axis].zoom;
-      
-      const maxPanX = (zoom - 1) * (axis === 'sagittal' ? ny : nx) / 2;
-      const maxPanY = (zoom - 1) * (axis === 'axial' ? ny : nz) / 2;
-      
-      viewState[axis].panX = (mx - 0.5) * 2 * maxPanX;
-      viewState[axis].panY = (my - 0.5) * 2 * maxPanY;
-      
+      const container = canvas.parentElement!;
+      const dw = container.clientWidth;
+      const dh = container.clientHeight;
+
+      // Compute displayed image size (same as paintSlice)
+      const pixelW = axis === 'axial' ? header.nx * header.dx : axis === 'coronal' ? header.nx * header.dx : header.ny * header.dy;
+      const pixelH = axis === 'axial' ? header.ny * header.dy : axis === 'coronal' ? header.nz * header.dz : header.nz * header.dz;
+      const ar = pixelW / pixelH;
+      let cw: number, ch: number;
+      if (dw / dh > ar) { ch = dh; cw = Math.floor(dh * ar); }
+      else { cw = dw; ch = Math.floor(dw / ar); }
+      cw = Math.floor(cw * zoom);
+      ch = Math.floor(ch * zoom);
+
+      // Pan limits match paintSlice exactly
+      const maxPanX = Math.max(0, (cw - dw) / 2);
+      const maxPanY = Math.max(0, (ch - dh) / 2);
+
+      const clickFlips = viewFlips[axis] || { flipX: false, flipY: false };
+      const effectiveMx = clickFlips.flipX ? 1 - mx : mx;
+      const effectiveMy = clickFlips.flipY ? 1 - my : my;
+      viewState[axis].panX = (effectiveMx - 0.5) * 2 * maxPanX;
+      viewState[axis].panY = (effectiveMy - 0.5) * 2 * maxPanY;
+
       updateSingleView(axis);
     });
   }
