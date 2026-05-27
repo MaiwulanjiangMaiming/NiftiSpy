@@ -2230,7 +2230,10 @@ async function fetchPreviewData(url: string = fileUrl): Promise<any | null> {
     }
     if (!previewData) {
       const previewUrl = url.replace('/file/', '/preview/');
-      previewData = await fetchWithRetry(previewUrl, 'json');
+      const buffer = await fetchWithRetry(previewUrl, 'arrayBuffer');
+      if (buffer) {
+        previewData = decodePreviewBinary(buffer);
+      }
     }
     if (previewData) {
       perfMonitor.previewLoads.push(performance.now() - startedAt);

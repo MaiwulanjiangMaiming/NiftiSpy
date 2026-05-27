@@ -11,7 +11,6 @@ interface FileEntry {
   dataCache?: Uint8Array;
   lastAccess?: number;
   headerCache?: any;
-  previewCache?: any;
   previewBinaryCache?: Buffer;
   sliceCache?: Map<string, { data: Buffer; timestamp: number }>;
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
@@ -202,6 +201,44 @@ function computeSliceMinMax(...slices: Float32Array[]): { min: number; max: numb
   }
 
   return { min, max };
+}
+
+function encodePreviewBinary(header: any, slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array }, min: number, max: number): Buffer {
+  const sliceIdxVal = {
+    axial: Math.floor(header.nz / 2),
+    coronal: Math.floor(header.ny / 2),
+    sagittal: Math.floor(header.nx / 2),
+  };
+
+  const headerJson = JSON.stringify(header);
+  const headerBuf = Buffer.from(headerJson, 'utf8');
+  const axialBuf = Buffer.from(slices.axial.buffer, slices.axial.byteOffset, slices.axial.byteLength);
+  const coronalBuf = Buffer.from(slices.coronal.buffer, slices.coronal.byteOffset, slices.coronal.byteLength);
+  const sagittalBuf = Buffer.from(slices.sagittal.buffer, slices.sagittal.byteOffset, slices.sagittal.byteLength);
+
+  const totalLen = 4 + headerBuf.length + 4 * 7 + axialBuf.length + 4 + coronalBuf.length + 4 + sagittalBuf.length;
+  const buf = Buffer.alloc(totalLen);
+  let offset = 0;
+
+  buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
+  headerBuf.copy(buf, offset); offset += headerBuf.length;
+
+  buf.writeFloatLE(min, offset); offset += 4;
+  buf.writeFloatLE(max, offset); offset += 4;
+  buf.writeUInt32LE(sliceIdxVal.axial, offset); offset += 4;
+  buf.writeUInt32LE(sliceIdxVal.coronal, offset); offset += 4;
+  buf.writeUInt32LE(sliceIdxVal.sagittal, offset); offset += 4;
+
+  buf.writeUInt32LE(axialBuf.length, offset); offset += 4;
+  axialBuf.copy(buf, offset); offset += axialBuf.length;
+
+  buf.writeUInt32LE(coronalBuf.length, offset); offset += 4;
+  coronalBuf.copy(buf, offset); offset += coronalBuf.length;
+
+  buf.writeUInt32LE(sagittalBuf.length, offset); offset += 4;
+  sagittalBuf.copy(buf, offset); offset += sagittalBuf.length;
+
+  return buf;
 }
 
 function extractSingleSlice(rawData: Uint8Array, header: any, axis: string, idx: number): Float32Array | null {
@@ -474,7 +511,6 @@ export class LocalFileProxy {
       for (const [, entry] of this.files.entries()) {
         if (entry.dataCache && entry.lastAccess && now - entry.lastAccess > 120000) {
           entry.dataCache = undefined;
-          entry.previewCache = undefined;
           entry.previewBinaryCache = undefined;
           entry.headerCache = undefined;
           entry.sliceCache?.clear();
@@ -682,8 +718,8 @@ export class LocalFileProxy {
 
   private async handlePreview(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     try {
-      if (entry.previewCache) {
-        compressResponse(Buffer.from(JSON.stringify(entry.previewCache)), req, res, 'application/json');
+      if (entry.previewBinaryCache) {
+        compressResponse(entry.previewBinaryCache, req, res, 'application/octet-stream');
         return;
       }
 
@@ -703,8 +739,8 @@ export class LocalFileProxy {
 
       await this.handlePreviewRemote(entry, res, req);
     } catch (err: any) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: String(err?.message ?? err) }));
+      res.writeHead(500);
+      res.end(String(err?.message ?? err));
     }
   }
 
@@ -715,8 +751,8 @@ export class LocalFileProxy {
       const headerBytes = await readLocalFilePartial(fsPath, 0, 543);
       const header = parseNiiHeaderQuick(headerBytes);
       if (!header) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to parse header' }));
+        res.writeHead(500);
+        res.end('Failed to parse header');
         return;
       }
       entry.headerCache = header;
@@ -740,23 +776,10 @@ export class LocalFileProxy {
     const emptyCoronal = new Float32Array(nx * nz);
     const emptySagittal = new Float32Array(ny * nz);
 
-    const result = {
-      header,
-      globalMin: min,
-      globalMax: max,
-      sliceIdx: { axial: axMid, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
-      slope: header.scl_slope || 1,
-      inter: header.scl_inter || 0,
-      slices: {
-        axial: Array.from(axialSlice),
-        coronal: Array.from(emptyCoronal),
-        sagittal: Array.from(emptySagittal),
-      },
-      partialPreview: true,
-    };
-
-    entry.previewCache = result;
-    compressResponse(Buffer.from(JSON.stringify(result)), req, res, 'application/json');
+    const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
+    const buf = encodePreviewBinary(header, slices, min, max);
+    entry.previewBinaryCache = buf;
+    compressResponse(buf, req, res, 'application/octet-stream');
   }
 
   private async handlePreviewLocalGz(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
@@ -764,8 +787,8 @@ export class LocalFileProxy {
     const { header, axialSlice, rawData } = await streamingGunzipPreview(fsPath);
 
     if (!header) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to parse header' }));
+      res.writeHead(500);
+      res.end('Failed to parse header');
       return;
     }
 
@@ -783,62 +806,32 @@ export class LocalFileProxy {
     const emptyCoronal = new Float32Array(nx * nz);
     const emptySagittal = new Float32Array(ny * nz);
 
-    const result = {
-      header,
-      globalMin: min,
-      globalMax: max,
-      sliceIdx: { axial: Math.floor(nz / 2), coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
-      slope: header.scl_slope || 1,
-      inter: header.scl_inter || 0,
-      slices: {
-        axial: Array.from(axialSlice),
-        coronal: Array.from(emptyCoronal),
-        sagittal: Array.from(emptySagittal),
-      },
-      partialPreview: true,
-    };
-
-    entry.previewCache = result;
-    compressResponse(Buffer.from(JSON.stringify(result)), req, res, 'application/json');
+    const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
+    const buf = encodePreviewBinary(header, slices, min, max);
+    entry.previewBinaryCache = buf;
+    compressResponse(buf, req, res, 'application/octet-stream');
   }
 
   private async handlePreviewRemote(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const { rawData, header } = await this.loadFileData(entry);
     if (!header) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to parse NIfTI header' }));
+      res.writeHead(500);
+      res.end('Failed to parse NIfTI header');
       return;
     }
 
     const slices = extractPreviewSlices(rawData, header);
     if (!slices) {
-      res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Failed to extract preview slices' }));
+      res.writeHead(500);
+      res.end('Failed to extract preview slices');
       return;
     }
 
     const { min, max } = computeSliceMinMax(slices.axial, slices.coronal, slices.sagittal);
 
-    const result = {
-      header,
-      globalMin: min,
-      globalMax: max,
-      sliceIdx: {
-        axial: Math.floor(header.nz / 2),
-        coronal: Math.floor(header.ny / 2),
-        sagittal: Math.floor(header.nx / 2),
-      },
-      slope: header.scl_slope || 1,
-      inter: header.scl_inter || 0,
-      slices: {
-        axial: Array.from(slices.axial),
-        coronal: Array.from(slices.coronal),
-        sagittal: Array.from(slices.sagittal),
-      },
-    };
-
-    entry.previewCache = result;
-    compressResponse(Buffer.from(JSON.stringify(result)), req, res, 'application/json');
+    const buf = encodePreviewBinary(header, slices, min, max);
+    entry.previewBinaryCache = buf;
+    compressResponse(buf, req, res, 'application/octet-stream');
   }
 
   private async handlePreviewBinary(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
@@ -863,40 +856,7 @@ export class LocalFileProxy {
       }
 
       const { min, max } = computeSliceMinMax(slices.axial, slices.coronal, slices.sagittal);
-
-      const sliceIdxVal = {
-        axial: Math.floor(header.nz / 2),
-        coronal: Math.floor(header.ny / 2),
-        sagittal: Math.floor(header.nx / 2),
-      };
-
-      const headerJson = JSON.stringify(header);
-      const headerBuf = Buffer.from(headerJson, 'utf8');
-      const axialBuf = Buffer.from(slices.axial.buffer, slices.axial.byteOffset, slices.axial.byteLength);
-      const coronalBuf = Buffer.from(slices.coronal.buffer, slices.coronal.byteOffset, slices.coronal.byteLength);
-      const sagittalBuf = Buffer.from(slices.sagittal.buffer, slices.sagittal.byteOffset, slices.sagittal.byteLength);
-
-      const totalLen = 4 + headerBuf.length + 4 * 7 + axialBuf.length + 4 + coronalBuf.length + 4 + sagittalBuf.length;
-      const buf = Buffer.alloc(totalLen);
-      let offset = 0;
-
-      buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-      headerBuf.copy(buf, offset); offset += headerBuf.length;
-
-      buf.writeFloatLE(min, offset); offset += 4;
-      buf.writeFloatLE(max, offset); offset += 4;
-      buf.writeUInt32LE(sliceIdxVal.axial, offset); offset += 4;
-      buf.writeUInt32LE(sliceIdxVal.coronal, offset); offset += 4;
-      buf.writeUInt32LE(sliceIdxVal.sagittal, offset); offset += 4;
-
-      buf.writeUInt32LE(axialBuf.length, offset); offset += 4;
-      axialBuf.copy(buf, offset); offset += axialBuf.length;
-
-      buf.writeUInt32LE(coronalBuf.length, offset); offset += 4;
-      coronalBuf.copy(buf, offset); offset += coronalBuf.length;
-
-      buf.writeUInt32LE(sagittalBuf.length, offset); offset += 4;
-      sagittalBuf.copy(buf, offset); offset += sagittalBuf.length;
+      const buf = encodePreviewBinary(header, slices, min, max);
 
       entry.previewBinaryCache = buf;
       entry.headerCache = header;
