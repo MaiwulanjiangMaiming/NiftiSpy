@@ -18,37 +18,6 @@ interface FileEntry {
   pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
 }
 
-interface LRUCache<K, V> {
-  get(key: K): V | undefined;
-  set(key: K, value: V): void;
-  delete(key: K): void;
-  size: number;
-}
-
-function createLRUCache<K, V>(maxSize: number): LRUCache<K, V> & { entries(): IterableIterator<[K, V]> } {
-  const map = new Map<K, V>();
-  return {
-    get(key: K) {
-      const v = map.get(key);
-      if (v !== undefined) { map.delete(key); map.set(key, v); }
-      return v;
-    },
-    set(key: K, value: V) {
-      map.delete(key);
-      map.set(key, value);
-      if (map.size > maxSize) {
-        const first = map.keys().next().value;
-        if (first !== undefined) map.delete(first);
-      }
-    },
-    delete(key: K) { map.delete(key); },
-    get size() { return map.size; },
-    entries() { return map.entries(); },
-  };
-}
-
-const globalSliceCache = createLRUCache<string, { data: Buffer; timestamp: number }>(512);
-
 function parseNiiHeaderQuick(buf: Uint8Array): any | null {
   if (buf.length < 348) return null;
   const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -516,9 +485,6 @@ export class LocalFileProxy {
           }
         }
       }
-      for (const [key, val] of globalSliceCache.entries()) {
-        if (Date.now() - val.timestamp > 90000) globalSliceCache.delete(key);
-      }
       this.volumeCache?.cleanup();
       this.volumeCache?.evictIfNeeded();
     }, 30000);
@@ -945,7 +911,7 @@ export class LocalFileProxy {
   private async handleSlice(entry: FileEntry, axis: string, idx: number, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     try {
       const cacheKey = `${entry.id}:${axis}:${idx}`;
-      const cached = globalSliceCache.get(cacheKey) || entry.sliceCache?.get(cacheKey);
+      const cached = entry.sliceCache?.get(cacheKey);
       if (cached) {
         compressResponse(cached.data, req, res, 'application/octet-stream');
         return;
@@ -966,9 +932,7 @@ export class LocalFileProxy {
       }
 
       const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-      const now = Date.now();
-      globalSliceCache.set(cacheKey, { data: buf, timestamp: now });
-      entry.sliceCache?.set(cacheKey, { data: buf, timestamp: now });
+      entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
 
       compressResponse(buf, req, res, 'application/octet-stream');
     } catch (err: any) {
