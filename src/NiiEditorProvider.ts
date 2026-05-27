@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
+import * as zlib from 'zlib';
 import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
 
@@ -158,6 +160,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
         if (isRemote && entryId) {
           this.startPreviewLoad(entryId, webview, webviewId, uri, abortController.signal);
+        } else if (!isRemote) {
+          this.startLocalLoad(webview, webviewId, uri, abortController.signal);
         }
       } else if (msg.type === 'selectImage') {
         const files = await vscode.window.showOpenDialog({
@@ -168,7 +172,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         if (files && files.length > 0) {
           const imgUri = files[0];
           const imgIsRemote = imgUri.scheme !== 'file';
-          let imgUrl: string;
+          const imgFileName = path.basename(imgUri.fsPath ?? imgUri.toString());
+          const imgIsGzip = imgUri.fsPath?.endsWith('.gz') ?? false;
+          const imgWebviewId = msg.webviewId || webviewId;
 
           if (imgIsRemote) {
             if (!this.proxy) {
@@ -176,20 +182,230 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               await this.proxy.start();
               this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
             }
-            imgUrl = this.proxy.registerFile(imgUri);
+            const imgUrl = this.proxy.registerFile(imgUri);
+            const entryId = imgUrl.split('/').pop()!;
+            webview.postMessage({
+              type: 'newImage',
+              fileUrl: imgUrl,
+              fileName: imgFileName,
+              isGzip: imgIsGzip,
+              isRemote: true,
+            });
+            this.startPreviewLoad(entryId, webview, imgWebviewId, imgUri, new AbortController().signal);
           } else {
-            imgUrl = webview.asWebviewUri(imgUri).toString();
+            const imgUrl = webview.asWebviewUri(imgUri).toString();
+            webview.postMessage({
+              type: 'newImage',
+              fileUrl: imgUrl,
+              fileName: imgFileName,
+              isGzip: imgIsGzip,
+              isRemote: false,
+            });
+            this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal);
           }
-
-          webview.postMessage({
-            type: 'newImage',
-            fileUrl: imgUrl,
-            fileName: path.basename(imgUri.fsPath ?? imgUri.toString()),
-            isGzip: imgUri.fsPath?.endsWith('.gz') ?? false,
-            isRemote: imgIsRemote,
-          });
         }
       }
+    });
+  }
+
+  private parseNiiHeaderFromBuffer(buf: Uint8Array): any | null {
+    if (buf.length < 348) return null;
+    const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const le = v.getInt32(0, true) === 348 || v.getInt32(0, true) === 540;
+    if (!le && v.getInt32(0, false) !== 348 && v.getInt32(0, false) !== 540) return null;
+    const sizeofHdr = v.getInt32(0, le);
+    const version = sizeofHdr === 540 ? 2 : 1;
+    let nx: number, ny: number, nz: number, dx: number, dy: number, dz: number;
+    let datatype: number, bitpix: number, voxOffset: number;
+    let scl_slope: number, scl_inter: number;
+    let qform_code: number, sform_code: number;
+    let quatern_b: number, quatern_c: number, quatern_d: number;
+    let qoffset_x: number, qoffset_y: number, qoffset_z: number;
+    let srow_x: number[], srow_y: number[], srow_z: number[];
+
+    if (version === 1) {
+      nx = Math.max(1, v.getInt16(42, le)); ny = Math.max(1, v.getInt16(44, le)); nz = Math.max(1, v.getInt16(46, le));
+      datatype = v.getInt16(70, le); bitpix = v.getInt16(72, le);
+      dx = Math.abs(v.getFloat32(80, le)) || 1; dy = Math.abs(v.getFloat32(84, le)) || 1; dz = Math.abs(v.getFloat32(88, le)) || 1;
+      voxOffset = Math.max(352, v.getFloat32(108, le));
+      scl_slope = v.getFloat32(112, le); scl_inter = v.getFloat32(116, le);
+      qform_code = v.getInt16(252, le); sform_code = v.getInt16(254, le);
+      quatern_b = v.getFloat32(256, le); quatern_c = v.getFloat32(260, le); quatern_d = v.getFloat32(264, le);
+      qoffset_x = v.getFloat32(268, le); qoffset_y = v.getFloat32(272, le); qoffset_z = v.getFloat32(276, le);
+      srow_x = [v.getFloat32(280, le), v.getFloat32(284, le), v.getFloat32(288, le), v.getFloat32(292, le)];
+      srow_y = [v.getFloat32(296, le), v.getFloat32(300, le), v.getFloat32(304, le), v.getFloat32(308, le)];
+      srow_z = [v.getFloat32(312, le), v.getFloat32(316, le), v.getFloat32(320, le), v.getFloat32(324, le)];
+    } else {
+      const readInt64 = (off: number) => { const lo = v.getUint32(off, le); const hi = v.getInt32(off + 4, le); return hi * 0x100000000 + lo; };
+      nx = readInt64(24); ny = readInt64(32); nz = readInt64(40);
+      datatype = v.getInt16(12, le); bitpix = v.getInt16(14, le);
+      dx = Math.abs(v.getFloat64(104, le)) || 1; dy = Math.abs(v.getFloat64(112, le)) || 1; dz = Math.abs(v.getFloat64(120, le)) || 1;
+      voxOffset = Math.max(544, readInt64(168));
+      scl_slope = v.getFloat64(176, le); scl_inter = v.getFloat64(184, le);
+      qform_code = v.getInt16(196, le); sform_code = v.getInt16(198, le);
+      quatern_b = v.getFloat32(200, le); quatern_c = v.getFloat32(204, le); quatern_d = v.getFloat32(208, le);
+      qoffset_x = v.getFloat32(212, le); qoffset_y = v.getFloat32(216, le); qoffset_z = v.getFloat32(220, le);
+      srow_x = [v.getFloat64(224, le), v.getFloat64(232, le), v.getFloat64(240, le), v.getFloat64(248, le)];
+      srow_y = [v.getFloat64(256, le), v.getFloat64(264, le), v.getFloat64(272, le), v.getFloat64(280, le)];
+      srow_z = [v.getFloat64(288, le), v.getFloat64(296, le), v.getFloat64(304, le), v.getFloat64(312, le)];
+    }
+
+    return {
+      version, ndim: 3, nx, ny, nz, nt: 1, nu: 1, dx, dy, dz, dt: 0, datatype, bitpix, voxOffset,
+      scl_slope: scl_slope || 1, scl_inter: scl_inter || 0,
+      littleEndian: le, qform_code, sform_code, quatern_b, quatern_c, quatern_d,
+      qoffset_x, qoffset_y, qoffset_z, srow_x, srow_y, srow_z,
+      isGzip: false, bytesPerVoxel: Math.max(1, bitpix / 8),
+      totalVoxels3D: nx * ny * nz, sliceSizeXY: nx * ny,
+      volumeBytes: nx * ny * nz * Math.max(1, bitpix / 8),
+      descrip: '', xyzt_units: 0, orientation: 'unknown',
+    };
+  }
+
+  private computeVoxelStats(rawData: Uint8Array, header: any): { min: number; max: number } {
+    const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
+    const n = nx * ny * nz;
+    const slope = scl_slope || 1;
+    const inter = scl_inter || 0;
+    const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
+    const le = littleEndian;
+    let min = Infinity, max = -Infinity;
+    const sampleStep = Math.max(1, Math.floor(n / 50000));
+    const view = new DataView(rawData.buffer, rawData.byteOffset + voxOffset, n * elemSize);
+    for (let i = 0; i < n; i += sampleStep) {
+      let val: number;
+      switch (datatype) {
+        case 2: val = view.getUint8(i * elemSize); break;
+        case 4: val = view.getInt16(i * elemSize, le); break;
+        case 8: val = view.getInt32(i * elemSize, le); break;
+        case 16: val = view.getFloat32(i * elemSize, le); break;
+        case 64: val = view.getFloat64(i * elemSize, le); break;
+        case 256: val = view.getInt8(i * elemSize); break;
+        case 512: val = view.getUint16(i * elemSize, le); break;
+        case 768: val = view.getUint32(i * elemSize, le); break;
+        default: val = view.getFloat32(i * elemSize, le); break;
+      }
+      val = val * slope + inter;
+      if (val < min) min = val;
+      if (val > max) max = val;
+    }
+    if (min === max) max = min + 1;
+    if (min > max || !isFinite(min) || !isFinite(max)) { min = 0; max = 1; }
+    return { min, max };
+  }
+
+  private async startLocalLoad(
+    webview: vscode.Webview,
+    webviewId: string,
+    uri: vscode.Uri,
+    signal: AbortSignal
+  ): Promise<void> {
+    const uriKey = uri.toString();
+    const cached = this.volumeCache.get(uriKey);
+    if (cached) {
+      this.volumeCache.setActive(uriKey, webviewId);
+      const voxelBuffer = cached.voxelData.buffer.slice(
+        cached.voxelData.byteOffset,
+        cached.voxelData.byteOffset + cached.voxelData.byteLength
+      );
+      webview.postMessage({
+        type: 'cachedVolume',
+        header: cached.header,
+        globalMin: cached.min,
+        globalMax: cached.max,
+        slope: cached.slope,
+        inter: cached.inter,
+        sliceIdx: {
+          axial: Math.floor(cached.header.nz / 2),
+          coronal: Math.floor(cached.header.ny / 2),
+          sagittal: Math.floor(cached.header.nx / 2),
+        },
+        voxelData: voxelBuffer,
+        datatype: cached.header.datatype,
+      });
+      return;
+    }
+
+    const isActive = this.isWebviewActive(webviewId);
+    this.loadQueue.enqueue({
+      webviewId,
+      priority: isActive ? 100 : 1,
+      isRemote: false,
+      abortController: signal instanceof AbortController ? signal : new AbortController(),
+      execute: async () => {
+        if (signal.aborted) return;
+        try {
+          this.volumeCache.setActive(uriKey, webviewId);
+          const fsPath = uri.fsPath;
+          const isGzip = fsPath.endsWith('.gz');
+
+          let rawData: Uint8Array;
+          if (isGzip) {
+            rawData = await new Promise<Uint8Array>((resolve, reject) => {
+              const chunks: Buffer[] = [];
+              const stream = fs.createReadStream(fsPath);
+              const gunzip = zlib.createGunzip();
+              stream.pipe(gunzip);
+              gunzip.on('data', (chunk: Buffer) => { if (!signal.aborted) chunks.push(chunk); });
+              gunzip.on('end', () => {
+                if (signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+                const total = chunks.reduce((s, c) => s + c.length, 0);
+                const result = Buffer.alloc(total);
+                let offset = 0;
+                for (const chunk of chunks) { chunk.copy(result, offset); offset += chunk.length; }
+                resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
+              });
+              gunzip.on('error', reject);
+              stream.on('error', reject);
+              if (signal) signal.addEventListener('abort', () => { stream.destroy(); gunzip.destroy(); }, { once: true });
+            });
+          } else {
+            const fullData = await fs.promises.readFile(fsPath);
+            rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
+          }
+
+          if (signal.aborted) return;
+
+          const header = this.parseNiiHeaderFromBuffer(rawData);
+          if (!header) return;
+
+          const voxOffset = header.voxOffset;
+          const n = header.nx * header.ny * header.nz;
+          const elemSize = header.bytesPerVoxel;
+          const voxelOnly = rawData.slice(voxOffset, voxOffset + n * elemSize);
+          const { min, max } = this.computeVoxelStats(rawData, header);
+
+          this.volumeCache.set(uriKey, {
+            header,
+            voxelData: voxelOnly,
+            min, max,
+            slope: header.scl_slope || 1,
+            inter: header.scl_inter || 0,
+          });
+
+          const voxelBuffer = voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
+
+          webview.postMessage({
+            type: 'cachedVolume',
+            header,
+            voxelData: voxelBuffer,
+            datatype: header.datatype,
+            globalMin: min,
+            globalMax: max,
+            slope: header.scl_slope || 1,
+            inter: header.scl_inter || 0,
+            sliceIdx: {
+              axial: Math.floor(header.nz / 2),
+              coronal: Math.floor(header.ny / 2),
+              sagittal: Math.floor(header.nx / 2),
+            },
+          });
+        } catch (err: any) {
+          if (err?.name !== 'AbortError') {
+            console.error('Local load error:', err);
+          }
+        }
+      },
     });
   }
 
@@ -239,36 +455,44 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         if (signal.aborted) return;
 
         try {
-          const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
-          if (!preview || signal.aborted) return;
-
           this.volumeCache.setActive(uriKey, webviewId);
 
-          const axialBuffer = preview.slices.axial.buffer.slice(
-            preview.slices.axial.byteOffset,
-            preview.slices.axial.byteOffset + preview.slices.axial.byteLength
-          );
-          const coronalBuffer = preview.slices.coronal.buffer.slice(
-            preview.slices.coronal.byteOffset,
-            preview.slices.coronal.byteOffset + preview.slices.coronal.byteLength
-          );
-          const sagittalBuffer = preview.slices.sagittal.buffer.slice(
-            preview.slices.sagittal.byteOffset,
-            preview.slices.sagittal.byteOffset + preview.slices.sagittal.byteLength
-          );
+          const entry = this.proxy!.getEntry(entryId);
+          if (!entry) return;
+
+          const { rawData, header } = await this.proxy!.loadFileData(entry, signal);
+          if (!rawData || !header || signal.aborted) return;
+
+          const voxOffset = header.voxOffset;
+          const n = header.nx * header.ny * header.nz;
+          const elemSize = header.bytesPerVoxel;
+          const voxelOnly = rawData.slice(voxOffset, voxOffset + n * elemSize);
+          const { min, max } = this.computeVoxelStats(rawData, header);
+
+          this.volumeCache.set(uriKey, {
+            header,
+            voxelData: voxelOnly,
+            min, max,
+            slope: header.scl_slope || 1,
+            inter: header.scl_inter || 0,
+          });
+
+          const voxelBuffer = voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
 
           webview.postMessage({
-            type: 'preview',
-            header: preview.header,
-            globalMin: preview.globalMin,
-            globalMax: preview.globalMax,
-            sliceIdx: preview.sliceIdx,
-            slope: preview.slope,
-            inter: preview.inter,
-            partialPreview: preview.partialPreview || false,
-            axialSlice: axialBuffer,
-            coronalSlice: coronalBuffer,
-            sagittalSlice: sagittalBuffer,
+            type: 'cachedVolume',
+            header,
+            voxelData: voxelBuffer,
+            datatype: header.datatype,
+            globalMin: min,
+            globalMax: max,
+            slope: header.scl_slope || 1,
+            inter: header.scl_inter || 0,
+            sliceIdx: {
+              axial: Math.floor(header.nz / 2),
+              coronal: Math.floor(header.ny / 2),
+              sagittal: Math.floor(header.nx / 2),
+            },
           });
         } catch (err: any) {
           if (err?.name !== 'AbortError') {

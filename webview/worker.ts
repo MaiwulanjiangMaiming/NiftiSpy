@@ -458,6 +458,8 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
       throwIfAborted(signal);
       voxelData[i] = (nativeData as any)[i] * slope + inter;
     }
+    nativeData = null as any;
+    rawData = null as any;
     }
 
     self.postMessage({ id, type: 'progress', value: 1.0, stage: 'done' });
@@ -627,6 +629,8 @@ async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuf
       throwIfAborted(signal);
       voxelData[i] = (nativeData as any)[i] * slope + inter;
     }
+    nativeData = null as any;
+    rawData = null as any;
     }
 
     self.postMessage({ id, type: 'progress', value: 1.0, stage: 'done' });

@@ -362,7 +362,7 @@ function readLocalFilePartial(fsPath: string, start: number, end: number): Promi
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     const stream = fs.createReadStream(fsPath, { start, end });
-    stream.on('data', (chunk: Buffer) => chunks.push(chunk));
+    stream.on('data', (chunk) => { if (Buffer.isBuffer(chunk)) chunks.push(chunk); });
     stream.on('end', () => {
       const total = chunks.reduce((s, c) => s + c.length, 0);
       const result = Buffer.alloc(total);
@@ -537,6 +537,10 @@ export class LocalFileProxy {
     const id = String(this.idCounter++);
     this.files.set(id, { uri, id, sliceCache: new Map(), lodCache: new Map() });
     return `http://127.0.0.1:${this.port}/file/${id}`;
+  }
+
+  getEntry(entryId: string): FileEntry | undefined {
+    return this.files.get(entryId);
   }
 
   private async handleRequest(
@@ -1012,7 +1016,7 @@ export class LocalFileProxy {
     }
   }
 
-  private async loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: any }> {
+  public async loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: any }> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
     if (entry.dataCache && entry.headerCache) {

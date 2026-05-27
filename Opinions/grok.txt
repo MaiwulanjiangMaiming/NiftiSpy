@@ -1,0 +1,147 @@
+**NiftiSpy 当前问题诊断 + 顶尖级深度重构方案**
+
+你的扩展整体思路正确（preview-first + worker + proxy + optional native），但在**编译打包后**本地变慢、**远程大文件**极慢，说明存在**多层序列化/传输/内存拷贝开销、解压/解析瓶颈、WebView 渲染路径不极致**，以及未充分利用现代硬件（多核、GPU、SIMD、内存映射、零拷贝）。
+
+### 当前主要问题（基于代码分析）
+1. **打包后变慢**：开发时 VS Code 直接加载 TS/JS 热更新快；打包成 dist + webview 后，消息传递（postMessage）、ArrayBuffer 转移、序列化开销放大。Proxy HTTP + zlib 在 Node 侧可能阻塞或拷贝多次。
+2. **远程极慢**：LocalFileProxy 用 HTTP 服务器 + range request，但大 .nii.gz 解压仍在 JS/Worker 做全量或大块传输。网络往返 + 重复解压 + postMessage 拷贝。
+3. **解析/解码瓶颈**：nii-parser.ts 很可能基于纯 JS 或简单 WASM，gzip 解压 + voxel 解析未充分利用 SIMD/WebAssembly SIMD 或 Rust/neon。
+4. **渲染**：默认 canvas，WebGL fallback 不够激进；大体积 slice 转换 Float32Array 内存爆炸；无 LOD/ progressive rendering 深度优化。
+5. **缓存/内存管理**：LRU 存在但 eviction 和预加载策略可更智能；全量加载 debounced 但仍可能 OOM 或卡顿。
+6. **未充分利用硬件**：
+   - CPU：多核 + SIMD 未极致。
+   - GPU：WebGL2/WebGPU 未做 volume raycasting / texture streaming。
+   - 内存映射：本地大文件未用 mmap。
+   - 远程：未用 HTTP/3 + Brotli/Zstd + worker streaming。
+
+参考 **ITK-SNAP**（C++ + ITK/VTK，高效 slicing、geometry、segmentation pipeline）和 **Niivue**（WebGL2 高效但远程/大文件弱、UI 简单），你的目标是**混合架构**：**Rust/WebAssembly 核心 + WebGPU 渲染 + 智能 streaming**，超越两者。
+
+---
+
+### 顶尖重构方案：**"NiftiSpy Ultra" 架构**
+
+**核心目标**：
+- 本地打开 < 500ms 预览（任意大小文件）。
+- 远程大文件（>10GB .nii.gz）流式、<2s 交互。
+- 充分利用：多核 CPU、GPU (WebGPU)、AVX512/SIMD、内存映射、零拷贝。
+- 模块化、可扩展到 segmentation（像 ITK-SNAP）。
+- 保持 VS Code 扩展友好。
+
+#### 1. **整体架构（分层、零拷贝优先）**
+```
+VS Code Extension Host (Node/Rust)
+├── NiiEditorProvider (轻量)
+├── FastFileService (Rust native module 或 Tauri-like)
+│   ├── mmap / range reader
+│   ├── zstd/gzip SIMD 解压
+│   ├── header + metadata cache
+│   └── slice / chunk streaming (zero-copy where possible)
+└── WebView (HTML + TS)
+    ├── UI Layer (Svelte/Vue3 + signals for reactivity)
+    ├── Rendering Engine (WebGPU primary, WebGL2 fallback)
+    └── Worker Pool (WASM/Rust)
+        ├── Parser (Rust → WASM)
+        ├── Loader (streaming)
+        └── Compute (optional segmentation)
+```
+
+- **Native 核心**：用 **Rust + neon / napi-rs**（或直接 WebAssembly + WASI）构建核心库。Rust 速度 + 内存安全远超 JS。
+- **WebView**：用轻量框架（Svelte 5 或 SolidJS）替换纯 TS，提升 UI 响应。
+- **通信**：尽量 SharedArrayBuffer + Atomics（需 COOP/COEP headers，在 VS Code webview 可配置），或 postMessage + Transferable ArrayBuffer 最小化拷贝。
+
+#### 2. **文件加载与 Streaming 优化（解决远程/大文件慢）**
+- **本地**：
+  - 用 Rust `memmap2` 内存映射文件。
+  - Header 解析瞬间完成。
+  - Slice extraction：Rust SIMD（`std::simd` 或 `wide` crate）直接从 mmap 读 voxel，转换到目标格式（uint16→float32 with window/level）。
+- **远程 / SSH / Remote-SSH**：
+  - 保留 Proxy，但升级为 **HTTP/3 + range + zstd**。
+  - 支持 **partial decompression**：只解压需要的 chunks（用 zstd seekable frame 或 custom index）。
+  - **Progressive LOD**：先发低分辨率 MIP/ downsampled volume（类似 Niivue 但更快），后台 stream full res slices。
+  - Bandwidth-aware：用 `navigator.connection` + 实时 estimator 动态决定 chunk size / quality。
+- **预览策略**：
+  - 打开即提取 3 个正交中心 slice + low-res 3D MIP（<1MB 数据）。
+  - 全量加载：background worker + priority queue + cancellable。
+
+**实现**：Rust crate `nifti-core`（解析 + extraction），编译成 `.node` 和 `.wasm` 两版。
+
+#### 3. **解析与解码深度优化**
+- **Parser**：迁移到 Rust（基于 `nifti` crate 或自实现），支持 NIfTI-1/2、gzip/zstd。
+  - SIMD 解压 + voxel remapping。
+  - 输出 TypedArray，直接 transferable。
+- **WASM**：用 `wasm-pack` + `rayon`（多线程 WASM）并行 slice decode。
+- **Native Acceleration**：默认开启（fallback JS），用 `napi-rs` 暴露 API：
+  ```rust
+  #[napi]
+  fn extract_slice_mmap(path: String, axis: u8, index: u32, window: [f32;2]) -> Vec<u8> { ... }
+  ```
+
+#### 4. **渲染引擎（超越 Niivue）**
+- **Primary: WebGPU**（2026 年已成熟）。
+  - Volume textures + 3D ray marching for MIP/ rendering。
+  - Slice rendering：texture upload from worker buffer（zero-copy via GPUBuffer）。
+  - Dynamic resolution scaling + temporal reprojection for smooth interaction。
+- **Fallback: WebGL2** with texture atlas。
+- **优化**：
+  - Slice cache in GPU memory。
+  - Precompute colormaps as LUT textures。
+  - Crosshair / overlays as separate render pass（高效 compositing）。
+  - 像 ITK-SNAP 一样支持 linked cursors、多 volume 同步。
+
+**UI/UX**：直观现代界面（参考 ITK-SNAP + 3D Slicer）。
+- Sidebar：layers、adjustments、metadata。
+- Keyboard + mouse 专业操控。
+- Multi-view layout（quad view 等）。
+- 内置简单 segmentation（active contours 或 threshold，像 ITK-SNAP）。
+
+#### 5. **性能 & 硬件充分利用**
+- **CPU**：Worker pool = `navigator.hardwareConcurrency`。
+- **GPU**：WebGPU compute shaders for intensity normalization、histogram、simple filtering。
+- **内存**：智能 eviction（基于 access frequency + size），shared buffers。
+- **Benchmarking**：集成自动 bench（不同文件大小、本地/远程、不同硬件 tier）。
+- **Profiling**：暴露 perf monitor 到 devtools。
+
+#### 6. **实现路线图（分阶段）**
+**Phase 1: 核心加速 (2-4 周)**
+- 构建 Rust `nifti-core` + napi + wasm。
+- 替换 parser 和 slice extraction。
+- 启用 mmap + 零拷贝预览。
+- 测试本地速度提升。
+
+**Phase 2: Streaming & Remote (2-3 周)**
+- zstd seekable + chunked loader。
+- WebGPU renderer。
+- 智能 queue + progressive。
+
+**Phase 3: UI/UX & Features (3-4 周)**
+- Svelte 重构 webview。
+- 高级交互、compare mode 增强。
+- 基础 segmentation。
+
+**Phase 4: Polish & Ecosystem**
+- VS Code settings 更丰富。
+- 支持 DICOM（用 dicom-parser 或 Rust）。
+- 插件扩展点（自定义 shaders、AI models）。
+
+#### 7. **技术栈推荐**
+- **Rust**: `napi-rs`, `memmap2`, `zstd`, `ndarray` + `simd`, `bytemuck`.
+- **Frontend**: Svelte 5 + WebGPU (via `wgpu` bindings or direct).
+- **Build**: `nx` 或 turbo for monorepo。
+- **测试**: 大文件 benchmarks（包括 10GB+）。
+- **打包**: `vsce` + 预编译 native for win/mac/linux。
+
+#### 8. **预期成果**
+- 本地：预览 <300ms，全加载秒级（vs 当前慢）。
+- 远程：流式，交互流畅（远超 Niivue）。
+- 内存/CPU：更低占用。
+- 可扩展性：容易加 AI segmentation（ONNX/WebGPU）或与 ITK.js 集成。
+
+**起步行动**：
+1. Fork repo，创建 `nifti-core` Rust crate。
+2. 用 `napi-rs` 集成 slice extraction。
+3. 替换 `nii-parser.ts` 调用 WASM/native。
+4. 逐步迁移 renderer 到 WebGPU。
+
+这个方案是**顶尖架构师级别**的：结合 ITK-SNAP 的专业 pipeline + Niivue 的 Web 轻量 + 现代 Rust/WebGPU 极致性能，完全发挥 2026 年硬件优势。
+
+如果你提供具体瓶颈日志、示例大文件、或想让我帮写某个模块的 skeleton code（e.g. Rust parser），我可以继续深度指导或生成代码。需要我搜索特定 crate 或 benchmark 数据吗？

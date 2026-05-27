@@ -1,0 +1,894 @@
+# NiftiSpy 深度重构方案
+
+由于无法直接访问你的仓库代码，我将基于 NIfTI 图像查看器的通用架构瓶颈，结合你提到的症状（本地浏览正常但编译后变慢、远程加载极慢），给出一份系统性的诊断与重构方案。
+
+---
+
+## 第一部分：问题诊断
+
+### 1.1 「编译后打开图像慢」的常见根因
+
+```
+症状：本地浏览本来可以，编译后变慢
+```
+
+**最可能的原因排序：**
+
+| 优先级 | 问题 | 诊断方法 |
+|--------|------|----------|
+| **P0** | Release/Debug 编译配置差异（如 Debug 模式打开了大量 I/O 校验） | 检查 CMakeLists 或构建脚本中的编译标志 |
+| **P0** | gzip 解压 `.nii.gz` 未使用流式解压，而是全量解压到内存后才开始渲染 | 在 `nibabel` / `nifti` 读取处加计时日志 |
+| **P1** | 图像加载与 UI 渲染在同一线程，加载时 UI 卡死 | 检查是否有异步加载 |
+| **P1** | 每次打开都重新计算 min/max/windowing | 检查是否缓存了统计信息 |
+| **P2** | 体积渲染或切片重建时未使用缓存体数据 | 检查是否有 numpy array 缓存 |
+
+### 1.2 「远程图像慢」的根因
+
+```
+症状：远程大文件加载速度远慢于预期
+```
+
+**核心问题链：**
+
+```
+远程URL → 全量下载 → 写入临时文件 → gzip解压 → 构建numpy数组 → 渲染
+         ↑                                                ↑
+     瓶颈1: 无Range请求                              瓶颈2: 阻塞式串行
+```
+
+Niivue 的远程慢也是同样原因——它在浏览器中做全量 HTTP GET，没有利用 HTTP Range Requests 实现按需加载。
+
+---
+
+## 第二部分：重构架构设计
+
+### 2.1 总体架构（目标状态）
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         NiftiSpy v2.0                               │
+│                                                                     │
+│  ┌───────────┐   ┌──────────────┐   ┌──────────────────────────┐   │
+│  │  UI Layer  │   │ Render Engine│   │    Data Pipeline         │   │
+│  │  (Qt/QML)  │◄──│ (GPU Accel)  │◄──│                          │   │
+│  │            │   │              │   │  ┌────────┐ ┌──────────┐ │   │
+│  │ - Toolbar  │   │ - OpenGL/    │   │  │ Cache  │ │Decompress│ │   │
+│  │ - Slices   │   │   Vulkan     │   │  │ Manager│ │ Engine   │ │   │
+│  │ - 3D View  │   │ - Compute    │   │  └───┬────┘ └────┬─────┘ │   │
+│  │ - Overlays │   │   Shaders    │   │      │           │       │   │
+│  └───────────┘   └──────────────┘   │  ┌───▼───────────▼─────┐ │   │
+│                                      │  │   Async I/O Layer    │ │   │
+│  ┌───────────────────────────────┐  │  │                      │ │   │
+│  │     Intelligence Layer        │  │  │  ┌──────┐ ┌───────┐  │ │   │
+│  │ - Auto windowing              │  │  │  │Local │ │Remote │  │ │   │
+│  │ - Segmentation overlay        │  │  │  │ FS   │ │ HTTP  │  │ │   │
+│  │ - Annotation tools            │  │  │  │      │ │Range  │  │ │   │
+│  └───────────────────────────────┘  │  │  └──────┘ └───────┘  │ │   │
+│                                      │  └──────────────────────┘ │   │
+│                                      └──────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 技术栈选择
+
+基于你想融合 ITK-SNAP（原生性能）和 Niivue（Web 可及性）优势的诉求：
+
+```
+语言:        C++ 17/20 (核心引擎) + Python (脚本/插件接口)
+UI框架:      Qt 6 (QML + Quick3D) 或 Dear ImGui + 原生窗口
+GPU加速:     OpenGL 4.5+ / Vulkan (计算着色器用于体渲染)
+压缩:        libdeflate (替代 zlib，2-4x 解压加速)
+网络:        libcurl (HTTP Range) 或 cpp-httplib
+构建:        CMake + vcpkg/conan
+SIMD:        SSE4.2 / AVX2 / NEON (自动分发)
+```
+
+---
+
+## 第三部分：逐模块深度优化方案
+
+### 3.1 数据 I/O 层 —— 核心瓶颈破解
+
+#### 3.1.1 本地文件：内存映射 + 零拷贝
+
+```cpp
+// 方案: mmap 替代 read()
+class NiftiMMapReader {
+public:
+    NiftiMMapReader(const std::string& path) {
+        // 1. 打开文件
+        fd_ = open(path.c_str(), O_RDONLY);
+        file_size_ = lseek(fd_, 0, SEEK_END);
+        
+        // 2. 内存映射 - 不加载数据，只建立页表映射
+        mapped_data_ = mmap(nullptr, file_size_, PROT_READ, 
+                           MAP_PRIVATE | MAP_NORESERVE, fd_, 0);
+        
+        // 3. 解析 header (仅 348 字节，瞬时完成)
+        header_ = reinterpret_cast<nifti_1_header*>(mapped_data_);
+        
+        // 4. 对于 .nii 文件，数据紧跟 header 之后
+        // 关键：数据不需要"加载"，按需读取页面
+        data_offset_ = header_->vox_offset;
+    }
+    
+    // 按需读取切片 - OS自动管理页面缓存
+    template<typename T>
+    std::span<T> read_slice(int axis, int index) {
+        // 计算该切片在文件中的偏移
+        auto [offset, count] = compute_slice_offset<T>(axis, index);
+        // 直接返回映射区域的指针，零拷贝
+        return std::span<T>(
+            reinterpret_cast<T*>(
+                static_cast<char*>(mapped_data_) + data_offset_ + offset
+            ), 
+            count
+        );
+    }
+    
+    // 提示OS预取 - 对顺序浏览极其有效
+    void prefetch_region(int64_t offset, size_t length) {
+        madvise(static_cast<char*>(mapped_data_) + offset, 
+                length, MADV_WILLNEED);
+    }
+    
+    // 对于随机访问模式
+    void set_random_access() {
+        madvise(mapped_data_, file_size_, MADV_RANDOM);
+    }
+};
+```
+
+**效果对比：**
+```
+传统方式:  open → read(全量) → 解析 → 渲染    (~3-8秒 for 256³ float)
+mmap方式:  mmap → 解析header → 渲染当前切片    (~10-50毫秒 首帧)
+```
+
+#### 3.1.2 .nii.gz 流式解压（不用解压整个文件）
+
+```cpp
+// 核心问题: 大多数实现会 gunzip 整个文件到内存
+// 优化: 只解压需要的字节范围
+
+class GzipStreamDecompressor {
+    z_stream stream_;
+    std::ifstream file_;
+    
+public:
+    // 方法1: 预建索引（首次打开时建立，后续秒开）
+    struct GzipIndex {
+        std::vector<uint64_t> compressed_offsets;   // 压缩流中的检查点
+        std::vector<uint64_t> decompressed_offsets; // 对应的解压后位置
+    };
+    
+    // 使用 indexed_gzip 思路
+    void build_index(const std::string& path) {
+        // 扫描整个压缩流，每隔 N 字节记录一个同步点
+        // 索引本身很小（几KB），可以持久化到磁盘
+        // 下次打开同文件直接加载索引
+    }
+    
+    // 有了索引后，按需解压任意范围
+    std::vector<uint8_t> decompress_range(uint64_t start, uint64_t length) {
+        // 找到最近的同步点
+        auto it = std::lower_bound(index_.decompressed_offsets.begin(),
+                                    index_.decompressed_offsets.end(), start);
+        size_t sync_idx = std::distance(index_.decompressed_offsets.begin(), it);
+        
+        // 定位到压缩流中的对应位置
+        file_.seekg(index_.compressed_offsets[sync_idx]);
+        
+        // 从同步点解压到目标范围
+        inflateInit(&stream_);
+        // ... 流式解压，跳过不需要的部分 ...
+        
+        return result;
+    }
+};
+```
+
+#### 3.1.3 远程文件：HTTP Range + 并行分块下载
+
+```cpp
+class RemoteNiftiLoader {
+    std::string url_;
+    size_t file_size_ = 0;
+    
+public:
+    // Step 1: HEAD 请求获取文件大小（极快）
+    void probe() {
+        auto resp = http_head(url_);  // ~50-200ms
+        file_size_ = resp.content_length;
+    }
+    
+    // Step 2: 只下载 header（348字节 + vox_offset）
+    nifti_1_header fetch_header() {
+        // 只请求前 1024 字节
+        auto resp = http_get_range(url_, 0, 1024);  // ~50-100ms
+        return parse_header(resp.body);
+    }
+    
+    // Step 3: 按需下载当前切片数据
+    std::vector<uint8_t> fetch_slice(int axis, int index) {
+        auto [offset, size] = compute_slice_range(axis, index);
+        
+        // 单个 Range 请求，只传输需要的数据
+        auto resp = http_get_range(url_, 
+            data_offset_ + offset, 
+            data_offset_ + offset + size);  // ~100-500ms
+        
+        return resp.body;
+    }
+    
+    // Step 4: 预测性预取相邻切片
+    void prefetch_adjacent(int axis, int current, int radius = 2) {
+        std::vector<std::future<std::vector<uint8_t>>> futures;
+        
+        for (int i = -radius; i <= radius; i++) {
+            if (i == 0) continue;
+            int idx = current + i;
+            if (idx >= 0 && idx < dims_[axis]) {
+                futures.push_back(
+                    std::async(std::launch::async, 
+                        &RemoteNiftiLoader::fetch_slice, this, axis, idx)
+                );
+            }
+        }
+        // 异步结果缓存到本地 LRU cache
+    }
+    
+    // HTTP Range 请求实现
+    HttpResponse http_get_range(const std::string& url, 
+                                size_t start, size_t end) {
+        CURL* curl = curl_easy_init();
+        std::string range = std::to_string(start) + "-" + std::to_string(end);
+        curl_easy_setopt(curl, CURLOPT_RANGE, range.c_str());
+        // ... 配置其他选项 ...
+        curl_easy_perform(curl);
+        // ...
+    }
+};
+```
+
+**远程加载性能对比：**
+```
+传统方式:  GET完整文件 → 解压 → 渲染        (~30-120秒 for 500MB)
+Range方式: HEAD → GET header → GET当前切片    (~200-500ms 首帧)
+           GET相邻切片(后台)                   (用户无感知)
+```
+
+### 3.2 解压引擎优化
+
+#### 3.2.1 使用 libdeflate 替代 zlib
+
+```cpp
+#include <libdeflate.h>
+
+// zlib inflate: ~300 MB/s
+// libdeflate:   ~800 MB/s (2.5-3x 提升)
+
+class FastDecompressor {
+public:
+    static std::vector<uint8_t> decompress_gzip(
+        const uint8_t* compressed, size_t comp_size,
+        size_t expected_size) 
+    {
+        std::vector<uint8_t> output(expected_size);
+        
+        struct libdeflate_decompressor* decompressor = 
+            libdeflate_alloc_decompressor();
+        
+        size_t actual_size;
+        enum libdeflate_result result = libdeflate_gzip_decompress(
+            decompressor,
+            compressed, comp_size,
+            output.data(), output.size(),
+            &actual_size
+        );
+        
+        libdeflate_free_decompressor(decompressor);
+        
+        if (result != LIBDEFLATE_SUCCESS) {
+            throw std::runtime_error("Decompression failed");
+        }
+        
+        output.resize(actual_size);
+        return output;
+    }
+};
+```
+
+#### 3.2.2 多线程分块解压
+
+```cpp
+// 对于已知数据布局的情况，可以将数据分块并行解压
+class ParallelDecompressor {
+    static constexpr size_t BLOCK_SIZE = 4 * 1024 * 1024; // 4MB blocks
+    
+public:
+    std::vector<uint8_t> parallel_decompress(
+        const std::vector<std::pair<size_t, size_t>>& block_ranges,
+        const uint8_t* compressed_data)
+    {
+        size_t num_blocks = block_ranges.size();
+        std::vector<std::vector<uint8_t>> results(num_blocks);
+        
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t i = 0; i < num_blocks; i++) {
+            auto [offset, size] = block_ranges[i];
+            results[i] = decompress_block(
+                compressed_data + offset, size);
+        }
+        
+        // 合并结果
+        return merge_blocks(results);
+    }
+};
+```
+
+### 3.3 渲染引擎重构
+
+#### 3.3.1 切片渲染 —— GPU 纹理上传
+
+```cpp
+class SliceRenderer {
+    GLuint texture_id_;
+    GLuint pbo_id_; // Pixel Buffer Object 双缓冲
+    
+public:
+    void init() {
+        glGenTextures(1, &texture_id_);
+        glGenBuffers(2, pbo_ids_);
+        
+        // 配置纹理参数
+        glBindTexture(GL_TEXTURE_2D, texture_id_);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    
+    // 使用 PBO 异步上传，CPU 不等待 GPU
+    void update_slice_async(const void* data, int width, int height, 
+                            GLenum format) {
+        // Ping-pong PBO
+        int next_pbo = (current_pbo_ + 1) % 2;
+        
+        // 1. 异步上传到下一个 PBO（CPU 立即返回）
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_ids_[next_pbo]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, 
+                     width * height * pixel_size_, 
+                     data, GL_STREAM_DRAW);
+        
+        // 2. 从当前 PBO 上传到纹理（由 DMA 引擎完成）
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_ids_[current_pbo_]);
+        glBindTexture(GL_TEXTURE_2D, texture_id_);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 
+                        width, height, format, GL_FLOAT, nullptr);
+        
+        current_pbo_ = next_pbo;
+    }
+    
+    // 窗宽窗位调整 —— 全在 GPU 的 fragment shader 中完成
+    // 不需要重新上传纹理数据
+    void render(float window_center, float window_width) {
+        shader_->use();
+        shader_->set_float("u_window_center", window_center);
+        shader_->set_float("u_window_width", window_width);
+        shader_->set_int("u_colormap", colormap_id_);
+        // ... draw quad ...
+    }
+};
+```
+
+**Fragment Shader（窗宽窗位 + 伪彩色）：**
+```glsl
+#version 450 core
+
+uniform sampler2D u_volume_texture;
+uniform float u_window_center;
+uniform float u_window_width;
+uniform int u_colormap;
+uniform float u_opacity;
+
+in vec2 v_texcoord;
+out vec4 frag_color;
+
+// 高性能 LUT 伪彩色
+vec3 apply_colormap(float val, int cmap) {
+    if (cmap == 0) return vec3(val); // 灰度
+    
+    // Hot metal
+    float r = clamp(3.0 * val - 1.0, 0.0, 1.0);
+    float g = clamp(3.0 * val - 2.0, 0.0, 1.0);
+    float b = clamp(val * 3.0, 0.0, 1.0) - clamp(val * 3.0 - 2.0, 0.0, 1.0);
+    // ... more colormaps ...
+    return vec3(r, g, b);
+}
+
+void main() {
+    float raw = texture(u_volume_texture, v_texcoord).r;
+    
+    // 窗宽窗位映射 —— GPU 瞬时完成
+    float lower = u_window_center - u_window_width * 0.5;
+    float upper = u_window_center + u_window_width * 0.5;
+    float normalized = clamp((raw - lower) / (upper - lower), 0.0, 1.0);
+    
+    vec3 color = apply_colormap(normalized, u_colormap);
+    frag_color = vec4(color, u_opacity);
+}
+```
+
+#### 3.3.2 体渲染 —— Ray Marching 计算着色器
+
+```cpp
+class VolumeRenderer {
+    GLuint volume_texture_3d_; // 3D 纹理
+    GLuint depth_texture_;
+    
+public:
+    void upload_volume(const NiftiData& volume) {
+        glGenTextures(1, &volume_texture_3d_);
+        glBindTexture(GL_TEXTURE_3D, volume_texture_3d_);
+        
+        // 如果是标准 NIfTI 数据类型，直接上传
+        GLenum internal_format, format, type;
+        map_nifti_to_gl(volume.header->datatype, 
+                        internal_format, format, type);
+        
+        // 使用 glTexImage3D 一次性上传整个体积
+        glTexImage3D(GL_TEXTURE_3D, 0, internal_format,
+                     volume.header->dim[1], volume.header->dim[2], 
+                     volume.header->dim[3],
+                     0, format, type, volume.data());
+        
+        // 设置 3D 纹理参数
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    }
+    
+    void render_ray_marching(const Camera& camera, 
+                              const RenderParams& params) {
+        compute_shader_->use();
+        compute_shader_->set_mat4("u_inv_view_proj", 
+                                   glm::inverse(camera.view_proj()));
+        compute_shader_->set_vec3("u_camera_pos", camera.position());
+        compute_shader_->set_float("u_step_size", params.step_size);
+        compute_shader_->set_float("u_threshold", params.iso_threshold);
+        
+        // 绑定 3D 纹理和输出图像
+        glBindImageTexture(0, volume_texture_3d_, 0, GL_TRUE, 0, 
+                           GL_READ_ONLY, GL_R32F);
+        glBindImageTexture(1, output_texture_, 0, GL_FALSE, 0, 
+                           GL_WRITE_ONLY, GL_RGBA8);
+        
+        // 分发计算着色器
+        glDispatchCompute(
+            (screen_width_ + 7) / 8, 
+            (screen_height_ + 7) / 8, 
+            1);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    }
+};
+```
+
+**Compute Shader（体渲染 Ray Marching）：**
+```glsl
+#version 450 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, r32f) uniform readonly image3D u_volume;
+layout(binding = 1, rgba8) uniform writeonly image2D u_output;
+
+uniform mat4 u_inv_view_proj;
+uniform vec3 u_camera_pos;
+uniform float u_step_size;
+uniform float u_opacity_scale;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 screen_size = imageSize(u_output);
+    
+    if (pixel.x >= screen_size.x || pixel.y >= screen_size.y) return;
+    
+    // 将像素坐标转换为 NDC
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(screen_size) * 2.0 - 1.0;
+    
+    // 射线方向
+    vec4 near = u_inv_view_proj * vec4(ndc, -1.0, 1.0);
+    vec4 far  = u_inv_view_proj * vec4(ndc,  1.0, 1.0);
+    near /= near.w;
+    far  /= far.w;
+    
+    vec3 origin = u_camera_pos;
+    vec3 dir = normalize(far.xyz - near.xyz);
+    
+    // 与 volume AABB 求交
+    vec2 t_hit = intersect_aabb(origin, dir, vec3(0), vec3(1));
+    
+    if (t_hit.x > t_hit.y) {
+        imageStore(u_output, pixel, vec4(0, 0, 0, 1));
+        return;
+    }
+    
+    // Ray Marching
+    vec3 acc_color = vec3(0);
+    float acc_alpha = 0;
+    
+    float t = t_hit.x;
+    vec3 vol_size = vec3(imageSize(u_volume));
+    
+    while (t < t_hit.y && acc_alpha < 0.98) {
+        vec3 pos = origin + dir * t;
+        ivec3 voxel = ivec3(pos * vol_size);
+        
+        float val = imageLoad(u_volume, voxel).r;
+        
+        // Transfer Function
+        vec4 sample_color = transfer_function(val);
+        float alpha = sample_color.a * u_step_size * u_opacity_scale;
+        
+        acc_color += sample_color.rgb * alpha * (1.0 - acc_alpha);
+        acc_alpha += alpha * (1.0 - acc_alpha);
+        
+        t += u_step_size;
+    }
+    
+    imageStore(u_output, pixel, vec4(acc_color, 1.0));
+}
+```
+
+### 3.4 多级缓存系统
+
+```cpp
+class CacheManager {
+    // L1: 当前切片 - 直接内存指针（最快）
+    struct L1Cache {
+        int axis, index;
+        void* data;        // mmap 指针或已解压数据
+        size_t size;
+    };
+    
+    // L2: 相邻切片 - 预解压内存
+    struct L2Cache {
+        std::unordered_map<std::string, std::vector<uint8_t>> slices;
+        size_t max_size = 512 * 1024 * 1024; // 512MB
+        LRU eviction;
+    };
+    
+    // L3: 磁盘缓存（远程文件的本地副本）
+    struct L3Cache {
+        std::string cache_dir;
+        
+        std::string get_cached_path(const std::string& url, 
+                                     size_t start, size_t end) {
+            // 使用 URL + range 作为缓存 key
+            return cache_dir + "/" + sha256(url + ":" + 
+                   std::to_string(start) + "-" + std::to_string(end));
+        }
+        
+        bool has_cached(const std::string& url, size_t start, size_t end) {
+            auto path = get_cached_path(url, start, end);
+            return std::filesystem::exists(path);
+        }
+    };
+    
+public:
+    // 统一获取接口
+    SliceData get_slice(const DataSource& source, int axis, int index) {
+        // 1. 查 L1
+        if (l1_.axis == axis && l1_.index == index) {
+            return {l1_.data, l1_.size};
+        }
+        
+        // 2. 查 L2
+        std::string key = make_key(axis, index);
+        if (auto it = l2_.slices.find(key); it != l2_.slices.end()) {
+            promote_to_l1(axis, index, it->second);
+            return {l1_.data, l1_.size};
+        }
+        
+        // 3. 加载（本地 mmap 或远程 Range）
+        auto data = source.load_slice(axis, index);
+        
+        // 4. 存入缓存
+        l2_.slices[key] = data;
+        
+        return {data.data(), data.size()};
+    }
+    
+    // 预取调度
+    void schedule_prefetch(const DataSource& source, 
+                           int axis, int current) {
+        for (int i = -PREFETCH_RADIUS; i <= PREFETCH_RADIUS; i++) {
+            if (i == 0) continue;
+            prefetch_queue_.push({axis, current + i, 
+                                  std::abs(i)}); // 优先级=距离
+        }
+    }
+    
+private:
+    L1Cache l1_;
+    L2Cache l2_;
+    L3Cache l3_;
+    PriorityQueue<PrefetchTask> prefetch_queue_;
+    std::thread prefetch_thread_;
+};
+```
+
+### 3.5 异步渲染管线
+
+```cpp
+class AsyncRenderPipeline {
+    // 三线程模型
+    std::thread io_thread_;       // I/O + 解压
+    std::thread upload_thread_;   // GPU 纹理上传
+    // 主线程: UI + 渲染
+    
+    // 双缓冲同步
+    struct FrameBuffer {
+        std::atomic<bool> ready{false};
+        std::vector<uint8_t> data;
+        int width, height;
+    };
+    
+    TripleBuffer<FrameBuffer> buffers_;
+    
+public:
+    void init() {
+        // I/O 线程: 持续读取和预取
+        io_thread_ = std::thread([this]() {
+            while (running_) {
+                auto task = io_queue_.pop();
+                
+                // 读取 + 解压
+                auto slice = load_and_decompress(task);
+                
+                // 放入上传队列
+                upload_queue_.push(std::move(slice));
+            }
+        });
+        
+        // 上传线程: 使用共享 GL context 上传纹理
+        upload_thread_ = std::thread([this]() {
+            // 创建共享 GL context
+            auto shared_ctx = create_shared_gl_context(main_context_);
+            make_current(shared_ctx);
+            
+            while (running_) {
+                auto slice = upload_queue_.pop();
+                
+                // 在共享上下文中上传到 PBO
+                auto& buf = buffers_.get_write_buffer();
+                upload_to_pbo(buf, slice);
+                buf.ready = true;
+            }
+        });
+    }
+    
+    void on_slice_change(int axis, int index) {
+        // 立即响应 - 不等待 I/O
+        io_queue_.push({axis, index, PRIORITY_HIGH});
+        
+        // 同时开始预取
+        cache_.schedule_prefetch(data_source_, axis, index);
+    }
+    
+    void render_frame() {
+        auto& buf = buffers_.get_read_buffer();
+        if (buf.ready) {
+            // 从 PBO 到纹理（DMA，极快）
+            blit_pbo_to_texture(buf);
+            buf.ready = false;
+        }
+        
+        // 渲染当前纹理（窗宽窗位全在 shader 中）
+        render_slice(current_windowing_);
+    }
+};
+```
+
+### 3.6 数据类型优化
+
+```cpp
+// NIfTI 支持多种数据类型，直接匹配 GPU 纹理格式
+struct GLFormatMapping {
+    int nifti_datatype;
+    GLenum internal_format;
+    GLenum format;
+    GLenum type;
+    bool needs_conversion;
+};
+
+static const std::vector<GLFormatMapping> FORMAT_MAP = {
+    {NIFTI_TYPE_UINT8,   GL_R8,    GL_RED, GL_UNSIGNED_BYTE,  false},
+    {NIFTI_TYPE_INT16,   GL_R16,   GL_RED, GL_SHORT,          false},
+    {NIFTI_TYPE_INT32,   GL_R32I,  GL_RED, GL_INT,            false},
+    {NIFTI_TYPE_FLOAT32, GL_R32F,  GL_RED, GL_FLOAT,          false},
+    {NIFTI_TYPE_FLOAT64, GL_R32F,  GL_RED, GL_FLOAT,          true}, // 需要转换
+    {NIFTI_TYPE_INT8,    GL_R8,    GL_RED, GL_BYTE,           false},
+    {NIFTI_TYPE_UINT16,  GL_R16UI, GL_RED, GL_UNSIGNED_SHORT, false},
+    {NIFTI_TYPE_UINT32,  GL_R32UI, GL_RED, GL_UNSIGNED_INT,   false},
+};
+
+// 对于 FLOAT64 等不直接支持的类型，使用 SIMD 加速转换
+void convert_float64_to_float32_avx2(const double* src, float* dst, 
+                                      size_t count) {
+    size_t i = 0;
+    // 每次处理 4 个 double → 4 个 float
+    for (; i + 4 <= count; i += 4) {
+        __m256d v = _mm256_loadu_pd(src + i);
+        __m128 result = _mm256_cvtpd_ps(v);
+        _mm_storeu_ps(dst + i, result);
+    }
+    // 处理剩余
+    for (; i < count; i++) {
+        dst[i] = static_cast<float>(src[i]);
+    }
+}
+```
+
+---
+
+## 第四部分：编译优化配置
+
+### 4.1 CMake 最佳实践
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(NiftiSpy VERSION 2.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+
+# ===== 关键编译标志 =====
+
+# Release 模式 - 你之前慢的原因很可能在这里
+set(CMAKE_CXX_FLAGS_RELEASE 
+    "-O3 -DNDEBUG -march=native -mtune=native -flto -ffast-math")
+
+# 链接时优化
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -flto")
+
+# 如果有 Debug 模式，不要在生产中使用
+# Debug 模式会: 禁用优化、开启断言、添加调试符号
+# 这就是你"编译后变慢"的根源!
+
+# ===== 查找依赖 =====
+find_package(Qt6 REQUIRED COMPONENTS Quick Quick3D OpenGL)
+find_package(OpenGL REQUIRED)
+find_package(CURL REQUIRED)
+find_package(OpenMP REQUIRED)
+
+# 高性能 zlib 替代
+add_subdirectory(third_party/libdeflate)
+
+# ===== 源文件组织 =====
+add_executable(niftispy
+    src/main.cpp
+    src/core/nifti_reader.cpp
+    src/core/nifti_mmap_reader.cpp
+    src/core/gzip_stream_decompressor.cpp
+    src/core/cache_manager.cpp
+    src/core/async_pipeline.cpp
+    src/io/remote_loader.cpp
+    src/io/http_range_client.cpp
+    src/render/slice_renderer.cpp
+    src/render/volume_renderer.cpp
+    src/render/transfer_function.cpp
+    src/ui/main_window.cpp
+)
+
+target_link_libraries(niftispy PRIVATE
+    Qt6::Quick Qt6::Quick3D Qt6::OpenGL
+    OpenGL::GL
+    CURL::libcurl
+    OpenMP::OpenMP_CXX
+    libdeflate
+)
+
+# SIMD 检测
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx2" HAS_AVX2)
+if(HAS_AVX2)
+    target_compile_definitions(niftispy PRIVATE HAS_AVX2)
+endif()
+```
+
+### 4.2 确认你的编译配置
+
+**这可能是你最紧急要修复的问题：**
+
+```bash
+# 错误的方式（很可能是你现在的做法）
+cmake -DCMAKE_BUILD_TYPE=Debug ..    # 或不指定，默认 Debug
+make
+
+# 正确的方式
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+```
+
+**验证：**
+```bash
+# 检查你的二进制文件
+file niftispy
+# 应该显示 "stripped" 而不是 "not stripped"
+
+# 检查优化级别
+strings niftispy | grep -i "O[0-3]"
+# Release 应该包含 -O3 相关的内联函数
+```
+
+---
+
+## 第五部分：实施路线图
+
+```
+Phase 1 - 紧急修复 (1-2天)
+├── [x] 确认 Release 编译模式
+├── [x] 本地文件用 mmap 替代 read
+├── [x] 窗宽窗位移到 GPU shader
+└── 预期: 本地浏览速度提升 5-10x
+
+Phase 2 - I/O 重构 (3-5天)
+├── 实现 HTTP Range 请求
+├── 远程 header 快速解析
+├── 按需切片加载
+├── 三级缓存系统
+└── 预期: 远程首帧 < 500ms
+
+Phase 3 - 渲染引擎 (5-7天)
+├── PBO 双缓冲纹理上传
+├── Compute Shader 体渲染
+├── 三缓冲异步管线
+├── Transfer Function 实时编辑
+└── 预期: 60fps 流畅渲染
+
+Phase 4 - 高级优化 (持续)
+├── libdeflate 替换 zlib
+├── SIMD 数据类型转换
+├── 预测性预取算法
+├── 压缩索引持久化
+├── 网络自适应质量
+└── 预期: 极致体验
+
+Phase 5 - 对标 ITK-SNAP (长期)
+├── 分割工具 (水平集/Snake)
+├── 标注/测量工具
+├── 多模态配准显示
+├── 插件系统
+└── 目标: 超越 ITK-SNAP + Niivue
+```
+
+---
+
+## 第六部分：性能基准预期
+
+| 场景 | 当前估计 | Phase 1 后 | Phase 3 后 | 完全优化后 |
+|------|----------|-----------|-----------|-----------|
+| 本地 256³ .nii | 3-8s | < 50ms | < 16ms | < 10ms |
+| 本地 256³ .nii.gz | 5-15s | 200-500ms | < 100ms | < 50ms |
+| 远程 500MB .nii | 60-180s | 10-30s | 200-500ms | < 200ms |
+| 切片切换延迟 | 100-500ms | < 16ms | < 8ms | < 4ms |
+| 窗宽窗位调整 | 每次重新计算 | GPU实时 | GPU实时 | GPU实时 |
+| 体渲染帧率 | 1-5 fps | 15-30 fps | 60 fps | 60+ fps |
+
+---
+
+## 最关键的第一步
+
+**在做任何重构之前，先验证这个：**
+
+```bash
+# 在你的项目根目录
+cmake -B build-release -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-O3 -march=native"
+cmake --build build-release -j$(nproc)
+
+# 然后用 Release 版本打开同一个图像
+# 如果速度恢复正常，问题就是编译配置
+# 如果还是很慢，再按上述方案逐项排查
+```
+
+如果你能分享你的代码仓库的截图或者关键文件（特别是数据加载部分和构建配置），我可以给出更精确的针对性修复方案。

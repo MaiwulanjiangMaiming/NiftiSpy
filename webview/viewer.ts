@@ -62,6 +62,7 @@ let initialWindowLevel = 0.5;
 const sliceIdx = { axial: 0, coronal: 0, sagittal: 0 };
 let windowWidth = 1.0;
 let windowLevel = 0.5;
+let pendingAddImageIdx = -1;
 let overlayOpacity = 0.5;
 let overlayColormap = 'hot';
 type CompareLayout = 'overlay' | 'sideBySide';
@@ -530,6 +531,28 @@ function worldToVoxel(h: NiiHeader, wx: number, wy: number, wz: number): [number
       const vy = invDet * (-(m[1][0] * m[2][2] - m[1][2] * m[2][0]) * off[0] + (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * off[1] - (m[0][0] * m[1][2] - m[0][2] * m[1][0]) * off[2]);
       const vz = invDet * ((m[1][0] * m[2][1] - m[1][1] * m[2][0]) * off[0] - (m[0][0] * m[2][1] - m[0][1] * m[2][0]) * off[1] + (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * off[2]);
       return [vx, vy, vz];
+    }
+  }
+  if (h.qform_code !== 0) {
+    const a = Math.sqrt(1.0 + h.quatern_b * h.quatern_b + h.quatern_c * h.quatern_c + h.quatern_d * h.quatern_d);
+    const b = h.quatern_b / a, c = h.quatern_c / a, d = h.quatern_d / a;
+    const R = [
+      [a * a + b * b - c * c - d * d, 2 * b * c - 2 * a * d, 2 * b * d + 2 * a * c],
+      [2 * b * c + 2 * a * d, a * a + c * c - b * b - d * d, 2 * c * d - 2 * a * b],
+      [2 * b * d - 2 * a * c, 2 * c * d + 2 * a * b, a * a + d * d - b * b - c * c],
+    ];
+    const qx = (wx - h.qoffset_x);
+    const qy = (wy - h.qoffset_y);
+    const qz = (wz - h.qoffset_z);
+    const det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1])
+              - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0])
+              + R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+    if (Math.abs(det) > 1e-10) {
+      const invDet = 1 / det;
+      const rx = invDet * ((R[1][1] * R[2][2] - R[1][2] * R[2][1]) * qx - (R[0][1] * R[2][2] - R[0][2] * R[2][1]) * qy + (R[0][1] * R[1][2] - R[0][2] * R[1][1]) * qz);
+      const ry = invDet * (-(R[1][0] * R[2][2] - R[1][2] * R[2][0]) * qx + (R[0][0] * R[2][2] - R[0][2] * R[2][0]) * qy - (R[0][0] * R[1][2] - R[0][2] * R[1][0]) * qz);
+      const rz = invDet * ((R[1][0] * R[2][1] - R[1][1] * R[2][0]) * qx - (R[0][0] * R[2][1] - R[0][1] * R[2][0]) * qy + (R[0][0] * R[1][1] - R[0][1] * R[1][0]) * qz);
+      return [rx / h.dx, ry / h.dy, rz / h.dz];
     }
   }
   return [wx / h.dx, wy / h.dy, wz / h.dz];
@@ -1514,7 +1537,7 @@ function extractSliceFromImage(img: VolumeImage, axis: 'axial' | 'coronal' | 'sa
   return slice;
 }
 
-function renderCompareViews() {
+function renderCompareViews(changedAxis?: 'axial' | 'coronal' | 'sagittal') {
   if (images.length < 2) return;
   const img0 = images[0];
   const img1 = images[1];
@@ -1529,7 +1552,7 @@ function renderCompareViews() {
     sagittal: Math.max(0, Math.min(h1.nx - 1, Math.round(vx1))),
   };
 
-  const axes: ('axial' | 'coronal' | 'sagittal')[] = ['axial', 'coronal', 'sagittal'];
+  const axes: ('axial' | 'coronal' | 'sagittal')[] = changedAxis ? [changedAxis] : ['axial', 'coronal', 'sagittal'];
   for (const axis of axes) {
     const idx0 = axis === 'axial' ? sliceIdx.axial : axis === 'coronal' ? sliceIdx.coronal : sliceIdx.sagittal;
     const slice0 = extractSliceFromImage(img0, axis, idx0);
@@ -1559,31 +1582,121 @@ function renderCompareViews() {
     if (sbsL) { sbsL.textContent = img0.name; sbsL.style.display = compareLayout === 'sideBySide' ? '' : 'none'; }
     if (sbsR) { sbsR.textContent = img1.name; sbsR.style.display = compareLayout === 'sideBySide' ? '' : 'none'; }
   }
-  paintMIP();
-  updateAllInfo();
+  if (!changedAxis) {
+    paintMIP();
+    updateAllInfo();
+  }
 }
 
-function renderSliceToTempCanvas(data: Float32Array, w: number, h: number, imgMin: number, imgMax: number, cmapName: string): HTMLCanvasElement {
+function renderSliceToTempCanvas(data: Float32Array, w: number, h: number, imgMin: number, imgMax: number, cmapName: string, useGlobalWindow?: boolean): HTMLCanvasElement {
   const tc = document.createElement('canvas');
   tc.width = w; tc.height = h;
   const tctx = tc.getContext('2d')!;
   const imgData = tctx.createImageData(w, h);
   const pixels = imgData.data;
   const cmapFn = COLORMAPS[cmapName] || COLORMAPS.gray;
-  const lo = windowLevel - windowWidth * 0.5;
-  const hi = windowLevel + windowWidth * 0.5;
-  const range = hi - lo || 1;
   const dataRange = imgMax - imgMin || 1;
   const n = w * h;
-  for (let i = 0; i < n; i++) {
-    const norm = (data[i] - imgMin) / dataRange;
-    const t = Math.max(0, Math.min(1, (norm - lo) / range));
-    const [r, g, b] = cmapFn(t);
-    const idx = i * 4;
-    pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
+
+  if (useGlobalWindow) {
+    const lo = windowLevel - windowWidth * 0.5;
+    const hi = windowLevel + windowWidth * 0.5;
+    const range = hi - lo || 1;
+    for (let i = 0; i < n; i++) {
+      const norm = (data[i] - imgMin) / dataRange;
+      const t = Math.max(0, Math.min(1, (norm - lo) / range));
+      const [r, g, b] = cmapFn(t);
+      const idx = i * 4;
+      pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      const norm = (data[i] - imgMin) / dataRange;
+      const t = Math.max(0, Math.min(1, norm));
+      const [r, g, b] = cmapFn(t);
+      const idx = i * 4;
+      pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
+    }
   }
   tctx.putImageData(imgData, 0, 0);
   return tc;
+}
+
+function resampleOverlaySlice(
+  img0: VolumeImage, img1: VolumeImage,
+  axis: 'axial' | 'coronal' | 'sagittal',
+  sliceIdx0: number
+): Float32Array {
+  const h0 = img0.header;
+  const h1 = img1.header;
+  const d0 = img0.data;
+  const d1 = img1.data;
+
+  let outW: number, outH: number;
+  if (axis === 'axial') { outW = h0.nx; outH = h0.ny; }
+  else if (axis === 'coronal') { outW = h0.nx; outH = h0.nz; }
+  else { outW = h0.ny; outH = h0.nz; }
+
+  const result = new Float32Array(outW * outH);
+  if (!d0 || !d1) return result;
+
+  const n1x = h1.nx, n1y = h1.ny, n1z = h1.nz;
+  const elem1 = h1.datatype === 64 ? 8 : h1.datatype === 8 || h1.datatype === 16 || h1.datatype === 768 ? 4 : h1.datatype === 4 || h1.datatype === 512 ? 2 : 1;
+  const slope1 = img1.slope || 1;
+  const inter1 = img1.inter || 0;
+
+  const getVoxel1 = (vx: number, vy: number, vz: number): number => {
+    const ix = Math.round(vx), iy = Math.round(vy), iz = Math.round(vz);
+    if (ix < 0 || ix >= n1x || iy < 0 || iy >= n1y || iz < 0 || iz >= n1z) return NaN;
+    const idx = iz * n1y * n1x + iy * n1x + ix;
+    return (d1 as any)[idx] * slope1 + inter1;
+  };
+
+  const getVoxel1Lerp = (vx: number, vy: number, vz: number): number => {
+    if (vx < -0.5 || vx > n1x - 0.5 || vy < -0.5 || vy > n1y - 0.5 || vz < -0.5 || vz > n1z - 0.5) return NaN;
+    const x0 = Math.floor(vx), y0 = Math.floor(vy), z0 = Math.floor(vz);
+    const x1 = Math.min(x0 + 1, n1x - 1), y1 = Math.min(y0 + 1, n1y - 1), z1 = Math.min(z0 + 1, n1z - 1);
+    const fx = vx - x0, fy = vy - y0, fz = vz - z0;
+    const cx0 = Math.max(0, x0), cy0 = Math.max(0, y0), cz0 = Math.max(0, z0);
+
+    const v000 = (d1 as any)[cz0 * n1y * n1x + cy0 * n1x + cx0] * slope1 + inter1;
+    const v100 = (d1 as any)[cz0 * n1y * n1x + cy0 * n1x + x1] * slope1 + inter1;
+    const v010 = (d1 as any)[cz0 * n1y * n1x + y1 * n1x + cx0] * slope1 + inter1;
+    const v110 = (d1 as any)[cz0 * n1y * n1x + y1 * n1x + x1] * slope1 + inter1;
+    const v001 = (d1 as any)[z1 * n1y * n1x + cy0 * n1x + cx0] * slope1 + inter1;
+    const v101 = (d1 as any)[z1 * n1y * n1x + cy0 * n1x + x1] * slope1 + inter1;
+    const v011 = (d1 as any)[z1 * n1y * n1x + y1 * n1x + cx0] * slope1 + inter1;
+    const v111 = (d1 as any)[z1 * n1y * n1x + y1 * n1x + x1] * slope1 + inter1;
+
+    const c00 = v000 * (1 - fx) + v100 * fx;
+    const c10 = v010 * (1 - fx) + v110 * fx;
+    const c01 = v001 * (1 - fx) + v101 * fx;
+    const c11 = v011 * (1 - fx) + v111 * fx;
+    const c0 = c00 * (1 - fy) + c10 * fy;
+    const c1 = c01 * (1 - fy) + c11 * fy;
+    return c0 * (1 - fz) + c1 * fz;
+  };
+
+  for (let j = 0; j < outH; j++) {
+    for (let i = 0; i < outW; i++) {
+      let vx0: number, vy0: number, vz0: number;
+      if (axis === 'axial') {
+        vx0 = i; vy0 = j; vz0 = sliceIdx0;
+      } else if (axis === 'coronal') {
+        vx0 = i; vy0 = sliceIdx0; vz0 = j;
+      } else {
+        vx0 = sliceIdx0; vy0 = i; vz0 = j;
+      }
+
+      const [wx, wy, wz] = voxelToWorld(h0, vx0, vy0, vz0);
+      const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+
+      const val = getVoxel1Lerp(vx1, vy1, vz1);
+      result[j * outW + i] = isNaN(val) ? 0 : val;
+    }
+  }
+
+  return result;
 }
 
 function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Array,
@@ -1591,7 +1704,7 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   pw0: number, ph0: number, pw1: number, ph1: number,
   img0: VolumeImage, img1: VolumeImage) {
   const canvas = canvases[axis as keyof typeof canvases];
-  if (!canvas || !data0 || !data1) return;
+  if (!canvas || !data0) return;
 
   const vs = viewState[axis as keyof typeof viewState] as { zoom: number; panX: number; panY: number };
   const zoom = vs.zoom;
@@ -1616,8 +1729,7 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
 
-  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, colormap);
-  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, overlayColormap);
+  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, colormap, true);
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1632,12 +1744,22 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   ctx.drawImage(tc0, 0, 0);
   ctx.restore();
 
-  ctx.save();
-  ctx.translate(offsetX, offsetY);
-  ctx.scale(cw * dpr / w1, -ch * dpr / h1_);
-  ctx.globalAlpha = overlayOpacity;
-  ctx.drawImage(tc1, 0, 0);
-  ctx.restore();
+  if (img1.data) {
+    const resampled = resampleOverlaySlice(img0, img1, axis as 'axial' | 'coronal' | 'sagittal',
+      axis === 'axial' ? sliceIdx.axial : axis === 'coronal' ? sliceIdx.coronal : sliceIdx.sagittal);
+    if (resampled && resampled.length > 0) {
+      const i1min = img1.min;
+      const i1max = img1.max;
+      const tc1 = renderSliceToTempCanvas(resampled, w0, h0_, i1min, i1max, overlayColormap);
+
+      ctx.save();
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
+      ctx.globalAlpha = overlayOpacity;
+      ctx.drawImage(tc1, 0, 0);
+      ctx.restore();
+    }
+  }
 
   ctx.globalAlpha = 1.0;
 
@@ -1834,6 +1956,14 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
   if (!header) return;
   const { nx, ny, nz, dx, dy, dz } = header;
 
+  if (compareMode && images.length >= 2) {
+    renderCompareViews(axis);
+    updateSliceInfo(axis);
+    updateSliderValues();
+    if (crosshairVisible) updateCoordInfoFromCenter();
+    return;
+  }
+
   if (volumeData) {
     if (axis === 'axial') {
       paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
@@ -1921,9 +2051,11 @@ function autoContrast() {
   const sampleSize = Math.min(10000, n);
   const step = Math.max(1, Math.floor(n / sampleSize));
   const samples: number[] = [];
+  const s = dataSlope;
+  const t = dataInter;
 
   for (let i = 0; i < n; i += step) {
-    samples.push(volumeData[i]);
+    samples.push(volumeData[i] * s + t);
   }
   samples.sort((a, b) => a - b);
 
@@ -2240,9 +2372,21 @@ function handleCachedVolume(msg: any): void {
   let voxelBuffer: ArrayBuffer | null = null;
   if (msg.voxelData instanceof ArrayBuffer) {
     voxelBuffer = msg.voxelData;
+  } else if (msg.voxelData?.buffer instanceof ArrayBuffer) {
+    const view = msg.voxelData;
+    voxelBuffer = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
   } else if (Array.isArray(msg.voxelData)) {
     const f32 = new Float32Array(msg.voxelData);
     voxelBuffer = f32.buffer.slice(f32.byteOffset, f32.byteOffset + f32.byteLength);
+  } else if (msg.voxelData && typeof msg.voxelData === 'object' && msg.voxelData.byteLength !== undefined) {
+    try {
+      const keys = Object.keys(msg.voxelData);
+      if (keys.length > 0) {
+        const arr = new Uint8Array(keys.length);
+        for (let i = 0; i < keys.length; i++) arr[i] = msg.voxelData[i];
+        voxelBuffer = arr.buffer;
+      }
+    } catch {}
   }
 
   if (voxelBuffer) {
@@ -2260,29 +2404,74 @@ function handleCachedVolume(msg: any): void {
     fullVolumeLoaded = true;
   }
 
-  if (!voxelBuffer) {
+  if (!voxelBuffer || !volumeData) {
     fallbackToHttpPreview();
     return;
   }
 
-  autoContrast();
+  const { nx, ny, nz } = header!;
+  const n = nx * ny * nz;
+
+  const s = dataSlope;
+  const t = dataInter;
+  const sampleSize = Math.min(10000, n);
+  const step = Math.max(1, Math.floor(n / sampleSize));
+  const samples: number[] = [];
+  for (let i = 0; i < n; i += step) {
+    samples.push((volumeData as any)[i] * s + t);
+  }
+  samples.sort((a, b) => a - b);
+  const p1Idx = Math.floor(samples.length * 0.01);
+  const p99Idx = Math.floor(samples.length * 0.99);
+  const p1 = samples[p1Idx];
+  const p99 = samples[p99Idx];
+  const range = globalMax - globalMin || 1;
+  windowLevel = ((p1 + p99) / 2 - globalMin) / range;
+  windowWidth = (p99 - p1) / range;
+  if (windowWidth <= 0 || !isFinite(windowWidth) || !isFinite(windowLevel)) {
+    windowWidth = 1.0;
+    windowLevel = 0.5;
+  }
+
+  const wwSlider = document.getElementById('ww-slider') as HTMLInputElement;
+  const wlSlider = document.getElementById('wl-slider') as HTMLInputElement;
+  if (wwSlider) wwSlider.value = String(Math.round(windowWidth * 100));
+  if (wlSlider) wlSlider.value = String(Math.round(windowLevel * 100));
+
   initialWindowWidth = windowWidth;
   initialWindowLevel = windowLevel;
 
-  images.length = 0;
-  images.push({
-    header: msg.header,
-    data: volumeData,
-    min: msg.globalMin,
-    max: msg.globalMax,
-    name: fileName,
-    url: fileUrl,
-    slope: msg.slope || 1,
-    inter: msg.inter || 0,
-    state: volumeData ? 'ready' : 'preview',
-    lastAccess: Date.now(),
-  });
-  activeImageIdx = 0;
+  if (pendingAddImageIdx >= 0 && pendingAddImageIdx < images.length) {
+    images[pendingAddImageIdx] = {
+      header: msg.header,
+      data: volumeData,
+      min: msg.globalMin,
+      max: msg.globalMax,
+      name: fileName,
+      url: fileUrl,
+      slope: msg.slope || 1,
+      inter: msg.inter || 0,
+      state: volumeData ? 'ready' : 'preview',
+      lastAccess: Date.now(),
+    };
+    activeImageIdx = pendingAddImageIdx;
+    pendingAddImageIdx = -1;
+  } else {
+    images.length = 0;
+    images.push({
+      header: msg.header,
+      data: volumeData,
+      min: msg.globalMin,
+      max: msg.globalMax,
+      name: fileName,
+      url: fileUrl,
+      slope: msg.slope || 1,
+      inter: msg.inter || 0,
+      state: volumeData ? 'ready' : 'preview',
+      lastAccess: Date.now(),
+    });
+    activeImageIdx = 0;
+  }
   publishPerfMonitor();
 
   updateFileInfo();
@@ -2624,36 +2813,30 @@ function primeSliceFramesFromPreview(img: VolumeImage): void {
 }
 
 async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: boolean) {
-  try {
-    const previewData = await fetchPreviewData(url);
-    if (!previewData?.header || !previewData?.slices) {
-      throw new Error('Preview unavailable');
-    }
-    images.push({
-      header: previewData.header,
-      data: null,
-      min: previewData.globalMin,
-      max: previewData.globalMax,
-      name,
-      url,
-      slope: previewData.slope || 1,
-      inter: previewData.inter || 0,
-      preview: {
-        axial: new Float32Array(previewData.slices.axial),
-        coronal: new Float32Array(previewData.slices.coronal),
-        sagittal: new Float32Array(previewData.slices.sagittal),
-      },
-      state: 'preview',
-      lastAccess: Date.now(),
-    });
-    publishPerfMonitor();
-    updateImagePicker();
-    if (images.length === 2) {
-      void switchToImage(images.length - 1);
-    }
-  } catch (err) {
-    console.error('Failed to load image:', err);
-  }
+  fileUrl = url;
+  fileName = name;
+  isGzip = name.endsWith('.gz');
+  isRemoteSource = !!_remote;
+  fullVolumeLoaded = false;
+  volumeData = null;
+  currentSlices.axial = null;
+  currentSlices.coronal = null;
+  currentSlices.sagittal = null;
+
+  pendingAddImageIdx = images.length;
+  images.push({
+    header: null as any,
+    data: null,
+    min: 0,
+    max: 1,
+    name,
+    url,
+    slope: 1,
+    inter: 0,
+    state: 'loading',
+    lastAccess: Date.now(),
+  });
+  updateImagePicker();
 }
 
 function setupInteraction() {
