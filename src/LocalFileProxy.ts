@@ -1,5 +1,6 @@
 import * as http from 'http';
 import * as zlib from 'zlib';
+import * as stream from 'stream';
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { VolumeCache } from './VolumeCache';
@@ -334,18 +335,9 @@ function compressResponse(data: Buffer, req: http.IncomingMessage, res: http.Ser
   };
 
   if (shouldCompress(req)) {
-    zlib.gzip(data, (err, compressed) => {
-      if (err) {
-        headers['Content-Length'] = String(data.length);
-        res.writeHead(200, headers);
-        res.end(data);
-        return;
-      }
-      headers['Content-Encoding'] = 'gzip';
-      headers['Content-Length'] = String(compressed.length);
-      res.writeHead(200, headers);
-      res.end(compressed);
-    });
+    headers['Content-Encoding'] = 'gzip';
+    res.writeHead(200, headers);
+    stream.Readable.from(data).pipe(zlib.createGzip({ level: 1 })).pipe(res);
   } else {
     headers['Content-Length'] = String(data.length);
     res.writeHead(200, headers);
