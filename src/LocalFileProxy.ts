@@ -372,7 +372,7 @@ function readLocalFilePartial(fsPath: string, start: number, end: number): Promi
   });
 }
 
-function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array; rawData: Uint8Array }> {
+function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
   return new Promise((resolve, reject) => {
     const gunzip = zlib.createGunzip();
     const chunks: Buffer[] = [];
@@ -421,8 +421,7 @@ function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{
           const sliceBytes = new Uint8Array(buf.buffer, buf.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
           const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
           resolved = true;
-          const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
-          resolve({ header, axialSlice, rawData });
+          resolve({ header, axialSlice });
         }
       }
     });
@@ -447,7 +446,7 @@ function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{
           } else {
             axialSlice = new Float32Array(nx * ny);
           }
-          resolve({ header, axialSlice, rawData });
+          resolve({ header, axialSlice });
         } else {
           reject(new Error('Failed to parse NIfTI header from decompressed data'));
         }
@@ -776,7 +775,7 @@ export class LocalFileProxy {
 
   private async handlePreviewLocalGz(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const fsPath = entry.uri.fsPath!;
-    const { header, axialSlice, rawData } = await streamingGunzipPreview(fsPath);
+    const { header, axialSlice } = await streamingGunzipPreview(fsPath);
 
     if (!header) {
       res.writeHead(500);
@@ -785,7 +784,6 @@ export class LocalFileProxy {
     }
 
     entry.headerCache = header;
-    entry.dataCache = rawData;
     entry.lastAccess = Date.now();
 
     const { nx, ny, nz } = header;
@@ -805,6 +803,19 @@ export class LocalFileProxy {
   }
 
   private async handlePreviewRemote(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    // For remote files, vscode.workspace.fs.readFile does not support Range requests,
+    // so we have to download the entire file. For large files (>200MB), this is impractical.
+    if (!entry.size) {
+      const stat = await vscode.workspace.fs.stat(entry.uri);
+      entry.size = Number(stat.size);
+    }
+    const MAX_REMOTE_PREVIEW_SIZE = 200 * 1024 * 1024; // 200MB
+    if (entry.size && entry.size > MAX_REMOTE_PREVIEW_SIZE) {
+      res.writeHead(503, { 'Content-Type': 'text/plain' });
+      res.end('Remote preview for large files (>200MB) is not supported yet');
+      return;
+    }
+
     const { rawData, header } = await this.loadFileData(entry);
     if (!header) {
       res.writeHead(500);
@@ -869,6 +880,48 @@ export class LocalFileProxy {
         return;
       }
 
+      const fsPath = entry.uri.fsPath;
+      const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
+
+      // For local uncompressed .nii, use Range read instead of loading entire file
+      if (fsPath && !isGzip) {
+        if (!entry.headerCache) {
+          const headerBytes = await readLocalFilePartial(fsPath, 0, 543);
+          const header = parseNiiHeaderQuick(headerBytes);
+          if (!header) {
+            res.writeHead(500);
+            res.end('Failed to parse header');
+            return;
+          }
+          entry.headerCache = header;
+        }
+        const header = entry.headerCache;
+        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+
+        let sliceStart: number, sliceSize: number;
+        if (axis === 'axial') {
+          sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
+          sliceSize = nx * ny * bytesPerVoxel;
+        } else if (axis === 'coronal') {
+          sliceStart = voxOffset + idx * nx * bytesPerVoxel;
+          sliceSize = nx * nz * bytesPerVoxel;
+        } else {
+          sliceStart = voxOffset + idx * bytesPerVoxel;
+          sliceSize = ny * nz * bytesPerVoxel;
+        }
+
+        // For axial slices (contiguous in file), use direct range read
+        if (axis === 'axial') {
+          const sliceBytes = await readLocalFilePartial(fsPath, sliceStart, sliceStart + sliceSize - 1);
+          const slice = extractAxialSliceFromRange(sliceBytes, header);
+          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+          compressResponse(buf, req, res, 'application/octet-stream');
+          return;
+        }
+      }
+
+      // Fallback: load entire file for gzip or non-axial slices
       const { rawData, header } = await this.loadFileData(entry);
       if (!header) {
         res.writeHead(500);
@@ -958,9 +1011,13 @@ export class LocalFileProxy {
             rawData = entry.dataCache;
             header = entry.headerCache || parseNiiHeaderQuick(rawData);
           } else {
-            const result = await streamingGunzipPreview(fsPath!, signal);
-            header = result.header;
-            rawData = result.rawData;
+            // streamingGunzipPreview only returns header and axialSlice for preview.
+            // For full data load, we need to decompress the entire file.
+            const fullData = await vscode.workspace.fs.readFile(entry.uri);
+            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            const decompressed = await gunzipAsync(fullData, signal);
+            rawData = decompressed;
+            header = parseNiiHeaderQuick(rawData);
             entry.dataCache = rawData;
           }
         } else if (isLocal && !isGzip) {
