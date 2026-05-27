@@ -659,7 +659,8 @@ function buildLUT(stops: [number, number, number, number][]): [number, number, n
 const VIRIDIS_LUT = buildLUT([[0,68,1,84],[0.13,72,36,117],[0.25,65,68,135],[0.38,53,95,141],[0.5,42,120,142],[0.63,33,145,140],[0.75,34,168,132],[0.88,68,191,112],[1,253,231,37]]);
 const INFERNO_LUT = buildLUT([[0,0,0,4],[0.13,40,11,84],[0.25,101,21,110],[0.38,159,42,99],[0.5,212,72,66],[0.63,245,125,21],[0.75,250,193,39],[0.88,234,247,132],[1,252,255,164]]);
 
-let cachedWorker: Worker | null = null;
+let sliceWorkers: Worker[] = [];
+const AXIS_TO_WORKER_IDX: Record<Axis, number> = { axial: 0, coronal: 1, sagittal: 2 };
 let cachedBlobUrl: string | null = null;
 
 async function ensureWorkerBlobUrl(): Promise<string> {
@@ -701,11 +702,28 @@ function attachWorkerRouter(worker: Worker) {
   };
 }
 
-async function getWorker(): Promise<Worker> {
-  if (cachedWorker) return cachedWorker;
-  cachedWorker = new Worker(await ensureWorkerBlobUrl());
-  attachWorkerRouter(cachedWorker);
-  return cachedWorker;
+async function getSliceWorker(axis: Axis): Promise<Worker> {
+  const idx = AXIS_TO_WORKER_IDX[axis];
+  if (sliceWorkers[idx]) return sliceWorkers[idx];
+  const worker = new Worker(await ensureWorkerBlobUrl());
+  attachWorkerRouter(worker);
+  sliceWorkers[idx] = worker;
+  return worker;
+}
+
+async function ensureAllSliceWorkers(): Promise<Worker[]> {
+  await Promise.all([
+    getSliceWorker('axial'),
+    getSliceWorker('coronal'),
+    getSliceWorker('sagittal'),
+  ]);
+  return sliceWorkers;
+}
+
+function broadcastToSliceWorkers(message: Record<string, any>): void {
+  for (const worker of sliceWorkers) {
+    if (worker) worker.postMessage(message);
+  }
 }
 
 function sendWorkerRequest<T = any>(worker: Worker, payload: Record<string, any>): Promise<T> {
@@ -966,7 +984,7 @@ function getActiveDownsample(): number {
 
 async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
   if (!header) return;
-  const worker = await getWorker();
+  const worker = await getSliceWorker(axis);
   const geometry = getAxisGeometry(axis);
   const response = await sendWorkerRequest<{
     type: 'slice';
@@ -2332,6 +2350,7 @@ window.addEventListener('message', async (e) => {
 
   if (msg.type !== 'config') return;
 
+  broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
   fileUrl = msg.fileUrl;
   fileName = msg.fileName;
   isGzip = fileName.endsWith('.gz');
@@ -2567,8 +2586,10 @@ async function fallbackToHttpPreview(): Promise<void> {
     loadingText.textContent = 'Loading preview...';
     updateProgress(0.01, 'Fetching preview...', 'Preview');
 
-    const worker = await getWorker();
-    worker.onerror = (err) => { loadingText.textContent = 'Worker error: ' + (err.message || 'unknown'); };
+    const workers = await ensureAllSliceWorkers();
+    for (const w of workers) {
+      w.onerror = (err) => { loadingText.textContent = 'Worker error: ' + (err.message || 'unknown'); };
+    }
 
     try {
       const previewData = await fetchPreviewData();
@@ -2593,13 +2614,16 @@ async function fallbackToHttpPreview(): Promise<void> {
       }
     } catch (_) {}
 
-    loadFullVolume(worker);
+    loadFullVolume(workers);
   } catch (err: any) {
     loadingText.textContent = 'Error: ' + (err?.message ?? String(err));
   }
 }
 
-async function loadFullVolume(worker: Worker) {
+function loadFullVolume(workers: Worker[]) {
+  let previewReceived = false;
+  let volumeReceived = false;
+
   workerStreamListener = (d) => {
     if (d.type === 'progress') {
       updateProgress(0.5 + d.value * 0.5, undefined, d.stage ? `${d.stage}...` : undefined);
@@ -2611,6 +2635,8 @@ async function loadFullVolume(worker: Worker) {
       return;
     }
     if (d.type === 'preview') {
+      if (previewReceived) return;
+      previewReceived = true;
       if (!header) {
         header = d.header;
         globalMin = d.globalMin;
@@ -2641,6 +2667,8 @@ async function loadFullVolume(worker: Worker) {
       return;
     }
     if (d.type === 'volume') {
+      if (volumeReceived) return;
+      volumeReceived = true;
       volumeData = d.voxelData;
       fullVolumeLoaded = true;
       const primary = images[0];
@@ -2682,7 +2710,9 @@ async function loadFullVolume(worker: Worker) {
     }
   };
 
-  worker.postMessage({ id: 0, type: 'loadVolume', url: fileUrl, isGzip });
+  for (const worker of workers) {
+    worker.postMessage({ id: 0, type: 'loadVolume', url: fileUrl, isGzip });
+  }
 }
 
 function updateProgress(value: number, text?: string, detail?: string) {
@@ -2869,6 +2899,7 @@ function primeSliceFramesFromPreview(img: VolumeImage): void {
 }
 
 async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: boolean) {
+  broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
   fileUrl = url;
   fileName = name;
   isGzip = name.endsWith('.gz');
