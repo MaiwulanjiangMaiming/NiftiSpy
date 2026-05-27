@@ -103,7 +103,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       enableScripts: true,
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'dist'),
-        vscode.Uri.joinPath(uri, '..'),
+        vscode.Uri.joinPath(uri, '.'),
         ...(vscode.workspace.workspaceFolders?.map(f => f.uri) ?? []),
       ],
     };
