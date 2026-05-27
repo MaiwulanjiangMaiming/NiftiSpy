@@ -279,6 +279,8 @@ class WebGLRenderer {
   private ready = false;
   private currentLut: string = '';
   private supportsFloatTexture = false;
+  private isWebGL2 = false;
+  private floatLinear = false;
 
   private vertexShaderSource = `#version 100
 attribute vec2 a_position;
@@ -304,16 +306,48 @@ void main() {
   gl_FragColor = color;
 }`;
 
+  private vertexShaderSourceGL2 = `#version 300 es
+in vec2 a_position;
+in vec2 a_texCoord;
+out vec2 v_texCoord;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_texCoord = a_texCoord;
+}`;
+
+  private fragmentShaderSourceGL2 = `#version 300 es
+precision highp float;
+in vec2 v_texCoord;
+uniform sampler2D u_image;
+uniform sampler2D u_lut;
+uniform float u_lo;
+uniform float u_hi;
+uniform float u_range;
+uniform float u_min;
+uniform float u_max;
+out vec4 fragColor;
+void main() {
+  float rawValue = texture(u_image, v_texCoord).r;
+  float normalized = (rawValue - u_min) / (u_max - u_min);
+  float t = clamp((normalized - u_lo) / u_range, 0.0, 1.0);
+  vec4 color = texture(u_lut, vec2(t, 0.5));
+  fragColor = color;
+}`;
+
   init(canvas: HTMLCanvasElement): boolean {
     const gl2 = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
     if (gl2) {
       this.gl = gl2;
-      this.supportsFloatTexture = false;
-      return false;
+      this.isWebGL2 = true;
+      this.supportsFloatTexture = true;
+      this.floatLinear = !!gl2.getExtension('OES_texture_float_linear');
+      return this.setupProgram();
     }
     const gl1 = canvas.getContext('webgl', { premultipliedAlpha: false, preserveDrawingBuffer: true });
     if (gl1) {
       this.gl = gl1;
+      this.isWebGL2 = false;
+      this.floatLinear = false;
       this.supportsFloatTexture = !!gl1.getExtension('OES_texture_float');
       if (!this.supportsFloatTexture) return false;
       return this.setupProgram();
@@ -323,8 +357,10 @@ void main() {
 
   private setupProgram(): boolean {
     const gl = this.gl!;
-    const vs = this.compileShader(gl.VERTEX_SHADER, this.vertexShaderSource);
-    const fs = this.compileShader(gl.FRAGMENT_SHADER, this.fragmentShaderSource);
+    const vsSource = this.isWebGL2 ? this.vertexShaderSourceGL2 : this.vertexShaderSource;
+    const fsSource = this.isWebGL2 ? this.fragmentShaderSourceGL2 : this.fragmentShaderSource;
+    const vs = this.compileShader(gl.VERTEX_SHADER, vsSource);
+    const fs = this.compileShader(gl.FRAGMENT_SHADER, fsSource);
     if (!vs || !fs) return false;
 
     this.program = gl.createProgram()!;
@@ -372,20 +408,30 @@ void main() {
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const filter = (this.isWebGL2 && !this.floatLinear) ? gl.NEAREST : gl.LINEAR;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 
-    const normalized = new Float32Array(w * h);
-    const dataRange = globalMax - globalMin || 1;
-    for (let i = 0; i < w * h; i++) {
-      normalized[i] = (sliceData[i] - globalMin) / dataRange;
-    }
-    try {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, w, h, 0, gl.LUMINANCE, gl.FLOAT, normalized);
-    } catch {
-      return false;
+    if (this.isWebGL2) {
+      const gl2 = gl as WebGL2RenderingContext;
+      try {
+        gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.R32F, w, h, 0, gl2.RED, gl2.FLOAT, sliceData);
+      } catch {
+        return false;
+      }
+    } else {
+      const normalized = new Float32Array(w * h);
+      const dataRange = globalMax - globalMin || 1;
+      for (let i = 0; i < w * h; i++) {
+        normalized[i] = (sliceData[i] - globalMin) / dataRange;
+      }
+      try {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, w, h, 0, gl.LUMINANCE, gl.FLOAT, normalized);
+      } catch {
+        return false;
+      }
     }
     if (gl.getError() !== gl.NO_ERROR) return false;
 
@@ -408,6 +454,13 @@ void main() {
     gl.uniform1f(uLo, lo);
     gl.uniform1f(uHi, lo + range);
     gl.uniform1f(uRange, range);
+
+    if (this.isWebGL2) {
+      const uMin = gl.getUniformLocation(this.program, 'u_min');
+      const uMax = gl.getUniformLocation(this.program, 'u_max');
+      gl.uniform1f(uMin, globalMin);
+      gl.uniform1f(uMax, globalMax);
+    }
 
     const aPos = gl.getAttribLocation(this.program, 'a_position');
     const aTex = gl.getAttribLocation(this.program, 'a_texCoord');
