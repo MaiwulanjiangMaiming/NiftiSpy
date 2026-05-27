@@ -1,4 +1,4 @@
-import { gunzipSync } from 'fflate';
+import { gunzip } from 'fflate';
 import { parseNiiHeader } from './nii-parser';
 
 const MAX_RETRIES = 3;
@@ -337,7 +337,13 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
     } else {
       const compressedData = new Uint8Array(await resp.arrayBuffer());
       throwIfAborted(signal);
-      rawData = gunzipSync(compressedData);
+      rawData = await new Promise<Uint8Array>((resolve, reject) => {
+        gunzip(compressedData, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+      throwIfAborted(signal);
       self.postMessage({ id, type: 'progress', value: 0.6, stage: 'parsing' });
     }
     } else {
@@ -346,7 +352,13 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
     if (isGzip) {
       self.postMessage({ id, type: 'progress', value: 0.35, stage: 'decompressing' });
       throwIfAborted(signal);
-      rawData = gunzipSync(compressedData);
+      rawData = await new Promise<Uint8Array>((resolve, reject) => {
+        gunzip(compressedData, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+      throwIfAborted(signal);
       self.postMessage({ id, type: 'progress', value: 0.6, stage: 'parsing' });
     } else {
       rawData = compressedData;
@@ -518,7 +530,13 @@ async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuf
           offset += chunk.byteLength;
         }
       } else {
-        rawData = gunzipSync(compressed);
+        rawData = await new Promise<Uint8Array>((resolve, reject) => {
+        gunzip(compressed, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+      throwIfAborted(signal);
       }
     } else {
       rawData = new Uint8Array(message.rawData);
