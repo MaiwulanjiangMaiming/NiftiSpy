@@ -421,23 +421,23 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
     {
     const base = axMid * ny * nx;
     if (needsConversion) {
-      for (let i = 0; i < nx * ny; i++) { throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i] * slope + inter; }
+      for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i] * slope + inter; }
     } else {
-      for (let i = 0; i < nx * ny; i++) { throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i]; }
+      for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i]; }
     }
     }
     {
     if (needsConversion) {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x] * slope + inter; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x] * slope + inter; }
     } else {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x]; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x]; }
     }
     }
     {
     if (needsConversion) {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid] * slope + inter; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid] * slope + inter; }
     } else {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid]; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid]; }
     }
     }
 
@@ -455,7 +455,7 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
     const voxelData = needsConversion ? (new Float32Array(n) as any) : nativeData;
     if (needsConversion) {
     for (let i = 0; i < n; i++) {
-      throwIfAborted(signal);
+      if (i % 4096 === 0) throwIfAborted(signal);
       voxelData[i] = (nativeData as any)[i] * slope + inter;
     }
     nativeData = null as any;
@@ -592,23 +592,23 @@ async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuf
     {
     const base = axMid * ny * nx;
     if (needsConversion) {
-      for (let i = 0; i < nx * ny; i++) { throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i] * slope + inter; }
+      for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i] * slope + inter; }
     } else {
-      for (let i = 0; i < nx * ny; i++) { throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i]; }
+      for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i]; }
     }
     }
     {
     if (needsConversion) {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x] * slope + inter; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x] * slope + inter; }
     } else {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x]; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x]; }
     }
     }
     {
     if (needsConversion) {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid] * slope + inter; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid] * slope + inter; }
     } else {
-      for (let z = 0; z < nz; z++) { throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid]; }
+      for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid]; }
     }
     }
 
@@ -626,7 +626,7 @@ async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuf
     const voxelData = needsConversion ? (new Float32Array(n) as any) : nativeData;
     if (needsConversion) {
     for (let i = 0; i < n; i++) {
-      throwIfAborted(signal);
+      if (i % 4096 === 0) throwIfAborted(signal);
       voxelData[i] = (nativeData as any)[i] * slope + inter;
     }
     nativeData = null as any;
