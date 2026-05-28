@@ -1,10 +1,25 @@
 import * as http from 'http';
-import * as https from 'https';
-import * as zlib from 'zlib';
-import * as stream from 'stream';
-import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as zlib from 'zlib';
+import * as vscode from 'vscode';
 import { VolumeCache } from './VolumeCache';
+import { parseNiiHeaderQuick } from './nifti/headerParser';
+import {
+  extractAxialSliceFromRange,
+  extractCoronalSliceFromRange,
+  extractSagittalSliceFromRange,
+  extractSingleSlice,
+  extractPreviewSlices,
+  downsampleSlice,
+} from './nifti/sliceExtractor';
+import { computeSliceMinMax, encodePreviewBinary } from './nifti/previewEncoder';
+import { readLocalFilePartial, readHttpPartial } from './io/fileReader';
+import {
+  compressResponse,
+  gunzipAsync,
+  streamingGunzipPreview,
+  streamingHttpGunzipPreview,
+} from './io/compression';
 
 interface FileEntry {
   uri: vscode.Uri;
@@ -17,677 +32,6 @@ interface FileEntry {
   sliceCache?: Map<string, { data: Buffer; timestamp: number }>;
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
   pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
-}
-
-function parseNiiHeaderQuick(buf: Uint8Array): any | null {
-  if (buf.length < 348) return null;
-  const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const le = v.getInt32(0, true) === 348 || v.getInt32(0, true) === 540;
-  if (!le && v.getInt32(0, false) !== 348 && v.getInt32(0, false) !== 540) return null;
-  const sizeofHdr = v.getInt32(0, le);
-  const version = sizeofHdr === 540 ? 2 : 1;
-  const ndim = version === 1 ? v.getInt16(40, le) : v.getInt8(16);
-  if (ndim < 1 || ndim > 7) return null;
-  let nx: number, ny: number, nz: number, dx: number, dy: number, dz: number;
-  let datatype: number, bitpix: number, voxOffset: number;
-  let scl_slope: number, scl_inter: number;
-  let qform_code: number, sform_code: number;
-  let quatern_b: number, quatern_c: number, quatern_d: number;
-  let qoffset_x: number, qoffset_y: number, qoffset_z: number;
-  let srow_x: number[], srow_y: number[], srow_z: number[];
-
-  if (version === 1) {
-    nx = Math.max(1, v.getInt16(42, le));
-    ny = Math.max(1, v.getInt16(44, le));
-    nz = Math.max(1, v.getInt16(46, le));
-    datatype = v.getInt16(70, le);
-    bitpix = v.getInt16(72, le);
-    dx = Math.abs(v.getFloat32(76 + 4, le)) || 1;
-    dy = Math.abs(v.getFloat32(76 + 8, le)) || 1;
-    dz = Math.abs(v.getFloat32(76 + 12, le)) || 1;
-    voxOffset = v.getFloat32(108, le);
-    scl_slope = v.getFloat32(112, le);
-    scl_inter = v.getFloat32(116, le);
-    qform_code = v.getInt16(252, le);
-    sform_code = v.getInt16(254, le);
-    quatern_b = v.getFloat32(256, le);
-    quatern_c = v.getFloat32(260, le);
-    quatern_d = v.getFloat32(264, le);
-    qoffset_x = v.getFloat32(268, le);
-    qoffset_y = v.getFloat32(272, le);
-    qoffset_z = v.getFloat32(276, le);
-    srow_x = [v.getFloat32(280, le), v.getFloat32(284, le), v.getFloat32(288, le), v.getFloat32(292, le)];
-    srow_y = [v.getFloat32(296, le), v.getFloat32(300, le), v.getFloat32(304, le), v.getFloat32(308, le)];
-    srow_z = [v.getFloat32(312, le), v.getFloat32(316, le), v.getFloat32(320, le), v.getFloat32(324, le)];
-    voxOffset = Math.max(352, voxOffset);
-  } else {
-    nx = Number(v.getBigInt64(24, le));
-    ny = Number(v.getBigInt64(32, le));
-    nz = Number(v.getBigInt64(40, le));
-    datatype = v.getInt16(12, le);
-    bitpix = v.getInt16(14, le);
-    dx = Math.abs(v.getFloat64(104, le)) || 1;
-    dy = Math.abs(v.getFloat64(112, le)) || 1;
-    dz = Math.abs(v.getFloat64(120, le)) || 1;
-    voxOffset = Number(v.getBigInt64(168, le));
-    scl_slope = v.getFloat64(176, le);
-    scl_inter = v.getFloat64(184, le);
-    qform_code = v.getInt16(196, le);
-    sform_code = v.getInt16(198, le);
-    quatern_b = v.getFloat32(200, le);
-    quatern_c = v.getFloat32(204, le);
-    quatern_d = v.getFloat32(208, le);
-    qoffset_x = v.getFloat32(212, le);
-    qoffset_y = v.getFloat32(216, le);
-    qoffset_z = v.getFloat32(220, le);
-    srow_x = [v.getFloat64(224, le), v.getFloat64(232, le), v.getFloat64(240, le), v.getFloat64(248, le)];
-    srow_y = [v.getFloat64(256, le), v.getFloat64(264, le), v.getFloat64(272, le), v.getFloat64(280, le)];
-    srow_z = [v.getFloat64(288, le), v.getFloat64(296, le), v.getFloat64(304, le), v.getFloat64(312, le)];
-    voxOffset = Math.max(544, voxOffset);
-  }
-
-  return {
-    version, ndim, nx, ny, nz, dx, dy, dz, datatype, bitpix, voxOffset,
-    scl_slope: scl_slope || 1, scl_inter: scl_inter || 0,
-    littleEndian: le, qform_code, sform_code,
-    quatern_b, quatern_c, quatern_d,
-    qoffset_x, qoffset_y, qoffset_z,
-    srow_x, srow_y, srow_z,
-    nt: 1, nu: 1, dt: 0, isGzip: false,
-    bytesPerVoxel: Math.max(1, bitpix / 8),
-    totalVoxels3D: nx * ny * nz,
-    sliceSizeXY: nx * ny,
-    volumeBytes: nx * ny * nz * Math.max(1, bitpix / 8),
-    descrip: '', xyzt_units: 0, orientation: 'unknown',
-  };
-}
-
-function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any): Float32Array {
-  const { nx, ny, datatype, scl_slope, scl_inter, littleEndian } = header;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const n = nx * ny;
-  const slice = new Float32Array(n);
-  const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
-
-  for (let i = 0; i < n; i++) {
-    const off = i * bpv;
-    let val: number;
-    switch (datatype) {
-      case 2: val = sliceBytes[off]; break;
-      case 4: val = view.getInt16(off, le); break;
-      case 8: val = view.getInt32(off, le); break;
-      case 16: val = view.getFloat32(off, le); break;
-      case 64: val = view.getFloat64(off, le); break;
-      case 256: val = (sliceBytes[off] << 24) >> 24; break;
-      case 512: val = view.getUint16(off, le); break;
-      case 768: val = view.getUint32(off, le); break;
-      default: val = 0;
-    }
-    slice[i] = val * slope + inter;
-  }
-  return slice;
-}
-
-async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number): Promise<Float32Array | null> {
-  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-  if (idx < 0 || idx >= ny) return null;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const slice = new Float32Array(nx * nz);
-
-  const rowSize = nx * bpv;
-  const promises: Promise<{ rowBytes: Uint8Array; z: number }>[] = [];
-  for (let z = 0; z < nz; z++) {
-    const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bpv;
-    promises.push(
-      readLocalFilePartial(fsPath, rowOffset, rowOffset + rowSize - 1)
-        .then(rowBytes => ({ rowBytes, z }))
-    );
-  }
-  const rows = await Promise.all(promises);
-
-  for (const { rowBytes, z } of rows) {
-    const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
-    for (let x = 0; x < nx; x++) {
-      const off = x * bpv;
-      let val: number;
-      switch (datatype) {
-        case 2: val = rowBytes[off]; break;
-        case 4: val = view.getInt16(off, le); break;
-        case 8: val = view.getInt32(off, le); break;
-        case 16: val = view.getFloat32(off, le); break;
-        case 64: val = view.getFloat64(off, le); break;
-        case 256: val = (rowBytes[off] << 24) >> 24; break;
-        case 512: val = view.getUint16(off, le); break;
-        case 768: val = view.getUint32(off, le); break;
-        default: val = 0;
-      }
-      slice[z * nx + x] = val * slope + inter;
-    }
-  }
-  return slice;
-}
-
-async function extractSagittalSliceFromRange(fsPath: string, header: any, idx: number): Promise<Float32Array | null> {
-  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-  if (idx < 0 || idx >= nx) return null;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const slice = new Float32Array(ny * nz);
-
-  const axialSize = nx * ny * bpv;
-  const promises: Promise<{ axialBytes: Uint8Array; z: number }>[] = [];
-  for (let z = 0; z < nz; z++) {
-    const axialOffset = voxOffset + z * nx * ny * bpv;
-    promises.push(
-      readLocalFilePartial(fsPath, axialOffset, axialOffset + axialSize - 1)
-        .then(axialBytes => ({ axialBytes, z }))
-    );
-  }
-  const axialSlices = await Promise.all(promises);
-
-  for (const { axialBytes, z } of axialSlices) {
-    const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
-    for (let y = 0; y < ny; y++) {
-      const off = (y * nx + idx) * bpv;
-      let val: number;
-      switch (datatype) {
-        case 2: val = axialBytes[off]; break;
-        case 4: val = view.getInt16(off, le); break;
-        case 8: val = view.getInt32(off, le); break;
-        case 16: val = view.getFloat32(off, le); break;
-        case 64: val = view.getFloat64(off, le); break;
-        case 256: val = (axialBytes[off] << 24) >> 24; break;
-        case 512: val = view.getUint16(off, le); break;
-        case 768: val = view.getUint32(off, le); break;
-        default: val = 0;
-      }
-      slice[z * ny + y] = val * slope + inter;
-    }
-  }
-  return slice;
-}
-
-function extractPreviewSlices(rawData: Uint8Array, header: any): { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array } | null {
-  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-  const n = nx * ny * nz;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const dataStart = voxOffset;
-  const dataEnd = dataStart + n * bpv;
-  if (rawData.length < dataEnd) return null;
-
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const view = new DataView(rawData.buffer, rawData.byteOffset, rawData.byteLength);
-
-  function getVoxel(idx: number): number {
-    const off = dataStart + idx * bpv;
-    switch (datatype) {
-      case 2: return rawData[off];
-      case 4: return view.getInt16(off, le);
-      case 8: return view.getInt32(off, le);
-      case 16: return view.getFloat32(off, le);
-      case 64: return view.getFloat64(off, le);
-      case 256: return (rawData[off] << 24) >> 24;
-      case 512: return view.getUint16(off, le);
-      case 768: return view.getUint32(off, le);
-      default: return 0;
-    }
-  }
-
-  const axMid = Math.floor(nz / 2);
-  const coMid = Math.floor(ny / 2);
-  const saMid = Math.floor(nx / 2);
-
-  const axial = new Float32Array(nx * ny);
-  const coronal = new Float32Array(nx * nz);
-  const sagittal = new Float32Array(ny * nz);
-
-  for (let y = 0; y < ny; y++) {
-    for (let x = 0; x < nx; x++) {
-      axial[y * nx + x] = getVoxel(axMid * ny * nx + y * nx + x) * slope + inter;
-    }
-  }
-  for (let z = 0; z < nz; z++) {
-    for (let x = 0; x < nx; x++) {
-      coronal[z * nx + x] = getVoxel(z * ny * nx + coMid * nx + x) * slope + inter;
-    }
-  }
-  for (let z = 0; z < nz; z++) {
-    for (let y = 0; y < ny; y++) {
-      sagittal[z * ny + y] = getVoxel(z * ny * nx + y * nx + saMid) * slope + inter;
-    }
-  }
-
-  return { axial, coronal, sagittal };
-}
-
-function computeSliceMinMax(...slices: Float32Array[]): { min: number; max: number } {
-  let min = Infinity;
-  let max = -Infinity;
-
-  for (const slice of slices) {
-    for (let i = 0; i < slice.length; i++) {
-      const value = slice[i];
-      if (value < min) min = value;
-      if (value > max) max = value;
-    }
-  }
-
-  if (min === max) {
-    max = min + 1;
-  }
-
-  return { min, max };
-}
-
-function encodePreviewBinary(header: any, slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array }, min: number, max: number): Buffer {
-  const sliceIdxVal = {
-    axial: Math.floor(header.nz / 2),
-    coronal: Math.floor(header.ny / 2),
-    sagittal: Math.floor(header.nx / 2),
-  };
-
-  const headerJson = JSON.stringify(header);
-  const headerBuf = Buffer.from(headerJson, 'utf8');
-  const axialBuf = Buffer.from(slices.axial.buffer, slices.axial.byteOffset, slices.axial.byteLength);
-  const coronalBuf = Buffer.from(slices.coronal.buffer, slices.coronal.byteOffset, slices.coronal.byteLength);
-  const sagittalBuf = Buffer.from(slices.sagittal.buffer, slices.sagittal.byteOffset, slices.sagittal.byteLength);
-
-  const totalLen = 4 + headerBuf.length + 4 * 7 + axialBuf.length + 4 + coronalBuf.length + 4 + sagittalBuf.length;
-  const buf = Buffer.alloc(totalLen);
-  let offset = 0;
-
-  buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-  headerBuf.copy(buf, offset); offset += headerBuf.length;
-
-  buf.writeFloatLE(min, offset); offset += 4;
-  buf.writeFloatLE(max, offset); offset += 4;
-  buf.writeUInt32LE(sliceIdxVal.axial, offset); offset += 4;
-  buf.writeUInt32LE(sliceIdxVal.coronal, offset); offset += 4;
-  buf.writeUInt32LE(sliceIdxVal.sagittal, offset); offset += 4;
-
-  buf.writeUInt32LE(axialBuf.length, offset); offset += 4;
-  axialBuf.copy(buf, offset); offset += axialBuf.length;
-
-  buf.writeUInt32LE(coronalBuf.length, offset); offset += 4;
-  coronalBuf.copy(buf, offset); offset += coronalBuf.length;
-
-  buf.writeUInt32LE(sagittalBuf.length, offset); offset += 4;
-  sagittalBuf.copy(buf, offset); offset += sagittalBuf.length;
-
-  return buf;
-}
-
-function extractSingleSlice(rawData: Uint8Array, header: any, axis: string, idx: number): Float32Array | null {
-  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const dataStart = voxOffset;
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const view = new DataView(rawData.buffer, rawData.byteOffset, rawData.byteLength);
-
-  function getVoxel(vidx: number): number {
-    const off = dataStart + vidx * bpv;
-    if (off + bpv > rawData.length) return 0;
-    switch (datatype) {
-      case 2: return rawData[off];
-      case 4: return view.getInt16(off, le);
-      case 8: return view.getInt32(off, le);
-      case 16: return view.getFloat32(off, le);
-      case 64: return view.getFloat64(off, le);
-      case 256: return (rawData[off] << 24) >> 24;
-      case 512: return view.getUint16(off, le);
-      case 768: return view.getUint32(off, le);
-      default: return 0;
-    }
-  }
-
-  if (axis === 'axial') {
-    if (idx < 0 || idx >= nz) return null;
-    const slice = new Float32Array(nx * ny);
-    const base = idx * ny * nx;
-    for (let i = 0; i < nx * ny; i++) {
-      slice[i] = getVoxel(base + i) * slope + inter;
-    }
-    return slice;
-  } else if (axis === 'coronal') {
-    if (idx < 0 || idx >= ny) return null;
-    const slice = new Float32Array(nx * nz);
-    for (let z = 0; z < nz; z++) {
-      const base = z * ny * nx + idx * nx;
-      for (let x = 0; x < nx; x++) {
-        slice[z * nx + x] = getVoxel(base + x) * slope + inter;
-      }
-    }
-    return slice;
-  } else if (axis === 'sagittal') {
-    if (idx < 0 || idx >= nx) return null;
-    const slice = new Float32Array(ny * nz);
-    for (let z = 0; z < nz; z++) {
-      const base = z * ny * nx;
-      for (let y = 0; y < ny; y++) {
-        slice[z * ny + y] = getVoxel(base + y * nx + idx) * slope + inter;
-      }
-    }
-    return slice;
-  }
-  return null;
-}
-
-function downsampleSlice(data: Float32Array, w: number, h: number, factor: number): { data: Float32Array; w: number; h: number } {
-  const nw = Math.max(1, Math.floor(w / factor));
-  const nh = Math.max(1, Math.floor(h / factor));
-  const out = new Float32Array(nw * nh);
-  for (let y = 0; y < nh; y++) {
-    for (let x = 0; x < nw; x++) {
-      let sum = 0;
-      let count = 0;
-      const sy0 = y * factor;
-      const sx0 = x * factor;
-      const sy1 = Math.min(h, (y + 1) * factor);
-      const sx1 = Math.min(w, (x + 1) * factor);
-      for (let sy = sy0; sy < sy1; sy++) {
-        for (let sx = sx0; sx < sx1; sx++) {
-          sum += data[sy * w + sx];
-          count++;
-        }
-      }
-      out[y * nw + x] = count > 0 ? sum / count : 0;
-    }
-  }
-  return { data: out, w: nw, h: nh };
-}
-
-function shouldCompress(req: http.IncomingMessage): boolean {
-  const acceptEncoding = req.headers['accept-encoding'] || '';
-  return acceptEncoding.includes('gzip');
-}
-
-function compressResponse(data: Buffer, req: http.IncomingMessage, res: http.ServerResponse, contentType: string, extraHeaders?: Record<string, string>): void {
-  const headers: Record<string, string> = {
-    'Content-Type': contentType,
-    ...extraHeaders,
-  };
-
-  if (shouldCompress(req)) {
-    headers['Content-Encoding'] = 'gzip';
-    res.writeHead(200, headers);
-    stream.Readable.from(data).pipe(zlib.createGzip({ level: 1 })).pipe(res);
-  } else {
-    headers['Content-Length'] = String(data.length);
-    res.writeHead(200, headers);
-    res.end(data);
-  }
-}
-
-function gunzipAsync(data: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
-    zlib.gunzip(Buffer.from(data.buffer, data.byteOffset, data.byteLength), (err, result) => {
-      if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
-      if (err) reject(err);
-      else resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
-    });
-  });
-}
-
-function readLocalFilePartial(fsPath: string, start: number, end: number): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    const stream = fs.createReadStream(fsPath, { start, end });
-    stream.on('data', (chunk) => { if (Buffer.isBuffer(chunk)) chunks.push(chunk); });
-    stream.on('end', () => {
-      const total = chunks.reduce((s, c) => s + c.length, 0);
-      const result = Buffer.alloc(total);
-      let offset = 0;
-      for (const chunk of chunks) { chunk.copy(result, offset); offset += chunk.length; }
-      resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
-    });
-    stream.on('error', reject);
-  });
-}
-
-function readHttpPartial(urlStr: string, start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const mod = url.protocol === 'https:' ? https : http;
-    const options: http.RequestOptions = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname + url.search,
-      method: 'GET',
-      headers: { Range: `bytes=${start}-${end}` },
-    };
-
-    const req = mod.request(options, (res) => {
-      if (res.statusCode === 206 || res.statusCode === 200) {
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk: Buffer) => chunks.push(chunk));
-        res.on('end', () => {
-          const total = chunks.reduce((s, c) => s + c.length, 0);
-          const result = Buffer.alloc(total);
-          let off = 0;
-          for (const chunk of chunks) { chunk.copy(result, off); off += chunk.length; }
-          resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
-        });
-      } else {
-        reject(new Error(`HTTP ${res.statusCode}`));
-      }
-    });
-    req.on('error', reject);
-    if (signal) {
-      const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-    req.end();
-  });
-}
-
-function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const mod = url.protocol === 'https:' ? https : http;
-    const gunzip = zlib.createGunzip();
-    const chunks: Buffer[] = [];
-    let totalSize = 0;
-    let resolved = false;
-    let header: any = null;
-    let axialNeeded = Infinity;
-
-    const options: http.RequestOptions = {
-      hostname: url.hostname,
-      port: url.port || (url.protocol === 'https:' ? 443 : 80),
-      path: url.pathname + url.search,
-      method: 'GET',
-    };
-
-    const req = mod.request(options, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
-      }
-      res.pipe(gunzip);
-
-      const onAbort = () => {
-        if (!resolved) {
-          resolved = true;
-          req.destroy();
-          gunzip.destroy();
-          reject(new DOMException('Aborted', 'AbortError'));
-        }
-      };
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
-
-      gunzip.on('data', (chunk: Buffer) => {
-        if (resolved) return;
-        if (signal?.aborted) { gunzip.destroy(); req.destroy(); return; }
-        chunks.push(chunk);
-        totalSize += chunk.length;
-
-        if (!header && totalSize >= 544) {
-          const buf = Buffer.concat(chunks);
-          header = parseNiiHeaderQuick(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
-          if (header) {
-            const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-            axialNeeded = voxOffset + (Math.floor(nz / 2) + 1) * nx * ny * bytesPerVoxel;
-          }
-        }
-
-        if (header && totalSize >= axialNeeded && !resolved) {
-          resolved = true;
-          const buf = Buffer.concat(chunks);
-          const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
-          const { nx, ny, nz, voxOffset } = header;
-          const axMid = Math.floor(nz / 2);
-          const bpv = Math.max(1, header.bitpix / 8);
-          const sliceStart = voxOffset + axMid * nx * ny * bpv;
-          const sliceEnd = sliceStart + nx * ny * bpv;
-          if (rawData.length >= sliceEnd) {
-            const sliceBytes = rawData.slice(sliceStart, sliceEnd);
-            const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-            req.destroy();
-            gunzip.destroy();
-            resolve({ header, axialSlice });
-          }
-        }
-      });
-
-      gunzip.on('end', () => {
-        if (!resolved) {
-          if (header) {
-            const buf = Buffer.concat(chunks);
-            const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
-            const { nx, ny, nz, voxOffset } = header;
-            const axMid = Math.floor(nz / 2);
-            const bpv = Math.max(1, header.bitpix / 8);
-            const sliceStart = voxOffset + axMid * nx * ny * bpv;
-            const sliceEnd = sliceStart + nx * ny * bpv;
-            if (rawData.length >= sliceEnd) {
-              const sliceBytes = rawData.slice(sliceStart, sliceEnd);
-              const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-              resolve({ header, axialSlice });
-              return;
-            }
-          }
-          reject(new Error('Failed to extract preview from remote gzip'));
-        }
-      });
-
-      gunzip.on('error', (err: Error) => { if (!resolved) { resolved = true; reject(err); } });
-    });
-
-    req.on('error', (err: Error) => { if (!resolved) { resolved = true; reject(err); } });
-    req.end();
-  });
-}
-
-function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
-  return new Promise((resolve, reject) => {
-    const gunzip = zlib.createGunzip();
-    const chunks: Buffer[] = [];
-    let totalSize = 0;
-    let resolved = false;
-    let header: any = null;
-    let axialNeeded = Infinity;
-
-    const stream = fs.createReadStream(fsPath);
-    stream.pipe(gunzip);
-
-    const onAbort = () => {
-      if (!resolved) {
-        resolved = true;
-        stream.destroy();
-        gunzip.destroy();
-        reject(new DOMException('Aborted', 'AbortError'));
-      }
-    };
-    if (signal) {
-      signal.addEventListener('abort', onAbort, { once: true });
-    }
-
-    gunzip.on('data', (chunk: Buffer) => {
-      if (resolved) return;
-      if (signal?.aborted) { gunzip.destroy(); return; }
-      chunks.push(chunk);
-      totalSize += chunk.length;
-
-      if (!header && totalSize >= 544) {
-        const buf = Buffer.concat(chunks);
-        header = parseNiiHeaderQuick(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
-        if (header) {
-          const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-          axialNeeded = voxOffset + (Math.floor(nz / 2) + 1) * nx * ny * bytesPerVoxel;
-        }
-      }
-
-      if (header && totalSize >= axialNeeded && !resolved) {
-        const buf = Buffer.concat(chunks);
-        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-        const axMid = Math.floor(nz / 2);
-        const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
-        const sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
-        if (buf.length >= sliceEnd) {
-          const sliceBytes = new Uint8Array(buf.buffer, buf.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
-          const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-          resolved = true;
-          resolve({ header, axialSlice });
-        }
-      }
-    });
-
-    gunzip.on('end', () => {
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (!resolved) {
-        const buf = Buffer.concat(chunks);
-        const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
-        if (!header) {
-          header = parseNiiHeaderQuick(rawData);
-        }
-        if (header) {
-          const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-          const axMid = Math.floor(nz / 2);
-          const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
-          const sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
-          let axialSlice: Float32Array;
-          if (rawData.length >= sliceEnd) {
-            const sliceBytes = new Uint8Array(rawData.buffer, rawData.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
-            axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-          } else {
-            axialSlice = new Float32Array(nx * ny);
-          }
-          resolve({ header, axialSlice });
-        } else {
-          reject(new Error('Failed to parse NIfTI header from decompressed data'));
-        }
-      }
-    });
-
-    gunzip.on('error', (err) => {
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (!resolved) {
-        resolved = true;
-        reject(err);
-      }
-    });
-
-    stream.on('error', (err) => {
-      if (signal) signal.removeEventListener('abort', onAbort);
-      if (!resolved) {
-        resolved = true;
-        reject(err);
-      }
-    });
-  });
 }
 
 export class LocalFileProxy {
@@ -787,7 +131,7 @@ export class LocalFileProxy {
     const entry = this.files.get(match[1]);
     if (!entry) {
       res.writeHead(404);
-      res.end();
+      res.end('File not found');
       return;
     }
 
@@ -856,14 +200,15 @@ export class LocalFileProxy {
         }
       } else {
         const fsPath = entry.uri.fsPath;
-        if (fsPath && !shouldCompress(req)) {
+        const shouldCompress = (req.headers['accept-encoding'] || '').includes('gzip');
+        if (fsPath && !shouldCompress) {
           res.writeHead(200, {
             'Content-Length': totalSize,
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
           });
           fs.createReadStream(fsPath).pipe(res);
-        } else if (fsPath && shouldCompress(req)) {
+        } else if (fsPath && shouldCompress) {
           res.writeHead(200, {
             'Content-Encoding': 'gzip',
             'Accept-Ranges': 'bytes',
@@ -1159,7 +504,6 @@ export class LocalFileProxy {
       const fsPath = entry.uri.fsPath;
       const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
 
-      // For local uncompressed .nii, use Range read instead of loading entire file
       if (fsPath && !isGzip) {
         if (!entry.headerCache) {
           const headerBytes = await readLocalFilePartial(fsPath, 0, 543);
@@ -1305,7 +649,6 @@ export class LocalFileProxy {
         }
       }
 
-      // Fallback: load entire file for gzip or non-axial slices
       const { rawData, header } = await this.loadFileData(entry);
       if (!header) {
         res.writeHead(500);
@@ -1395,8 +738,6 @@ export class LocalFileProxy {
             rawData = entry.dataCache;
             header = entry.headerCache || parseNiiHeaderQuick(rawData);
           } else {
-            // streamingGunzipPreview only returns header and axialSlice for preview.
-            // For full data load, we need to decompress the entire file.
             const fullData = await vscode.workspace.fs.readFile(entry.uri);
             if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
             const decompressed = await gunzipAsync(fullData, signal);
@@ -1583,5 +924,4 @@ export class LocalFileProxy {
       return null;
     }
   }
-
 }
