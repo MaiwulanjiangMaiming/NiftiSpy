@@ -173,11 +173,49 @@ npm run package
 
 ## Version
 
-- Current release: `1.0.1`
+- Current release: `1.3.2`
 - Status: release build prepared for GitHub push
-- Focus: safer rendering defaults, lower preview transfer overhead, cleaner native build flow, and better release documentation
+- Focus: ITK-Snap compatible orientation, multi-Worker parallelism, streaming memory optimization
 
 ## Release Notes
+
+### 1.3.2
+
+- Reorients all slice views (axial, coronal, sagittal) to match ITK-Snap display convention using sform matrix analysis
+- Computes per-view flip flags from sform dominant direction to ensure correct anatomical orientation regardless of NIfTI encoding (RAS, LAS, LPS, etc.)
+- Applies image flips in both Canvas 2D and WebGL render paths with crosshair, minimap, and click handler adjustments
+- Uses fixed ITK-Snap standard orientation labels: Axial X:R/L Y:A/P, Coronal X:R/L Y:S/I, Sagittal X:A/P Y:S/I
+- Fixes detectOrientation to use ITK-Snap's column-based ConvertDirectionMatrixToClosestRAICode algorithm
+
+### 1.3.1
+
+- Local uncompressed .nii axial slices use Range read via fs.createReadStream instead of loading entire file
+- streamingGunzipPreview no longer caches full decompressed volume in memory for preview-only requests
+- Remote preview returns 503 for files >200MB since vscode.workspace.fs.readFile lacks Range support
+
+### 1.3.0
+
+- Replaces single Worker with 3 per-axis Workers (axial/coronal/sagittal) for parallel slice extraction
+- Routes fetchSlice requests to correct Worker by axis with independent sliceCache per Worker
+
+### 1.2.0
+
+- Upgrades to WebGL2 shaders with R32F float texture direct upload and GPU window/level computation
+- Falls back to WebGL1 when WebGL2 is unavailable
+
+### 1.1.0 – 1.1.4
+
+- Extracts shared processRawVolume to eliminate 118 lines of Worker code duplication
+- Removes duplicate globalSliceCache, unifies on entry.sliceCache
+- Eliminates JSON serialization in preview paths (binary transfer, ~4x size reduction)
+- Streams compressResponse via pipe instead of full-buffer gzip
+- Tightens localResourceRoots to current directory only
+
+### 1.0.2 – 1.0.4
+
+- Fixes Worker needsConversion memory double-hold (releases references after conversion)
+- Optimizes throwIfAborted from 65536 to 16 calls per slice
+- Replaces gunzipSync with async gunzip for non-blocking Worker decompression
 
 ### 1.0.1
 

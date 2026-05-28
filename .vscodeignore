@@ -16,3 +16,4 @@ native/build.rs
 *.ts
 tsconfig.json
 .gitignore
+Opinions/**
