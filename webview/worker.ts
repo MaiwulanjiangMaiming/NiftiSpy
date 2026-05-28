@@ -414,14 +414,23 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
 
   self.postMessage({ id, type: 'progress', value: 0.85, stage: 'transferring volume' });
 
-  const voxelData = needsConversion ? (new Float32Array(n) as any) : nativeData;
-  if (needsConversion) {
-  for (let i = 0; i < n; i++) {
-    if (i % 4096 === 0) throwIfAborted(signal);
-    voxelData[i] = (nativeData as any)[i] * slope + inter;
-  }
-  nativeData = null as any;
-  rawData = null as any;
+  let voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+  if (!needsConversion) {
+    voxelData = nativeData;
+  } else if (nativeData instanceof Float32Array) {
+    for (let i = 0; i < n; i++) {
+      if (i % 4096 === 0) throwIfAborted(signal);
+      nativeData[i] = nativeData[i] * slope + inter;
+    }
+    voxelData = nativeData;
+  } else {
+    rawData = null as any;
+    voxelData = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      if (i % 4096 === 0) throwIfAborted(signal);
+      voxelData[i] = (nativeData as any)[i] * slope + inter;
+    }
+    nativeData = null as any;
   }
 
   self.postMessage({ id, type: 'progress', value: 1.0, stage: 'done' });
