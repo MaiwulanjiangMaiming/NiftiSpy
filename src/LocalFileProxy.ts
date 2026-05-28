@@ -1,4 +1,5 @@
 import * as http from 'http';
+import * as https from 'https';
 import * as zlib from 'zlib';
 import * as stream from 'stream';
 import * as vscode from 'vscode';
@@ -456,6 +457,140 @@ function readLocalFilePartial(fsPath: string, start: number, end: number): Promi
   });
 }
 
+function readHttpPartial(urlStr: string, start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const mod = url.protocol === 'https:' ? https : http;
+    const options: http.RequestOptions = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: { Range: `bytes=${start}-${end}` },
+    };
+
+    const req = mod.request(options, (res) => {
+      if (res.statusCode === 206 || res.statusCode === 200) {
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => {
+          const total = chunks.reduce((s, c) => s + c.length, 0);
+          const result = Buffer.alloc(total);
+          let off = 0;
+          for (const chunk of chunks) { chunk.copy(result, off); off += chunk.length; }
+          resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
+        });
+      } else {
+        reject(new Error(`HTTP ${res.statusCode}`));
+      }
+    });
+    req.on('error', reject);
+    if (signal) {
+      const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    req.end();
+  });
+}
+
+function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const mod = url.protocol === 'https:' ? https : http;
+    const gunzip = zlib.createGunzip();
+    const chunks: Buffer[] = [];
+    let totalSize = 0;
+    let resolved = false;
+    let header: any = null;
+    let axialNeeded = Infinity;
+
+    const options: http.RequestOptions = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+    };
+
+    const req = mod.request(options, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      res.pipe(gunzip);
+
+      const onAbort = () => {
+        if (!resolved) {
+          resolved = true;
+          req.destroy();
+          gunzip.destroy();
+          reject(new DOMException('Aborted', 'AbortError'));
+        }
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+      gunzip.on('data', (chunk: Buffer) => {
+        if (resolved) return;
+        if (signal?.aborted) { gunzip.destroy(); req.destroy(); return; }
+        chunks.push(chunk);
+        totalSize += chunk.length;
+
+        if (!header && totalSize >= 544) {
+          const buf = Buffer.concat(chunks);
+          header = parseNiiHeaderQuick(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
+          if (header) {
+            const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+            axialNeeded = voxOffset + (Math.floor(nz / 2) + 1) * nx * ny * bytesPerVoxel;
+          }
+        }
+
+        if (header && totalSize >= axialNeeded && !resolved) {
+          resolved = true;
+          const buf = Buffer.concat(chunks);
+          const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
+          const { nx, ny, nz, voxOffset } = header;
+          const axMid = Math.floor(nz / 2);
+          const bpv = Math.max(1, header.bitpix / 8);
+          const sliceStart = voxOffset + axMid * nx * ny * bpv;
+          const sliceEnd = sliceStart + nx * ny * bpv;
+          if (rawData.length >= sliceEnd) {
+            const sliceBytes = rawData.slice(sliceStart, sliceEnd);
+            const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
+            req.destroy();
+            gunzip.destroy();
+            resolve({ header, axialSlice });
+          }
+        }
+      });
+
+      gunzip.on('end', () => {
+        if (!resolved) {
+          if (header) {
+            const buf = Buffer.concat(chunks);
+            const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
+            const { nx, ny, nz, voxOffset } = header;
+            const axMid = Math.floor(nz / 2);
+            const bpv = Math.max(1, header.bitpix / 8);
+            const sliceStart = voxOffset + axMid * nx * ny * bpv;
+            const sliceEnd = sliceStart + nx * ny * bpv;
+            if (rawData.length >= sliceEnd) {
+              const sliceBytes = rawData.slice(sliceStart, sliceEnd);
+              const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
+              resolve({ header, axialSlice });
+              return;
+            }
+          }
+          reject(new Error('Failed to extract preview from remote gzip'));
+        }
+      });
+
+      gunzip.on('error', (err: Error) => { if (!resolved) { resolved = true; reject(err); } });
+    });
+
+    req.on('error', (err: Error) => { if (!resolved) { resolved = true; reject(err); } });
+    req.end();
+  });
+}
+
 function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
   return new Promise((resolve, reject) => {
     const gunzip = zlib.createGunzip();
@@ -769,6 +904,8 @@ export class LocalFileProxy {
       let headerBytes: Uint8Array;
       if (fsPath) {
         headerBytes = await readLocalFilePartial(fsPath, 0, 543);
+      } else if (entry.uri.scheme === 'http' || entry.uri.scheme === 'https') {
+        headerBytes = await readHttpPartial(entry.uri.toString(), 0, 543);
       } else {
         const fullData = await vscode.workspace.fs.readFile(entry.uri);
         entry.dataCache = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
@@ -887,13 +1024,68 @@ export class LocalFileProxy {
   }
 
   private async handlePreviewRemote(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    // For remote files, vscode.workspace.fs.readFile does not support Range requests,
-    // so we have to download the entire file. For large files (>200MB), this is impractical.
+    const uriStr = entry.uri.toString();
+    const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+    const isGzip = uriStr.endsWith('.gz');
+
+    if (isHttpRemote) {
+      if (isGzip) {
+        try {
+          const { header, axialSlice } = await streamingHttpGunzipPreview(uriStr);
+          entry.headerCache = header;
+          const { nx, ny, nz } = header;
+          const emptyCoronal = new Float32Array(nx * nz);
+          const emptySagittal = new Float32Array(ny * nz);
+          const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
+          const { min, max } = computeSliceMinMax(axialSlice);
+          const buf = encodePreviewBinary(header, slices, min, max);
+          entry.previewBinaryCache = buf;
+          compressResponse(buf, req, res, 'application/octet-stream');
+          return;
+        } catch {
+          res.writeHead(500);
+          res.end('Failed to stream remote gzip preview');
+          return;
+        }
+      }
+
+      try {
+        const headerBytes = await readHttpPartial(uriStr, 0, 543);
+        const header = parseNiiHeaderQuick(headerBytes);
+        if (!header) {
+          res.writeHead(500);
+          res.end('Failed to parse header');
+          return;
+        }
+        entry.headerCache = header;
+
+        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+        const axMid = Math.floor(nz / 2);
+        const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
+        const sliceEnd = sliceStart + nx * ny * bytesPerVoxel - 1;
+        const sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd);
+        const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
+
+        const emptyCoronal = new Float32Array(nx * nz);
+        const emptySagittal = new Float32Array(ny * nz);
+        const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
+        const { min, max } = computeSliceMinMax(axialSlice);
+        const buf = encodePreviewBinary(header, slices, min, max);
+        entry.previewBinaryCache = buf;
+        compressResponse(buf, req, res, 'application/octet-stream');
+        return;
+      } catch {
+        res.writeHead(500);
+        res.end('Failed to fetch remote file via HTTP Range');
+        return;
+      }
+    }
+
     if (!entry.size) {
       const stat = await vscode.workspace.fs.stat(entry.uri);
       entry.size = Number(stat.size);
     }
-    const MAX_REMOTE_PREVIEW_SIZE = 200 * 1024 * 1024; // 200MB
+    const MAX_REMOTE_PREVIEW_SIZE = 200 * 1024 * 1024;
     if (entry.size && entry.size > MAX_REMOTE_PREVIEW_SIZE) {
       res.writeHead(503, { 'Content-Type': 'text/plain' });
       res.end('Remote preview for large files (>200MB) is not supported yet');
@@ -1005,6 +1197,111 @@ export class LocalFileProxy {
           entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
           compressResponse(buf, req, res, 'application/octet-stream');
           return;
+        }
+      }
+
+      const uriStr = entry.uri.toString();
+      const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+
+      if (isHttpRemote && !isGzip) {
+        if (!entry.headerCache) {
+          try {
+            const headerBytes = await readHttpPartial(uriStr, 0, 543);
+            const header = parseNiiHeaderQuick(headerBytes);
+            if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
+            entry.headerCache = header;
+          } catch {
+            res.writeHead(500); res.end('Failed to fetch header via HTTP Range'); return;
+          }
+        }
+        const header = entry.headerCache;
+        const { nx, ny, voxOffset, bytesPerVoxel } = header;
+
+        try {
+          if (axis === 'axial') {
+            const sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
+            const sliceEnd = sliceStart + nx * ny * bytesPerVoxel - 1;
+            const sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd);
+            const slice = extractAxialSliceFromRange(sliceBytes, header);
+            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+            compressResponse(buf, req, res, 'application/octet-stream');
+            return;
+          } else if (axis === 'coronal') {
+            const rowSize = nx * bytesPerVoxel;
+            const promises: Promise<{ rowBytes: Uint8Array; z: number }>[] = [];
+            for (let z = 0; z < header.nz; z++) {
+              const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bytesPerVoxel;
+              promises.push(readHttpPartial(uriStr, rowOffset, rowOffset + rowSize - 1).then(rowBytes => ({ rowBytes, z })));
+            }
+            const rows = await Promise.all(promises);
+            const slice = new Float32Array(nx * header.nz);
+            const bpv = Math.max(1, header.bitpix / 8);
+            const le = header.littleEndian;
+            const slope = header.scl_slope || 1;
+            const inter = header.scl_inter || 0;
+            for (const { rowBytes, z } of rows) {
+              const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
+              for (let x = 0; x < nx; x++) {
+                const off = x * bpv;
+                let val: number;
+                switch (header.datatype) {
+                  case 2: val = rowBytes[off]; break;
+                  case 4: val = view.getInt16(off, le); break;
+                  case 8: val = view.getInt32(off, le); break;
+                  case 16: val = view.getFloat32(off, le); break;
+                  case 64: val = view.getFloat64(off, le); break;
+                  case 256: val = (rowBytes[off] << 24) >> 24; break;
+                  case 512: val = view.getUint16(off, le); break;
+                  case 768: val = view.getUint32(off, le); break;
+                  default: val = 0;
+                }
+                slice[z * nx + x] = val * slope + inter;
+              }
+            }
+            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+            compressResponse(buf, req, res, 'application/octet-stream');
+            return;
+          } else {
+            const axialSize = nx * ny * bytesPerVoxel;
+            const promises: Promise<{ axialBytes: Uint8Array; z: number }>[] = [];
+            for (let z = 0; z < header.nz; z++) {
+              const axialOffset = voxOffset + z * nx * ny * bytesPerVoxel;
+              promises.push(readHttpPartial(uriStr, axialOffset, axialOffset + axialSize - 1).then(axialBytes => ({ axialBytes, z })));
+            }
+            const axialSlices = await Promise.all(promises);
+            const slice = new Float32Array(ny * header.nz);
+            const bpv = Math.max(1, header.bitpix / 8);
+            const le = header.littleEndian;
+            const slope = header.scl_slope || 1;
+            const inter = header.scl_inter || 0;
+            for (const { axialBytes, z } of axialSlices) {
+              const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
+              for (let y = 0; y < ny; y++) {
+                const off = (y * nx + idx) * bpv;
+                let val: number;
+                switch (header.datatype) {
+                  case 2: val = axialBytes[off]; break;
+                  case 4: val = view.getInt16(off, le); break;
+                  case 8: val = view.getInt32(off, le); break;
+                  case 16: val = view.getFloat32(off, le); break;
+                  case 64: val = view.getFloat64(off, le); break;
+                  case 256: val = (axialBytes[off] << 24) >> 24; break;
+                  case 512: val = view.getUint16(off, le); break;
+                  case 768: val = view.getUint32(off, le); break;
+                  default: val = 0;
+                }
+                slice[z * ny + y] = val * slope + inter;
+              }
+            }
+            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+            compressResponse(buf, req, res, 'application/octet-stream');
+            return;
+          }
+        } catch {
+          res.writeHead(500); res.end('Failed to fetch slice via HTTP Range'); return;
         }
       }
 
