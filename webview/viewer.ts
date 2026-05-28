@@ -1495,11 +1495,10 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
   const maxPanX = Math.max(0, (cw - dw) / 2);
   const maxPanY = Math.max(0, (ch - dh) / 2);
 
-  const indFlips = viewFlips[axis] || { flipX: false, flipY: false };
   const rawNormPanX = maxPanX > 0 ? (panX + maxPanX) / (2 * maxPanX) : 0.5;
   const rawNormPanY = maxPanY > 0 ? (panY + maxPanY) / (2 * maxPanY) : 0.5;
-  const normPanX = indFlips.flipX ? rawNormPanX : 1 - rawNormPanX;
-  const normPanY = indFlips.flipY ? rawNormPanY : 1 - rawNormPanY;
+  const normPanX = 1 - rawNormPanX;
+  const normPanY = 1 - rawNormPanY;
 
   const rx = Math.max(0, Math.min(mw - rw, normPanX * mw - rw / 2));
   const ry = Math.max(0, Math.min(mh - rh, normPanY * mh - rh / 2));
@@ -3572,9 +3571,8 @@ function setupInteraction() {
       const maxPanX = Math.max(0, (cw - dw) / 2);
       const maxPanY = Math.max(0, (ch - dh) / 2);
 
-      const clickFlips = viewFlips[axis] || { flipX: false, flipY: false };
-      const effectiveMx = clickFlips.flipX ? mx : 1 - mx;
-      const effectiveMy = clickFlips.flipY ? my : 1 - my;
+      const effectiveMx = 1 - mx;
+      const effectiveMy = 1 - my;
       viewState[axis].panX = (effectiveMx - 0.5) * 2 * maxPanX;
       viewState[axis].panY = (effectiveMy - 0.5) * 2 * maxPanY;
 

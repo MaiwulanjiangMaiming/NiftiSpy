@@ -130,6 +130,90 @@ function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any): Float3
   return slice;
 }
 
+async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number): Promise<Float32Array | null> {
+  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
+  if (idx < 0 || idx >= ny) return null;
+  const bpv = Math.max(1, header.bitpix / 8);
+  const le = littleEndian;
+  const slope = scl_slope || 1;
+  const inter = scl_inter || 0;
+  const slice = new Float32Array(nx * nz);
+
+  const rowSize = nx * bpv;
+  const promises: Promise<{ rowBytes: Uint8Array; z: number }>[] = [];
+  for (let z = 0; z < nz; z++) {
+    const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bpv;
+    promises.push(
+      readLocalFilePartial(fsPath, rowOffset, rowOffset + rowSize - 1)
+        .then(rowBytes => ({ rowBytes, z }))
+    );
+  }
+  const rows = await Promise.all(promises);
+
+  for (const { rowBytes, z } of rows) {
+    const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
+    for (let x = 0; x < nx; x++) {
+      const off = x * bpv;
+      let val: number;
+      switch (datatype) {
+        case 2: val = rowBytes[off]; break;
+        case 4: val = view.getInt16(off, le); break;
+        case 8: val = view.getInt32(off, le); break;
+        case 16: val = view.getFloat32(off, le); break;
+        case 64: val = view.getFloat64(off, le); break;
+        case 256: val = (rowBytes[off] << 24) >> 24; break;
+        case 512: val = view.getUint16(off, le); break;
+        case 768: val = view.getUint32(off, le); break;
+        default: val = 0;
+      }
+      slice[z * nx + x] = val * slope + inter;
+    }
+  }
+  return slice;
+}
+
+async function extractSagittalSliceFromRange(fsPath: string, header: any, idx: number): Promise<Float32Array | null> {
+  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
+  if (idx < 0 || idx >= nx) return null;
+  const bpv = Math.max(1, header.bitpix / 8);
+  const le = littleEndian;
+  const slope = scl_slope || 1;
+  const inter = scl_inter || 0;
+  const slice = new Float32Array(ny * nz);
+
+  const axialSize = nx * ny * bpv;
+  const promises: Promise<{ axialBytes: Uint8Array; z: number }>[] = [];
+  for (let z = 0; z < nz; z++) {
+    const axialOffset = voxOffset + z * nx * ny * bpv;
+    promises.push(
+      readLocalFilePartial(fsPath, axialOffset, axialOffset + axialSize - 1)
+        .then(axialBytes => ({ axialBytes, z }))
+    );
+  }
+  const axialSlices = await Promise.all(promises);
+
+  for (const { axialBytes, z } of axialSlices) {
+    const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
+    for (let y = 0; y < ny; y++) {
+      const off = (y * nx + idx) * bpv;
+      let val: number;
+      switch (datatype) {
+        case 2: val = axialBytes[off]; break;
+        case 4: val = view.getInt16(off, le); break;
+        case 8: val = view.getInt32(off, le); break;
+        case 16: val = view.getFloat32(off, le); break;
+        case 64: val = view.getFloat64(off, le); break;
+        case 256: val = (axialBytes[off] << 24) >> 24; break;
+        case 512: val = view.getUint16(off, le); break;
+        case 768: val = view.getUint32(off, le); break;
+        default: val = 0;
+      }
+      slice[z * ny + y] = val * slope + inter;
+    }
+  }
+  return slice;
+}
+
 function extractPreviewSlices(rawData: Uint8Array, header: any): { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array } | null {
   const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
   const n = nx * ny * nz;
@@ -896,24 +980,27 @@ export class LocalFileProxy {
           entry.headerCache = header;
         }
         const header = entry.headerCache;
-        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+        const { nx, ny, voxOffset, bytesPerVoxel } = header;
 
-        let sliceStart: number, sliceSize: number;
         if (axis === 'axial') {
-          sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
-          sliceSize = nx * ny * bytesPerVoxel;
-        } else if (axis === 'coronal') {
-          sliceStart = voxOffset + idx * nx * bytesPerVoxel;
-          sliceSize = nx * nz * bytesPerVoxel;
-        } else {
-          sliceStart = voxOffset + idx * bytesPerVoxel;
-          sliceSize = ny * nz * bytesPerVoxel;
-        }
-
-        // For axial slices (contiguous in file), use direct range read
-        if (axis === 'axial') {
+          const sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
+          const sliceSize = nx * ny * bytesPerVoxel;
           const sliceBytes = await readLocalFilePartial(fsPath, sliceStart, sliceStart + sliceSize - 1);
           const slice = extractAxialSliceFromRange(sliceBytes, header);
+          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+          compressResponse(buf, req, res, 'application/octet-stream');
+          return;
+        } else if (axis === 'coronal') {
+          const slice = await extractCoronalSliceFromRange(fsPath, header, idx);
+          if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
+          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+          compressResponse(buf, req, res, 'application/octet-stream');
+          return;
+        } else {
+          const slice = await extractSagittalSliceFromRange(fsPath, header, idx);
+          if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
           const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
           entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
           compressResponse(buf, req, res, 'application/octet-stream');
