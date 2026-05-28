@@ -672,6 +672,78 @@ let sliceWorkers: Worker[] = [];
 const AXIS_TO_WORKER_IDX: Record<Axis, number> = { axial: 0, coronal: 1, sagittal: 2 };
 let cachedBlobUrl: string | null = null;
 
+class SliceWorkerPool {
+  private workers: Worker[] = [];
+  private idle: Worker[] = [];
+  private maxSize: number;
+  private blobUrl: string | null = null;
+  private queue: Array<{ payload: Record<string, any>; resolve: (v: any) => void; reject: (e: any) => void }> = [];
+
+  constructor(maxSize: number) { this.maxSize = maxSize; }
+
+  async init(): Promise<void> {
+    this.blobUrl = await ensureWorkerBlobUrl();
+    const initialSize = Math.min(this.maxSize, 3);
+    for (let i = 0; i < initialSize; i++) {
+      const w = new Worker(this.blobUrl);
+      attachWorkerRouter(w);
+      this.workers.push(w);
+      this.idle.push(w);
+    }
+  }
+
+  dispatch<T = any>(payload: Record<string, any>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const idleWorker = this.idle.shift();
+      if (idleWorker) {
+        this.exec(idleWorker, payload, resolve, reject);
+      } else if (this.workers.length < this.maxSize) {
+        const w = new Worker(this.blobUrl!);
+        attachWorkerRouter(w);
+        this.workers.push(w);
+        this.exec(w, payload, resolve, reject);
+      } else {
+        this.queue.push({ payload, resolve, reject });
+      }
+    });
+  }
+
+  private exec(worker: Worker, payload: Record<string, any>, resolve: (v: any) => void, reject: (e: any) => void): void {
+    const id = nextWorkerRequestId++;
+    workerRequests.set(id, {
+      resolve: (msg: any) => { resolve(msg); this.release(worker); },
+      reject: (err: any) => { reject(err); this.release(worker); },
+    });
+    worker.postMessage({ ...payload, id });
+  }
+
+  private release(worker: Worker): void {
+    if (this.queue.length > 0) {
+      const next = this.queue.shift()!;
+      this.exec(worker, next.payload, next.resolve, next.reject);
+    } else {
+      this.idle.push(worker);
+    }
+  }
+
+  broadcast(message: Record<string, any>): void {
+    for (const w of this.workers) w.postMessage(message);
+  }
+
+  terminate(): void {
+    for (const w of this.workers) w.terminate();
+    this.workers = [];
+    this.idle = [];
+    this.queue = [];
+  }
+
+  setErrorHandler(handler: (err: ErrorEvent) => void): void {
+    for (const w of this.workers) w.onerror = handler;
+  }
+}
+
+let slicePool: SliceWorkerPool | null = null;
+
 async function ensureWorkerBlobUrl(): Promise<string> {
   if ((window as any).__NII_WORKER_BLOB_URL__) return (window as any).__NII_WORKER_BLOB_URL__;
   if (cachedBlobUrl) return cachedBlobUrl;
@@ -711,7 +783,17 @@ function attachWorkerRouter(worker: Worker) {
   };
 }
 
+async function getSlicePool(): Promise<SliceWorkerPool> {
+  if (!slicePool) {
+    const maxWorkers = Math.min(navigator.hardwareConcurrency || 4, 6);
+    slicePool = new SliceWorkerPool(maxWorkers);
+    await slicePool.init();
+  }
+  return slicePool;
+}
+
 async function getSliceWorker(axis: Axis): Promise<Worker> {
+  const pool = await getSlicePool();
   const idx = AXIS_TO_WORKER_IDX[axis];
   if (sliceWorkers[idx]) return sliceWorkers[idx];
   const worker = new Worker(await ensureWorkerBlobUrl());
@@ -720,16 +802,12 @@ async function getSliceWorker(axis: Axis): Promise<Worker> {
   return worker;
 }
 
-async function ensureAllSliceWorkers(): Promise<Worker[]> {
-  await Promise.all([
-    getSliceWorker('axial'),
-    getSliceWorker('coronal'),
-    getSliceWorker('sagittal'),
-  ]);
-  return sliceWorkers;
+async function ensureAllSliceWorkers(): Promise<void> {
+  await getSlicePool();
 }
 
 function broadcastToSliceWorkers(message: Record<string, any>): void {
+  if (slicePool) slicePool.broadcast(message);
   for (const worker of sliceWorkers) {
     if (worker) worker.postMessage(message);
   }
@@ -994,9 +1072,9 @@ function getActiveDownsample(): number {
 
 async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
   if (!header) return;
-  const worker = await getSliceWorker(axis);
+  const pool = await getSlicePool();
   const geometry = getAxisGeometry(axis);
-  const response = await sendWorkerRequest<{
+  const response = await pool.dispatch<{
     type: 'slice';
     axis: Axis;
     index: number;
@@ -1004,7 +1082,7 @@ async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
     width: number;
     height: number;
     data: Float32Array;
-  }>(worker, {
+  }>({
     type: 'fetchSlice',
     url: fileUrl,
     axis,
@@ -2622,9 +2700,9 @@ async function fallbackToHttpPreview(): Promise<void> {
     loadingText.textContent = 'Loading preview...';
     updateProgress(0.01, 'Fetching preview...', 'Preview');
 
-    const workers = await ensureAllSliceWorkers();
-    for (const w of workers) {
-      w.onerror = (err) => { loadingText.textContent = 'Worker error: ' + (err.message || 'unknown'); };
+    await ensureAllSliceWorkers();
+    if (slicePool) {
+      slicePool.setErrorHandler((err) => { loadingText.textContent = 'Worker error: ' + (err.message || 'unknown'); });
     }
 
     try {
@@ -2650,13 +2728,13 @@ async function fallbackToHttpPreview(): Promise<void> {
       }
     } catch (_) {}
 
-    loadFullVolume(workers);
+    loadFullVolume();
   } catch (err: any) {
     loadingText.textContent = 'Error: ' + (err?.message ?? String(err));
   }
 }
 
-function loadFullVolume(workers: Worker[]) {
+function loadFullVolume() {
   let previewReceived = false;
   let volumeReceived = false;
 
@@ -2747,9 +2825,7 @@ function loadFullVolume(workers: Worker[]) {
     }
   };
 
-  for (const worker of workers) {
-    worker.postMessage({ id: 0, type: 'loadVolume', url: fileUrl, isGzip });
-  }
+  if (slicePool) slicePool.broadcast({ id: 0, type: 'loadVolume', url: fileUrl, isGzip });
 }
 
 function updateProgress(value: number, text?: string, detail?: string) {
