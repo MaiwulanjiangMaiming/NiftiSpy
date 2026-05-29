@@ -278,7 +278,9 @@ const bandwidthEstimator = new BandwidthEstimator();
 class WebGLRenderer {
   private gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
   private program: WebGLProgram | null = null;
+  private program3D: WebGLProgram | null = null;
   private texture: WebGLTexture | null = null;
+  private texture3D: WebGLTexture | null = null;
   private lutTexture: WebGLTexture | null = null;
   private posBuffer: WebGLBuffer | null = null;
   private texCoordBuffer: WebGLBuffer | null = null;
@@ -287,6 +289,8 @@ class WebGLRenderer {
   private supportsFloatTexture = false;
   private isWebGL2 = false;
   private floatLinear = false;
+  private volume3DReady = false;
+  private volume3DSize = 0;
 
   private vertexShaderSource = `#version 100
 attribute vec2 a_position;
@@ -331,6 +335,42 @@ uniform float u_windowWidth;
 out vec4 fragColor;
 void main() {
   float rawValue = texture(u_image, v_texCoord).r;
+  float lo = u_windowLevel - u_windowWidth * 0.5;
+  float t = clamp((rawValue - lo) / u_windowWidth, 0.0, 1.0);
+  vec4 color = texture(u_lut, vec2(t, 0.5));
+  fragColor = color;
+}`;
+
+  private vertexShader3D = `#version 300 es
+in vec2 a_position;
+in vec2 a_texCoord;
+out vec2 v_texCoord;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_texCoord = a_texCoord;
+}`;
+
+  private fragmentShader3D = `#version 300 es
+precision highp float;
+in vec2 v_texCoord;
+uniform sampler3D u_volume;
+uniform sampler2D u_lut;
+uniform float u_windowLevel;
+uniform float u_windowWidth;
+uniform float u_sliceIndex;
+uniform int u_axis;
+uniform vec3 u_volumeSize;
+out vec4 fragColor;
+void main() {
+  vec3 uvw;
+  if (u_axis == 0) {
+    uvw = vec3(v_texCoord.x, v_texCoord.y, u_sliceIndex / u_volumeSize.z);
+  } else if (u_axis == 1) {
+    uvw = vec3(v_texCoord.x, u_sliceIndex / u_volumeSize.y, v_texCoord.y);
+  } else {
+    uvw = vec3(u_sliceIndex / u_volumeSize.x, v_texCoord.x, v_texCoord.y);
+  }
+  float rawValue = texture(u_volume, uvw).r;
   float lo = u_windowLevel - u_windowWidth * 0.5;
   float t = clamp((rawValue - lo) / u_windowWidth, 0.0, 1.0);
   vec4 color = texture(u_lut, vec2(t, 0.5));
@@ -408,6 +448,21 @@ void main() {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]), gl.STATIC_DRAW);
 
     this.ready = true;
+
+    if (this.isWebGL2) {
+      const vs3d = this.compileShader(gl.VERTEX_SHADER, this.vertexShader3D);
+      const fs3d = this.compileShader(gl.FRAGMENT_SHADER, this.fragmentShader3D);
+      if (vs3d && fs3d) {
+        this.program3D = gl.createProgram()!;
+        gl.attachShader(this.program3D, vs3d);
+        gl.attachShader(this.program3D, fs3d);
+        gl.linkProgram(this.program3D);
+        if (!gl.getProgramParameter(this.program3D, gl.LINK_STATUS)) {
+          this.program3D = null;
+        }
+      }
+    }
+
     return true;
   }
 
@@ -511,6 +566,112 @@ void main() {
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     if (gl.getError() !== gl.NO_ERROR) return false;
     return true;
+  }
+
+  uploadVolume3D(data: Float32Array, nx: number, ny: number, nz: number): boolean {
+    if (!this.isWebGL2 || !this.program3D) return false;
+    const gl2 = this.gl as WebGL2RenderingContext;
+
+    const max3DSize = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE);
+    if (nx > max3DSize || ny > max3DSize || nz > max3DSize) return false;
+
+    const estimatedBytes = nx * ny * nz * 4;
+    const maxTextureSize = gl2.getParameter(gl2.MAX_TEXTURE_SIZE);
+    const availableMB = (maxTextureSize * maxTextureSize * 4) / (1024 * 1024);
+    if (estimatedBytes > availableMB * 1024 * 1024) return false;
+
+    if (!this.texture3D) {
+      this.texture3D = gl2.createTexture();
+    }
+
+    gl2.activeTexture(gl2.TEXTURE0);
+    gl2.bindTexture(gl2.TEXTURE_3D, this.texture3D);
+    const filter = this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
+    gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_MIN_FILTER, filter);
+    gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_MAG_FILTER, filter);
+    gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
+    gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
+    gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_R, gl2.CLAMP_TO_EDGE);
+
+    try {
+      gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, nz, 0, gl2.RED, gl2.FLOAT, data);
+    } catch {
+      gl2.deleteTexture(this.texture3D);
+      this.texture3D = null;
+      return false;
+    }
+
+    if (gl2.getError() !== gl2.NO_ERROR) {
+      gl2.deleteTexture(this.texture3D);
+      this.texture3D = null;
+      return false;
+    }
+
+    this.volume3DReady = true;
+    this.volume3DSize = nx * ny * nz;
+    return true;
+  }
+
+  renderSlice3D(canvas: HTMLCanvasElement, axis: number, sliceIndex: number,
+    nx: number, ny: number, nz: number, lo: number, range: number,
+    cmapName: string, flipX: boolean = false, flipY: boolean = false): boolean {
+    if (!this.volume3DReady || !this.texture3D || !this.program3D || !this.isWebGL2) return false;
+    const gl2 = this.gl as WebGL2RenderingContext;
+
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = canvas.clientWidth * dpr;
+    canvas.height = canvas.clientHeight * dpr;
+    gl2.viewport(0, 0, canvas.width, canvas.height);
+
+    gl2.useProgram(this.program3D);
+
+    gl2.activeTexture(gl2.TEXTURE0);
+    gl2.bindTexture(gl2.TEXTURE_3D, this.texture3D);
+
+    if (this.currentLut !== cmapName) {
+      this.updateLUT(cmapName);
+      this.currentLut = cmapName;
+    }
+
+    gl2.activeTexture(gl2.TEXTURE1);
+    gl2.bindTexture(gl2.TEXTURE_2D, this.lutTexture);
+
+    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_volume'), 0);
+    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_lut'), 1);
+    gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_windowLevel'), lo + range * 0.5);
+    gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_windowWidth'), range);
+    gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_sliceIndex'), sliceIndex);
+    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_axis'), axis);
+    gl2.uniform3f(gl2.getUniformLocation(this.program3D, 'u_volumeSize'), nx, ny, nz);
+
+    const aPos = gl2.getAttribLocation(this.program3D, 'a_position');
+    const aTex = gl2.getAttribLocation(this.program3D, 'a_texCoord');
+
+    gl2.bindBuffer(gl2.ARRAY_BUFFER, this.posBuffer);
+    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl2.DYNAMIC_DRAW);
+    gl2.enableVertexAttribArray(aPos);
+    gl2.vertexAttribPointer(aPos, 2, gl2.FLOAT, false, 0, 0);
+
+    gl2.bindBuffer(gl2.ARRAY_BUFFER, this.texCoordBuffer);
+    const tx0 = flipX ? 1 : 0, tx1 = flipX ? 0 : 1;
+    const ty0 = flipY ? 0 : 1, ty1 = flipY ? 1 : 0;
+    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([tx0, ty0, tx1, ty0, tx0, ty1, tx1, ty1]), gl2.DYNAMIC_DRAW);
+    gl2.enableVertexAttribArray(aTex);
+    gl2.vertexAttribPointer(aTex, 2, gl2.FLOAT, false, 0, 0);
+
+    gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
+    return gl2.getError() === gl2.NO_ERROR;
+  }
+
+  isVolume3DReady(): boolean { return this.volume3DReady; }
+
+  clearVolume3D(): void {
+    if (this.texture3D && this.gl) {
+      this.gl.deleteTexture(this.texture3D);
+      this.texture3D = null;
+    }
+    this.volume3DReady = false;
+    this.volume3DSize = 0;
   }
 
   private updateLUT(cmapName: string): void {
@@ -937,6 +1098,28 @@ function evictInactiveImageData(preferredIndices: number[] = []) {
   publishPerfMonitor();
 }
 
+function tryUploadVolume3D() {
+  if (!volumeData || !header) return;
+  const { nx, ny, nz } = header;
+  const n = nx * ny * nz;
+  let float32Data: Float32Array;
+  if (volumeData instanceof Float32Array) {
+    float32Data = volumeData;
+  } else {
+    float32Data = new Float32Array(n);
+    for (let i = 0; i < n; i++) float32Data[i] = (volumeData as any)[i] * dataSlope + dataInter;
+  }
+
+  for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+    const r = glRenderers[axis];
+    if (r) {
+      if (!r.isVolume3DReady()) {
+        r.uploadVolume3D(float32Data, nx, ny, nz);
+      }
+    }
+  }
+}
+
 function applyImageState(img: VolumeImage, preserveSlices = false) {
   header = img.header;
   computeViewFlips();
@@ -947,6 +1130,7 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
   globalMax = img.max;
   fileName = img.name;
   img.lastAccess = Date.now();
+  tryUploadVolume3D();
   if (!preserveSlices && img.preview) {
     setCurrentSlice('axial', new Float32Array(img.preview.axial), img.header.nx, img.header.ny, 1);
     setCurrentSlice('coronal', new Float32Array(img.preview.coronal), img.header.nx, img.header.nz, 1);
@@ -1409,6 +1593,18 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
 
   const renderer = getOrCreateRenderer(axis as Axis);
   const flips = viewFlips[axis] || { flipX: false, flipY: false };
+
+  if (renderer && renderer.isVolume3DReady() && header) {
+    const axisIdx = axis === 'axial' ? 0 : axis === 'coronal' ? 1 : 2;
+    if (renderer.renderSlice3D(canvas, axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
+      updateDirectionLabels(axis);
+      updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+      updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+      updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+      return;
+    }
+  }
+
   if (renderer && zoom === 1 && panX === 0 && panY === 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
     updateDirectionLabels(axis);
     updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);

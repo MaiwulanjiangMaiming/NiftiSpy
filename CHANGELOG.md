@@ -10,6 +10,16 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.2.0] - 2026-05-28
+
+### Added
+- GPU 3D texture rendering: when volume data is fully loaded, upload entire volume as `TEXTURE_3D` (R32F) to GPU. Slice scrolling becomes pure uniform update (`u_sliceIndex`), achieving 60fps+ with zero CPU data transfer.
+- 3D texture shader: `sampler3D` with `u_axis` (0=axial, 1=coronal, 2=sagittal) and `u_sliceIndex` for GPU-side slice extraction in any orientation.
+- Automatic GPU memory detection and fallback: checks `MAX_3D_TEXTURE_SIZE` and estimated memory before upload. Large volumes (>1GB) that exceed GPU limits automatically fall back to 2D texture mode.
+- `tryUploadVolume3D()`: automatically uploads volume data to GPU 3D texture when `volumeData` is set, shared across all three axis renderers.
+
+---
+
 ## [1.1.2] - 2026-05-28
 
 ### Added
