@@ -1,5 +1,6 @@
 import { gunzip } from 'fflate';
 import { parseNiiHeader } from './nii-parser';
+import { getCachedChunk, setCachedChunk, makeCacheKey } from './cache';
 
 const MAX_RETRIES = 3;
 const CHUNK_SIZE = 4 * 1024 * 1024;
@@ -126,6 +127,15 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
   if (pending) return pending;
 
   const request = (async () => {
+    const idbKey = makeCacheKey(url, axis, index);
+    const idbData = await getCachedChunk(idbKey);
+    if (idbData) {
+      const data = new Float32Array(idbData);
+      const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
+      setCachedSlice(url, axis, index, factor, slice);
+      return slice;
+    }
+
     const startedAt = performance.now();
     const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor));
     if (!resp.ok) {
@@ -143,6 +153,9 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
       timestamp: Date.now(),
     };
     setCachedSlice(url, axis, index, factor, slice);
+
+    setCachedChunk(idbKey, buffer).catch(() => {});
+
     self.postMessage({
       id: -1,
       type: 'bandwidthSample',

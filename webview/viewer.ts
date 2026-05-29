@@ -337,7 +337,34 @@ void main() {
   fragColor = color;
 }`;
 
+  private offscreen: OffscreenCanvas | null = null;
+  private offscreenCtx: WebGL2RenderingContext | WebGLRenderingContext | null = null;
+
   init(canvas: HTMLCanvasElement): boolean {
+    const tryOffscreen = !!(canvas as any).transferControlToOffscreen;
+    if (tryOffscreen) {
+      try {
+        const offscreenCanvas = (canvas as any).transferControlToOffscreen() as OffscreenCanvas;
+        const gl2 = offscreenCanvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true }) as WebGL2RenderingContext | null;
+        if (gl2) {
+          this.offscreen = offscreenCanvas;
+          this.offscreenCtx = gl2;
+          this.gl = gl2;
+          this.isWebGL2 = true;
+          this.supportsFloatTexture = true;
+          this.floatLinear = !!gl2.getExtension('OES_texture_float_linear');
+          if (this.setupProgram()) return true;
+          this.offscreen = null;
+          this.offscreenCtx = null;
+          this.gl = null;
+        }
+      } catch {
+        this.offscreen = null;
+        this.offscreenCtx = null;
+        this.gl = null;
+      }
+    }
+
     const gl2 = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
     if (gl2) {
       this.gl = gl2;

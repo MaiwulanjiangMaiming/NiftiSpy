@@ -10,6 +10,14 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.1.2] - 2026-05-28
+
+### Added
+- IndexedDB disk cache (`webview/cache.ts`): remote file slices are cached to IndexedDB with LRU eviction (max 500MB). Repeated access to remote files loads from disk cache instead of re-downloading.
+- OffscreenCanvas support: WebGL2 renderer now attempts to use `transferControlToOffscreen()` first, moving GL context to OffscreenCanvas for reduced main thread blocking. Falls back to regular canvas context if unavailable.
+
+---
+
 ## [1.1.1] - 2026-05-28
 
 ### Changed
