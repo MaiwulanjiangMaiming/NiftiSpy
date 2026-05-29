@@ -326,16 +326,13 @@ precision highp float;
 in vec2 v_texCoord;
 uniform sampler2D u_image;
 uniform sampler2D u_lut;
-uniform float u_lo;
-uniform float u_hi;
-uniform float u_range;
-uniform float u_min;
-uniform float u_max;
+uniform float u_windowLevel;
+uniform float u_windowWidth;
 out vec4 fragColor;
 void main() {
   float rawValue = texture(u_image, v_texCoord).r;
-  float normalized = (rawValue - u_min) / (u_max - u_min);
-  float t = clamp((normalized - u_lo) / u_range, 0.0, 1.0);
+  float lo = u_windowLevel - u_windowWidth * 0.5;
+  float t = clamp((rawValue - lo) / u_windowWidth, 0.0, 1.0);
   vec4 color = texture(u_lut, vec2(t, 0.5));
   fragColor = color;
 }`;
@@ -451,21 +448,22 @@ void main() {
 
     const uImage = gl.getUniformLocation(this.program, 'u_image');
     const uLut = gl.getUniformLocation(this.program, 'u_lut');
-    const uLo = gl.getUniformLocation(this.program, 'u_lo');
-    const uHi = gl.getUniformLocation(this.program, 'u_hi');
-    const uRange = gl.getUniformLocation(this.program, 'u_range');
 
     gl.uniform1i(uImage, 0);
     gl.uniform1i(uLut, 1);
-    gl.uniform1f(uLo, lo);
-    gl.uniform1f(uHi, lo + range);
-    gl.uniform1f(uRange, range);
 
     if (this.isWebGL2) {
-      const uMin = gl.getUniformLocation(this.program, 'u_min');
-      const uMax = gl.getUniformLocation(this.program, 'u_max');
-      gl.uniform1f(uMin, globalMin);
-      gl.uniform1f(uMax, globalMax);
+      const uWindowLevel = gl.getUniformLocation(this.program, 'u_windowLevel');
+      const uWindowWidth = gl.getUniformLocation(this.program, 'u_windowWidth');
+      gl.uniform1f(uWindowLevel, lo + range * 0.5);
+      gl.uniform1f(uWindowWidth, range);
+    } else {
+      const uLo = gl.getUniformLocation(this.program, 'u_lo');
+      const uHi = gl.getUniformLocation(this.program, 'u_hi');
+      const uRange = gl.getUniformLocation(this.program, 'u_range');
+      gl.uniform1f(uLo, lo);
+      gl.uniform1f(uHi, lo + range);
+      gl.uniform1f(uRange, range);
     }
 
     const aPos = gl.getAttribLocation(this.program, 'a_position');
@@ -1226,49 +1224,121 @@ function setCachedSliceRender(axis: string, idx: number, canvas: HTMLCanvasEleme
   pruneSliceCache();
 }
 
+class PredictivePrefetcher {
+  private lastSlice: Record<string, number> = {};
+  private lastTime: Record<string, number> = {};
+  private velocity: Record<string, number> = {};
+
+  onSliceChange(axis: string, sliceIndex: number): number {
+    const now = performance.now();
+    const prevSlice = this.lastSlice[axis] ?? sliceIndex;
+    const prevTime = this.lastTime[axis] ?? now;
+    const dt = now - prevTime;
+
+    if (dt > 0 && prevTime > 0) {
+      const instantVelocity = (sliceIndex - prevSlice) / (dt / 1000);
+      this.velocity[axis] = this.velocity[axis] * 0.7 + instantVelocity * 0.3;
+    }
+
+    this.lastSlice[axis] = sliceIndex;
+    this.lastTime[axis] = now;
+
+    const v = Math.abs(this.velocity[axis] || 0);
+    if (v > 20) return Math.min(15, Math.ceil(v * 0.5));
+    if (v > 5) return Math.min(10, Math.ceil(v * 0.4));
+    return PRELOAD_RANGE;
+  }
+
+  getDirection(axis: string): 1 | -1 {
+    return (this.velocity[axis] || 0) >= 0 ? 1 : -1;
+  }
+}
+
+const prefetcher = new PredictivePrefetcher();
+
 function preloadSlices(axis: 'axial' | 'coronal' | 'sagittal', currentIdx: number): void {
   if (!header || !volumeData) return;
   const max = axis === 'axial' ? header.nz : axis === 'coronal' ? header.ny : header.nx;
+  const prefetchRange = prefetcher.onSliceChange(axis, currentIdx);
+  const direction = prefetcher.getDirection(axis);
 
-  for (let d = 1; d <= PRELOAD_RANGE; d++) {
-    for (const offset of [d, -d]) {
-      const idx = currentIdx + offset;
-      if (idx < 0 || idx >= max) continue;
-      const cacheKey = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
-      if (sliceRenderCache.has(cacheKey)) continue;
+  const forwardRange = Math.min(prefetchRange * 2, max);
+  for (let d = 1; d <= forwardRange; d++) {
+    const idx = currentIdx + d * direction;
+    if (idx < 0 || idx >= max) continue;
+    const cacheKey = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
+    if (sliceRenderCache.has(cacheKey)) continue;
 
-      requestIdleCallback(() => {
-        if (!header || !volumeData) return;
-        const { nx, ny, nz, dx, dy, dz } = header;
-        const slice = extractSlice(axis, idx);
-        let w: number, h: number, pw: number, ph: number;
-        if (axis === 'axial') { w = nx; h = ny; pw = nx * dx; ph = ny * dy; }
-        else if (axis === 'coronal') { w = nx; h = nz; pw = nx * dx; ph = nz * dz; }
-        else { w = ny; h = nz; pw = ny * dy; ph = nz * dz; }
+    requestIdleCallback(() => {
+      if (!header || !volumeData) return;
+      const { nx, ny, nz, dx, dy, dz } = header;
+      const slice = extractSlice(axis, idx);
+      let w: number, h: number, pw: number, ph: number;
+      if (axis === 'axial') { w = nx; h = ny; pw = nx * dx; ph = ny * dy; }
+      else if (axis === 'coronal') { w = nx; h = nz; pw = nx * dx; ph = nz * dz; }
+      else { w = ny; h = nz; pw = ny * dy; ph = nz * dz; }
 
-        const tc = document.createElement('canvas');
-        tc.width = w; tc.height = h;
-        const tctx = tc.getContext('2d')!;
-        const imgData = tctx.createImageData(w, h);
-        const pixels = imgData.data;
-        const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
-        const lo = windowLevel - windowWidth * 0.5;
-        const range = windowWidth || 1;
-        const dataRange = globalMax - globalMin || 1;
-        const n = w * h;
+      const tc = document.createElement('canvas');
+      tc.width = w; tc.height = h;
+      const tctx = tc.getContext('2d')!;
+      const imgData = tctx.createImageData(w, h);
+      const pixels = imgData.data;
+      const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
+      const lo = windowLevel - windowWidth * 0.5;
+      const range = windowWidth || 1;
+      const dataRange = globalMax - globalMin || 1;
+      const n = w * h;
 
-        for (let i = 0; i < n; i++) {
-          const norm = (slice[i] - globalMin) / dataRange;
-          const t = Math.max(0, Math.min(1, (norm - lo) / range));
-          const [r, g, b] = cmapFn(t);
-          const idx4 = i * 4;
-          pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
-        }
-        tctx.putImageData(imgData, 0, 0);
-        setCachedSliceRender(axis, idx, tc);
-        float32Pool.release(slice);
-      });
-    }
+      for (let i = 0; i < n; i++) {
+        const norm = (slice[i] - globalMin) / dataRange;
+        const t = Math.max(0, Math.min(1, (norm - lo) / range));
+        const [r, g, b] = cmapFn(t);
+        const idx4 = i * 4;
+        pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
+      }
+      tctx.putImageData(imgData, 0, 0);
+      setCachedSliceRender(axis, idx, tc);
+      float32Pool.release(slice);
+    });
+  }
+
+  for (let d = 1; d <= prefetchRange; d++) {
+    const idx = currentIdx - d * direction;
+    if (idx < 0 || idx >= max) continue;
+    const cacheKey = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
+    if (sliceRenderCache.has(cacheKey)) continue;
+
+    requestIdleCallback(() => {
+      if (!header || !volumeData) return;
+      const { nx, ny, nz, dx, dy, dz } = header;
+      const slice = extractSlice(axis, idx);
+      let w: number, h: number;
+      if (axis === 'axial') { w = nx; h = ny; }
+      else if (axis === 'coronal') { w = nx; h = nz; }
+      else { w = ny; h = nz; }
+
+      const tc = document.createElement('canvas');
+      tc.width = w; tc.height = h;
+      const tctx = tc.getContext('2d')!;
+      const imgData = tctx.createImageData(w, h);
+      const pixels = imgData.data;
+      const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
+      const lo = windowLevel - windowWidth * 0.5;
+      const range = windowWidth || 1;
+      const dataRange = globalMax - globalMin || 1;
+      const n = w * h;
+
+      for (let i = 0; i < n; i++) {
+        const norm = (slice[i] - globalMin) / dataRange;
+        const t = Math.max(0, Math.min(1, (norm - lo) / range));
+        const [r, g, b] = cmapFn(t);
+        const idx4 = i * 4;
+        pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
+      }
+      tctx.putImageData(imgData, 0, 0);
+      setCachedSliceRender(axis, idx, tc);
+      float32Pool.release(slice);
+    });
   }
 }
 
