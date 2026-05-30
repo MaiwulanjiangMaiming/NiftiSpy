@@ -10,6 +10,16 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.4.1] - 2026-05-30
+
+### Added
+- Rust mmap memory-mapped file I/O (`native/src/lib.rs`): `mmap_parse_header()`, `mmap_extract_slice()`, `mmap_extract_preview()` functions use `memmap2` for zero-copy file access. Memory-mapped files avoid explicit `readFile()` calls, reducing memory pressure for large NIfTI volumes.
+- Rust fast GZIP decompression (`native/src/lib.rs`): `fast_decompress_gzip()` function using `flate2::GzDecoder` with pre-allocated output buffer, providing faster decompression than Node.js `zlib.gunzipSync()`.
+- Native bridge extensions (`src/nativeBridge.ts`): new `mmapParseHeader()`, `mmapExtractSlice()`, `mmapExtractPreview()`, `fastDecompressGzip()` bindings exposed through the native bridge with automatic JSON serialization/deserialization.
+- `memmap2` dependency added to `native/Cargo.toml`.
+
+---
+
 ## [1.4.0] - 2026-05-30
 
 ### Added

@@ -474,3 +474,86 @@ fn bytemuck(data: &[f32]) -> Vec<u8> {
   }
   out
 }
+
+#[napi(object)]
+pub struct MmapInfo {
+  pub header: String,
+  pub size: f64,
+}
+
+#[napi]
+pub fn mmap_parse_header(path: String) -> Option<MmapInfo> {
+  let file = std::fs::File::open(&path).ok()?;
+  let metadata = file.metadata().ok()?;
+  let size = metadata.len();
+  if size < 348 {
+    return None;
+  }
+  let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+  let header = parse_header_impl(mmap.as_ref())?;
+  Some(MmapInfo {
+    header: serde_json::to_string(&header).ok()?,
+    size: size as f64,
+  })
+}
+
+#[napi]
+pub fn mmap_extract_slice(path: String, header_json: String, axis: String, index: u32, factor: Option<u32>) -> Option<Buffer> {
+  let file = std::fs::File::open(&path).ok()?;
+  let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+  let header: Header = serde_json::from_str(&header_json).ok()?;
+  let axis_enum = match axis.as_str() {
+    "axial" => Axis::Axial,
+    "coronal" => Axis::Coronal,
+    "sagittal" => Axis::Sagittal,
+    _ => return None,
+  };
+  let (slice, width, height) = extract_slice_impl(mmap.as_ref(), &header, axis_enum, index as usize)?;
+  let (downsampled, _, _) = downsample(&slice, width, height, std::cmp::max(1, factor.unwrap_or(1)) as usize);
+  Some(Buffer::from(bytemuck(&downsampled)))
+}
+
+#[napi]
+pub fn mmap_extract_preview(path: String) -> Option<PreviewResult> {
+  let file = std::fs::File::open(&path).ok()?;
+  let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+  let header = parse_header_impl(mmap.as_ref())?;
+  let axial_idx = header.nz / 2;
+  let coronal_idx = header.ny / 2;
+  let sagittal_idx = header.nx / 2;
+  let (axial, _, _) = extract_slice_impl(mmap.as_ref(), &header, Axis::Axial, axial_idx)?;
+  let (coronal, _, _) = extract_slice_impl(mmap.as_ref(), &header, Axis::Coronal, coronal_idx)?;
+  let (sagittal, _, _) = extract_slice_impl(mmap.as_ref(), &header, Axis::Sagittal, sagittal_idx)?;
+  let mut min_val = f32::INFINITY;
+  let mut max_val = f32::NEG_INFINITY;
+  for slice in [&axial, &coronal, &sagittal] {
+    for value in slice.iter() {
+      if *value < min_val { min_val = *value; }
+      if *value > max_val { max_val = *value; }
+    }
+  }
+  if min_val == max_val {
+    max_val = min_val + 1.0;
+  }
+  Some(PreviewResult {
+    header: serde_json::to_string(&header).ok()?,
+    axial: Buffer::from(bytemuck(&axial)),
+    coronal: Buffer::from(bytemuck(&coronal)),
+    sagittal: Buffer::from(bytemuck(&sagittal)),
+    min: min_val as f64,
+    max: max_val as f64,
+  })
+}
+
+#[napi]
+pub fn fast_decompress_gzip(buffer: Buffer) -> Result<Buffer> {
+  use flate2::read::GzDecoder;
+  use std::io::Read;
+
+  let input = buffer.as_ref();
+  let estimated_size = input.len() * 4;
+  let mut decoder = GzDecoder::new(input);
+  let mut out = Vec::with_capacity(estimated_size.min(512 * 1024 * 1024));
+  decoder.read_to_end(&mut out).map_err(|e| Error::from_reason(e.to_string()))?;
+  Ok(Buffer::from(out))
+}
