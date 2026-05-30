@@ -10,6 +10,17 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.3.0] - 2026-05-30
+
+### Added
+- WebGPU rendering path (`webview/webgpuRenderer.ts`): new `WebGPURenderer` class that uses the WebGPU API for slice rendering when available. Automatically detects `navigator.gpu` adapter support and falls back to WebGL2 when WebGPU is not available.
+- WebGPU 3D texture: volume data uploaded as `GPUTexture` (3D, `r32float` format) with WGSL fragment shader performing GPU-side slice extraction and window/level normalization.
+- Compute Shader histogram: `WebGPURenderer.computeHistogram()` uses a WGSL compute pipeline to calculate a 256-bin intensity histogram from the 3D volume texture, enabling real-time histogram display without CPU involvement.
+- WebGPU integration in `viewer.ts`: `paintSlice()` now checks for WebGPU availability first; if a WebGPU renderer is initialized and the 3D volume is uploaded, it uses the WebGPU path. The `tryUploadVolume3D()` function also uploads volume data to WebGPU renderers.
+- `@webgpu/types` added as dev dependency for TypeScript type definitions.
+
+---
+
 ## [1.2.2] - 2026-05-30
 
 ### Added

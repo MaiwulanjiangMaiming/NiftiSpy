@@ -1,4 +1,5 @@
 import { NiiHeader, DATATYPE_NAMES } from './nii-parser';
+import { WebGPURenderer } from './webgpuRenderer';
 
 declare function acquireVsCodeApi(): any;
 const vscode = acquireVsCodeApi();
@@ -183,6 +184,9 @@ const MAX_SLICE_CACHE = perfProfile.tier === 'high' ? 64 : perfProfile.tier === 
 const PRELOAD_RANGE = perfProfile.tier === 'high' ? 5 : perfProfile.tier === 'medium' ? 3 : 1;
 
 const glRenderers: Partial<Record<Axis | 'mip', WebGLRenderer>> = {};
+const webgpuRenderers: Partial<Record<Axis, WebGPURenderer>> = {};
+let webgpuAvailable = false;
+let webgpuChecked = false;
 
 class BufferPool {
   private pools: Map<number, ArrayBuffer[]> = new Map();
@@ -1143,6 +1147,10 @@ function tryUploadVolume3D() {
         r.uploadVolume3D(float32Data, nx, ny, nz);
       }
     }
+    const wgr = webgpuRenderers[axis];
+    if (wgr && wgr.isReady()) {
+      wgr.uploadVolume3D(float32Data, nx, ny, nz);
+    }
   }
 }
 
@@ -1589,6 +1597,23 @@ function getOrCreateRenderer(axis: Axis): WebGLRenderer | null {
   return renderer;
 }
 
+async function getOrCreateWebGPURenderer(axis: Axis): Promise<WebGPURenderer | null> {
+  if (!webgpuChecked) {
+    webgpuAvailable = await WebGPURenderer.isAvailable();
+    webgpuChecked = true;
+  }
+  if (!webgpuAvailable) return null;
+
+  const existing = webgpuRenderers[axis];
+  if (existing?.isReady()) return existing;
+
+  const renderer = new WebGPURenderer();
+  const ok = await renderer.init(canvases[axis]);
+  if (!ok) return null;
+  webgpuRenderers[axis] = renderer;
+  return renderer;
+}
+
 function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
   const canvas = canvases[axis as keyof typeof canvases];
   if (!canvas || !data || data.length === 0) return;
@@ -1620,8 +1645,24 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   const renderer = getOrCreateRenderer(axis as Axis);
   const flips = viewFlips[axis] || { flipX: false, flipY: false };
 
+  if (!webgpuChecked) {
+    getOrCreateWebGPURenderer(axis as Axis).then(() => {});
+  }
+
   if (renderer && renderer.isVolume3DReady() && header) {
     const axisIdx = axis === 'axial' ? 0 : axis === 'coronal' ? 1 : 2;
+    const webgpuRenderer = webgpuRenderers[axis as Axis];
+    if (webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
+      axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz,
+      windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY
+    )) {
+      updateDirectionLabels(axis);
+      updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+      updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+      updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+      return;
+    }
+
     if (renderer.renderSlice3D(canvas, axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
       updateDirectionLabels(axis);
       updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
