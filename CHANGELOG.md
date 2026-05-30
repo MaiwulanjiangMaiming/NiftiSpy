@@ -10,6 +10,21 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.5.0] - 2026-05-30
+
+### Added
+- Volume Ray Marching renderer (`webview/volumeRaycaster.ts`): `VolumeRaycaster` class implementing GPU-based 3D volume rendering using WebGL2 ray marching. Features include:
+  - Ray-box intersection for bounding volume traversal
+  - Front-to-back compositing with early ray termination (alpha > 0.95)
+  - On-the-fly gradient computation for Phong shading (ambient + diffuse + specular)
+  - Transfer function with piecewise linear interpolation between control points
+  - Configurable step size, max steps, and lighting parameters
+- 3D rendering mode in `viewer.ts`: new `renderMode` state (`'slice'` | `'volume'`) with mouse drag rotation and scroll zoom for interactive 3D viewing. When `renderMode === 'volume'`, the axial canvas displays the ray-marched 3D volume instead of 2D slices.
+- Volume raycaster integration: `tryUploadVolume3D()` automatically uploads volume data to the `VolumeRaycaster`; `paintSlice()` dispatches to `renderVolume3D()` when in volume mode.
+- Default transfer function: 6-point piecewise linear TF with black→blue→red→yellow→white color ramp and increasing opacity.
+
+---
+
 ## [1.4.1] - 2026-05-30
 
 ### Added

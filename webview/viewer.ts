@@ -1,5 +1,6 @@
 import { NiiHeader, DATATYPE_NAMES } from './nii-parser';
 import { WebGPURenderer } from './webgpuRenderer';
+import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
 
 declare function acquireVsCodeApi(): any;
 const vscode = acquireVsCodeApi();
@@ -187,6 +188,15 @@ const glRenderers: Partial<Record<Axis | 'mip', WebGLRenderer>> = {};
 const webgpuRenderers: Partial<Record<Axis, WebGPURenderer>> = {};
 let webgpuAvailable = false;
 let webgpuChecked = false;
+
+let volumeRaycaster: VolumeRaycaster | null = null;
+let renderMode: 'slice' | 'volume' = 'slice';
+let volumeRotationX = 0;
+let volumeRotationY = 0;
+let volumeZoom = 1.0;
+let isDraggingVolume = false;
+let lastVolumeMouseX = 0;
+let lastVolumeMouseY = 0;
 
 class BufferPool {
   private pools: Map<number, ArrayBuffer[]> = new Map();
@@ -1152,6 +1162,13 @@ function tryUploadVolume3D() {
       wgr.uploadVolume3D(float32Data, nx, ny, nz);
     }
   }
+
+  if (!volumeRaycaster) {
+    initVolumeRaycaster();
+  }
+  if (volumeRaycaster) {
+    volumeRaycaster.uploadVolume(float32Data, nx, ny, nz);
+  }
 }
 
 function applyImageState(img: VolumeImage, preserveSlices = false) {
@@ -1614,7 +1631,97 @@ async function getOrCreateWebGPURenderer(axis: Axis): Promise<WebGPURenderer | n
   return renderer;
 }
 
+function initVolumeRaycaster(): boolean {
+  if (volumeRaycaster) return volumeRaycaster.isReady();
+  const axialCanvas = canvases.axial;
+  if (!axialCanvas) return false;
+  volumeRaycaster = new VolumeRaycaster();
+  return volumeRaycaster.init(axialCanvas);
+}
+
+function renderVolume3D(): void {
+  if (!volumeRaycaster || !volumeRaycaster.isReady() || !header) return;
+
+  const canvas = canvases.axial;
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const container = canvas.parentElement!;
+  canvas.width = container.clientWidth * dpr;
+  canvas.height = container.clientHeight * dpr;
+
+  const aspect = canvas.width / canvas.height;
+  const fov = Math.PI / 4;
+  const near = 0.1;
+  const far = 10.0;
+  const f = 1.0 / Math.tan(fov / 2);
+
+  const projMatrix = new Float32Array(16);
+  projMatrix[0] = f / aspect;
+  projMatrix[5] = f;
+  projMatrix[10] = (far + near) / (near - far);
+  projMatrix[11] = -1;
+  projMatrix[14] = (2 * far * near) / (near - far);
+
+  const cx = Math.cos(volumeRotationX);
+  const sx = Math.sin(volumeRotationX);
+  const cy = Math.cos(volumeRotationY);
+  const sy = Math.sin(volumeRotationY);
+
+  const viewMatrix = new Float32Array(16);
+  viewMatrix[0] = cy;
+  viewMatrix[2] = -sy;
+  viewMatrix[5] = cx;
+  viewMatrix[6] = sx * sy;
+  viewMatrix[8] = sx;
+  viewMatrix[9] = -cx * sy;
+  viewMatrix[10] = cx * cy;
+  viewMatrix[14] = -3.0 / volumeZoom;
+
+  volumeRaycaster.render(viewMatrix, projMatrix, windowLevel - windowWidth * 0.5, windowWidth || 1);
+}
+
+function setupVolumeInteraction(): void {
+  const canvas = canvases.axial;
+  if (!canvas) return;
+
+  canvas.addEventListener('mousedown', (e: MouseEvent) => {
+    if (renderMode !== 'volume') return;
+    isDraggingVolume = true;
+    lastVolumeMouseX = e.clientX;
+    lastVolumeMouseY = e.clientY;
+  });
+
+  window.addEventListener('mousemove', (e: MouseEvent) => {
+    if (!isDraggingVolume) return;
+    const dx = e.clientX - lastVolumeMouseX;
+    const dy = e.clientY - lastVolumeMouseY;
+    volumeRotationY += dx * 0.01;
+    volumeRotationX += dy * 0.01;
+    lastVolumeMouseX = e.clientX;
+    lastVolumeMouseY = e.clientY;
+    renderVolume3D();
+  });
+
+  window.addEventListener('mouseup', () => {
+    isDraggingVolume = false;
+  });
+
+  canvas.addEventListener('wheel', (e: WheelEvent) => {
+    if (renderMode !== 'volume') return;
+    e.preventDefault();
+    volumeZoom *= e.deltaY > 0 ? 0.9 : 1.1;
+    volumeZoom = Math.max(0.1, Math.min(10, volumeZoom));
+    renderVolume3D();
+  }, { passive: false });
+}
+
 function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
+  if (renderMode === 'volume' && axis === 'axial' && volumeRaycaster?.isReady()) {
+    renderVolume3D();
+    return;
+  }
+  if (renderMode === 'volume') return;
+
   const canvas = canvases[axis as keyof typeof canvases];
   if (!canvas || !data || data.length === 0) return;
 
@@ -2831,6 +2938,9 @@ window.addEventListener('message', async (e) => {
   viewerConfig.renderBackend = msg.renderBackend || viewerConfig.renderBackend;
   viewerConfig.fullVolumePolicy = msg.fullVolumePolicy || viewerConfig.fullVolumePolicy;
   viewerConfig.nativeAcceleration = msg.nativeAcceleration || viewerConfig.nativeAcceleration;
+  if (msg.renderMode === 'volume' || msg.renderMode === 'slice') {
+    renderMode = msg.renderMode;
+  }
   fullVolumeLoaded = false;
   volumeData = null;
   currentSlices.axial = null;
