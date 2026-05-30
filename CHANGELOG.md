@@ -10,6 +10,14 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.4.0] - 2026-05-30
+
+### Added
+- Chunked Volume data model (`src/nifti/volumeProvider.ts`): abstract `VolumeProvider` class with 64³ chunk-based volume access. Supports `getChunksForSlice()` to identify which chunks are needed for a given slice, `extractSliceFromChunks()` to assemble slices from loaded chunks, and automatic LRU chunk eviction (max 512 chunks). `LocalVolumeProvider` extends this for local `.nii` files with on-demand chunk loading.
+- LOD Pyramid (`src/nifti/lodPyramid.ts`): `LODPyramid` class implementing progressive LOD loading strategy. LOD2 (1/4 resolution) loads in ~50ms, LOD1 (1/2 resolution) in ~200ms, LOD0 (full resolution) in ~1000ms. Each level triggers a callback for progressive rendering, providing a smooth loading experience from low-res preview to full quality.
+
+---
+
 ## [1.3.1] - 2026-05-30
 
 ### Added
