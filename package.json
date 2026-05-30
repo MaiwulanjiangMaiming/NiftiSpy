@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",

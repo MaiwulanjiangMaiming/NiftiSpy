@@ -10,6 +10,15 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.2.2] - 2026-05-30
+
+### Added
+- HTTP/2 multiplexed proxy: `LocalFileProxy` server upgraded from HTTP/1.1 to `http2.createServer()`, enabling concurrent multiplexed requests. Fast scrolling no longer causes request queuing; multiple slice requests are served in parallel over a single connection.
+- GZIP index for random access (`src/io/gzipIndex.ts`): zran-style GZIP index builder that scans the compressed stream once and records deflate block boundaries with 32KB sliding window snapshots. Subsequent slice requests for `.nii.gz` files use the index to decompress only the needed range, avoiding full-file decompression.
+- Indexed GZIP integration in `LocalFileProxy.handleSlice()`: when a `.nii.gz` file's GZIP index is ready, axial/coronal/sagittal slice extraction uses `extractRangeFromGzipIndex()` for direct random access. Index is built lazily in the background on first slice request.
+
+---
+
 ## [1.2.1] - 2026-05-30
 
 ### Added

@@ -1,4 +1,5 @@
 import * as http from 'http';
+import * as http2 from 'http2';
 import * as fs from 'fs';
 import * as zlib from 'zlib';
 import * as vscode from 'vscode';
@@ -20,6 +21,7 @@ import {
   streamingGunzipPreview,
   streamingHttpGunzipPreview,
 } from './io/compression';
+import { buildGzipIndex, extractRangeFromGzipIndex } from './io/gzipIndex';
 
 interface FileEntry {
   uri: vscode.Uri;
@@ -32,15 +34,24 @@ interface FileEntry {
   sliceCache?: Map<string, { data: Buffer; timestamp: number }>;
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
   pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
+  gzipIndex?: GzipIndexEntry[];
+  gzipIndexBuilding?: boolean;
+}
+
+interface GzipIndexEntry {
+  compressedOffset: number;
+  decompressedOffset: number;
+  windowBits: Uint8Array | null;
 }
 
 export class LocalFileProxy {
-  private server: http.Server | null = null;
+  private server: http2.Http2Server | http.Server | null = null;
   private port = 0;
   private files = new Map<string, FileEntry>();
   private idCounter = 0;
   private cleanupInterval: NodeJS.Timeout | null = null;
   private volumeCache: VolumeCache | null;
+  private useHttp2 = false;
 
   constructor(volumeCache?: VolumeCache) {
     this.volumeCache = volumeCache || null;
@@ -48,7 +59,13 @@ export class LocalFileProxy {
 
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.server = http.createServer(this.handleRequest.bind(this));
+      try {
+        this.server = http2.createServer(this.handleRequest.bind(this) as any);
+        this.useHttp2 = true;
+      } catch {
+        this.server = http.createServer(this.handleRequest.bind(this));
+        this.useHttp2 = false;
+      }
       this.server.listen(0, '127.0.0.1', () => {
         const addr = this.server!.address() as { port: number };
         this.port = addr.port;
@@ -100,62 +117,65 @@ export class LocalFileProxy {
   }
 
   private async handleRequest(
-    req: http.IncomingMessage,
-    res: http.ServerResponse
+    req: http.IncomingMessage | http2.Http2ServerRequest,
+    res: http.ServerResponse | http2.Http2ServerResponse
   ): Promise<void> {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding');
-    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Keep-Alive', 'timeout=30, max=100');
+    const _req = req as http.IncomingMessage;
+    const _res = res as http.ServerResponse;
 
-    if (req.method === 'OPTIONS') {
-      res.writeHead(204);
-      res.end();
+    _res.setHeader('Access-Control-Allow-Origin', '*');
+    _res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding');
+    _res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding');
+    _res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    _res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+    _res.setHeader('Connection', 'keep-alive');
+    _res.setHeader('Keep-Alive', 'timeout=30, max=100');
+
+    if (_req.method === 'OPTIONS') {
+      _res.writeHead(204);
+      _res.end();
       return;
     }
 
-    const headerMatch = req.url?.match(/^\/header\/(\d+)$/);
-    const previewMatch = req.url?.match(/^\/preview\/(\d+)$/);
-    const previewBinMatch = req.url?.match(/^\/preview-bin\/(\d+)$/);
-    const sliceMatch = req.url?.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
-    const lodMatch = req.url?.match(/^\/lod\/(\d+)\/(\d+)$/);
-    const fileMatch = req.url?.match(/^\/file\/(\d+)$/);
+    const headerMatch = _req.url?.match(/^\/header\/(\d+)$/);
+    const previewMatch = _req.url?.match(/^\/preview\/(\d+)$/);
+    const previewBinMatch = _req.url?.match(/^\/preview-bin\/(\d+)$/);
+    const sliceMatch = _req.url?.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
+    const lodMatch = _req.url?.match(/^\/lod\/(\d+)\/(\d+)$/);
+    const fileMatch = _req.url?.match(/^\/file\/(\d+)$/);
     const match = headerMatch || previewMatch || previewBinMatch || sliceMatch || lodMatch || fileMatch;
     if (!match) {
-      res.writeHead(404);
-      res.end();
+      _res.writeHead(404);
+      _res.end();
       return;
     }
 
     const entry = this.files.get(match[1]);
     if (!entry) {
-      res.writeHead(404);
-      res.end('File not found');
+      _res.writeHead(404);
+      _res.end('File not found');
       return;
     }
 
     try {
       if (headerMatch) {
-        await this.handleHeader(entry, res, req);
+        await this.handleHeader(entry, _res, _req);
         return;
       }
       if (previewMatch) {
-        await this.handlePreview(entry, res, req);
+        await this.handlePreview(entry, _res, _req);
         return;
       }
       if (previewBinMatch) {
-        await this.handlePreviewBinary(entry, res, req);
+        await this.handlePreviewBinary(entry, _res, _req);
         return;
       }
       if (sliceMatch) {
-        await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), res, req);
+        await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), _res, _req);
         return;
       }
       if (lodMatch) {
-        await this.handleLOD(entry, parseInt(lodMatch[2]), res, req);
+        await this.handleLOD(entry, parseInt(lodMatch[2]), _res, _req);
         return;
       }
 
@@ -165,12 +185,12 @@ export class LocalFileProxy {
       }
       const totalSize = entry.size!;
 
-      const rangeHeader = req.headers['range'];
+      const rangeHeader = _req.headers['range'];
       if (rangeHeader) {
         const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
         if (!m) {
-          res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
-          res.end();
+          _res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
+          _res.end();
           return;
         }
         const start = parseInt(m[1]);
@@ -179,56 +199,56 @@ export class LocalFileProxy {
 
         const fsPath = entry.uri.fsPath;
         if (fsPath) {
-          res.writeHead(206, {
+          _res.writeHead(206, {
             'Content-Range': `bytes ${start}-${end}/${totalSize}`,
             'Content-Length': chunkSize,
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
           });
-          fs.createReadStream(fsPath, { start, end }).pipe(res);
+          fs.createReadStream(fsPath, { start, end }).pipe(_res);
         } else {
           entry.lastAccess = Date.now();
           if (!entry.dataCache) {
             entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
           }
           const chunk = entry.dataCache.slice(start, end + 1);
-          res.writeHead(206, {
+          _res.writeHead(206, {
             'Content-Range': `bytes ${start}-${end}/${totalSize}`,
             'Content-Length': chunkSize,
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
           });
-          res.end(Buffer.from(chunk));
+          _res.end(Buffer.from(chunk));
         }
       } else {
         const fsPath = entry.uri.fsPath;
-        const shouldCompress = (req.headers['accept-encoding'] || '').includes('gzip');
+        const shouldCompress = (_req.headers['accept-encoding'] || '').includes('gzip');
         if (fsPath && !shouldCompress) {
-          res.writeHead(200, {
+          _res.writeHead(200, {
             'Content-Length': totalSize,
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
           });
-          fs.createReadStream(fsPath).pipe(res);
+          fs.createReadStream(fsPath).pipe(_res);
         } else if (fsPath && shouldCompress) {
-          res.writeHead(200, {
+          _res.writeHead(200, {
             'Content-Encoding': 'gzip',
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
           });
-          fs.createReadStream(fsPath).pipe(zlib.createGzip({ level: 1 })).pipe(res);
+          fs.createReadStream(fsPath).pipe(zlib.createGzip({ level: 1 })).pipe(_res);
         } else {
           entry.lastAccess = Date.now();
           if (!entry.dataCache) {
             entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
           }
-          compressResponse(Buffer.from(entry.dataCache), req, res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
+          compressResponse(Buffer.from(entry.dataCache), _req, _res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
         }
       }
     } catch (err) {
       console.error('LocalFileProxy error:', err);
-      res.writeHead(500);
-      res.end(String(err));
+      _res.writeHead(500);
+      _res.end(String(err));
     }
   }
 
@@ -544,6 +564,118 @@ export class LocalFileProxy {
           compressResponse(buf, req, res, 'application/octet-stream');
           return;
         }
+      }
+
+      if (fsPath && isGzip && entry.gzipIndex) {
+        if (!entry.headerCache) {
+          const { header } = await this.loadFileData(entry);
+          if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
+        }
+        const header = entry.headerCache;
+        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+
+        try {
+          let sliceStart: number;
+          let sliceSize: number;
+
+          if (axis === 'axial') {
+            sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
+            sliceSize = nx * ny * bytesPerVoxel;
+          } else if (axis === 'coronal') {
+            sliceStart = voxOffset + idx * nx * bytesPerVoxel;
+            sliceSize = nx * bytesPerVoxel;
+          } else {
+            sliceStart = voxOffset + idx * bytesPerVoxel;
+            sliceSize = bytesPerVoxel;
+          }
+
+          if (axis === 'axial') {
+            const sliceBytes = await extractRangeFromGzipIndex(fsPath, entry.gzipIndex, sliceStart, sliceStart + sliceSize);
+            const slice = extractAxialSliceFromRange(sliceBytes, header);
+            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+            compressResponse(buf, req, res, 'application/octet-stream');
+            return;
+          }
+
+          if (axis === 'coronal') {
+            const slice = new Float32Array(nx * nz);
+            const bpv = Math.max(1, header.bitpix / 8);
+            const le = header.littleEndian;
+            const slope = header.scl_slope || 1;
+            const inter = header.scl_inter || 0;
+            for (let z = 0; z < nz; z++) {
+              const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bytesPerVoxel;
+              const rowBytes = await extractRangeFromGzipIndex(fsPath, entry.gzipIndex, rowOffset, rowOffset + nx * bpv);
+              const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
+              for (let x = 0; x < nx; x++) {
+                const off = x * bpv;
+                let val: number;
+                switch (header.datatype) {
+                  case 2: val = rowBytes[off]; break;
+                  case 4: val = view.getInt16(off, le); break;
+                  case 8: val = view.getInt32(off, le); break;
+                  case 16: val = view.getFloat32(off, le); break;
+                  case 64: val = view.getFloat64(off, le); break;
+                  case 256: val = (rowBytes[off] << 24) >> 24; break;
+                  case 512: val = view.getUint16(off, le); break;
+                  case 768: val = view.getUint32(off, le); break;
+                  default: val = 0;
+                }
+                slice[z * nx + x] = val * slope + inter;
+              }
+            }
+            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+            compressResponse(buf, req, res, 'application/octet-stream');
+            return;
+          }
+
+          {
+            const slice = new Float32Array(ny * nz);
+            const bpv = Math.max(1, header.bitpix / 8);
+            const le = header.littleEndian;
+            const slope = header.scl_slope || 1;
+            const inter = header.scl_inter || 0;
+            for (let z = 0; z < nz; z++) {
+              const axialOffset = voxOffset + z * nx * ny * bytesPerVoxel;
+              const axialBytes = await extractRangeFromGzipIndex(fsPath, entry.gzipIndex, axialOffset, axialOffset + nx * ny * bpv);
+              const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
+              for (let y = 0; y < ny; y++) {
+                const off = (y * nx + idx) * bpv;
+                let val: number;
+                switch (header.datatype) {
+                  case 2: val = axialBytes[off]; break;
+                  case 4: val = view.getInt16(off, le); break;
+                  case 8: val = view.getInt32(off, le); break;
+                  case 16: val = view.getFloat32(off, le); break;
+                  case 64: val = view.getFloat64(off, le); break;
+                  case 256: val = (axialBytes[off] << 24) >> 24; break;
+                  case 512: val = view.getUint16(off, le); break;
+                  case 768: val = view.getUint32(off, le); break;
+                  default: val = 0;
+                }
+                slice[z * ny + y] = val * slope + inter;
+              }
+            }
+            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+            compressResponse(buf, req, res, 'application/octet-stream');
+            return;
+          }
+        } catch {
+          // fall through to full decompression path
+        }
+      }
+
+      if (fsPath && isGzip && !entry.gzipIndex && !entry.gzipIndexBuilding) {
+        entry.gzipIndexBuilding = true;
+        buildGzipIndex(fsPath).then(idx => {
+          entry.gzipIndex = idx;
+          entry.gzipIndexBuilding = false;
+        }).catch(() => {
+          entry.gzipIndexBuilding = false;
+        });
       }
 
       const uriStr = entry.uri.toString();
