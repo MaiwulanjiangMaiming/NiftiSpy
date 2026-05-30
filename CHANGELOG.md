@@ -10,6 +10,16 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.2.1] - 2026-05-30
+
+### Added
+- SharedArrayBuffer zero-copy communication: when the browser supports `SharedArrayBuffer` (requires COOP/COEP headers), volume data is placed in a `SharedArrayBuffer` and broadcast to all Web Workers. Workers can extract slices directly from shared memory without data copying or network requests.
+- COOP/COEP headers: HTTP proxy server (`LocalFileProxy.ts`) sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` response headers to enable `SharedArrayBuffer` in the extension webview.
+- COOP/COEP meta tags: `NiiEditorProvider.ts` adds `<meta http-equiv="Cross-Origin-Opener-Policy">` and `<meta http-equiv="Cross-Origin-Embedder-Policy">` tags as a fallback for environments where HTTP headers cannot be set.
+- SAB-aware Worker slice extraction: when `sharedVolume` is available and `factor === 1`, the Worker extracts slices directly from the shared Float32Array buffer (axial/coronal/sagittal), bypassing network I/O entirely.
+
+---
+
 ## [1.2.0] - 2026-05-28
 
 ### Added

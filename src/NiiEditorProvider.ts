@@ -524,6 +524,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+<meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
 <meta http-equiv="Content-Security-Policy"
   content="default-src 'none';
            script-src ${webview.cspSource} 'unsafe-inline' 'unsafe-eval' blob:;

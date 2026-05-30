@@ -52,6 +52,22 @@ let compareMode = false;
 
 let header: NiiHeader | null = null;
 let volumeData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | null = null;
+let sharedVolumeBuffer: SharedArrayBuffer | null = null;
+let sabAvailable = false;
+
+try { sabAvailable = typeof SharedArrayBuffer !== 'undefined'; } catch { sabAvailable = false; }
+
+function createSharedVolumeBuffer(data: Float32Array): SharedArrayBuffer | null {
+  if (!sabAvailable) return null;
+  try {
+    const sab = new SharedArrayBuffer(data.byteLength);
+    const view = new Float32Array(sab);
+    view.set(data);
+    return sab;
+  } catch {
+    return null;
+  }
+}
 let dataSlope = 1;
 let dataInter = 0;
 let globalMin = 0;
@@ -1108,6 +1124,16 @@ function tryUploadVolume3D() {
   } else {
     float32Data = new Float32Array(n);
     for (let i = 0; i < n; i++) float32Data[i] = (volumeData as any)[i] * dataSlope + dataInter;
+  }
+
+  sharedVolumeBuffer = createSharedVolumeBuffer(float32Data);
+  if (sharedVolumeBuffer) {
+    broadcastToSliceWorkers({
+      type: 'sharedVolume',
+      buffer: sharedVolumeBuffer,
+      nx, ny, nz,
+      slope: dataSlope, inter: dataInter,
+    });
   }
 
   for (const axis of ['axial', 'coronal', 'sagittal'] as const) {

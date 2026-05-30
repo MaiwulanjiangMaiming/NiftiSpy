@@ -19,6 +19,8 @@ interface CachedSlice {
 
 const sliceCache = new Map<string, CachedSlice>();
 
+let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number } | null = null;
+
 self.onmessage = async (e: MessageEvent) => {
   const { id, type, url, isGzip } = e.data;
   try {
@@ -30,6 +32,15 @@ self.onmessage = async (e: MessageEvent) => {
       cancelVolumeLoad(id);
     } else if (type === 'fetchSlice') {
       await handleFetchSlice(e.data);
+    } else if (type === 'sharedVolume') {
+      sharedVolume = {
+        buffer: e.data.buffer as SharedArrayBuffer,
+        nx: e.data.nx,
+        ny: e.data.ny,
+        nz: e.data.nz,
+        slope: e.data.slope ?? 1,
+        inter: e.data.inter ?? 0,
+      };
     }
   } catch (err: any) {
     if (err?.name === 'AbortError') {
@@ -180,6 +191,54 @@ async function handleFetchSlice(message: {
   maxIndex?: number;
 }): Promise<void> {
   const factor = Math.max(1, message.factor || 1);
+
+  if (sharedVolume && factor === 1) {
+    const { buffer, nx, ny, nz, slope, inter } = sharedVolume;
+    const data = new Float32Array(buffer);
+    const idx = message.index;
+    let sliceData: Float32Array;
+    let w: number, h: number;
+
+    if (message.axis === 'axial') {
+      w = nx; h = ny;
+      sliceData = new Float32Array(nx * ny);
+      const base = idx * ny * nx;
+      for (let i = 0; i < nx * ny; i++) {
+        sliceData[i] = data[base + i] * slope + inter;
+      }
+    } else if (message.axis === 'coronal') {
+      w = nx; h = nz;
+      sliceData = new Float32Array(nx * nz);
+      for (let z = 0; z < nz; z++) {
+        const base = z * ny * nx + idx * nx;
+        for (let x = 0; x < nx; x++) {
+          sliceData[z * nx + x] = data[base + x] * slope + inter;
+        }
+      }
+    } else {
+      w = ny; h = nz;
+      sliceData = new Float32Array(ny * nz);
+      for (let z = 0; z < nz; z++) {
+        const base = z * ny * nx;
+        for (let y = 0; y < ny; y++) {
+          sliceData[z * ny + y] = data[base + y * nx + idx] * slope + inter;
+        }
+      }
+    }
+
+    self.postMessage({
+      id: message.id,
+      type: 'slice',
+      axis: message.axis,
+      index: message.index,
+      factor,
+      width: w,
+      height: h,
+      data: sliceData,
+    }, [sliceData.buffer]);
+    return;
+  }
+
   const slice = await fetchSlice(message.url, message.axis, message.index, factor);
   const payload = new Float32Array(slice.data);
   self.postMessage({
