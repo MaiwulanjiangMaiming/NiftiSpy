@@ -10,6 +10,17 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.3.1] - 2026-05-30
+
+### Added
+- Multi-level cache architecture with hit/miss statistics: L1 (GPU texture, managed by WebGL/WebGPU renderer), L2 (in-memory LRU `sliceCache`), L3 (IndexedDB disk cache with LRU eviction, max 500MB), L4 (remote fetch).
+- Cache statistics API (`webview/cache.ts`): `recordCacheHit()`, `recordCacheMiss()`, `recordL4Fetch()`, `getCacheStats()`, `resetCacheStats()`, `getCacheSize()` for monitoring cache effectiveness at each level.
+- IndexedDB cache touch-on-read: `getCachedChunk()` now updates the `timestamp` field on read, improving LRU accuracy for frequently accessed slices.
+- IndexedDB meta store: new `meta` object store for key-value metadata (e.g., ETag, Last-Modified headers for cache validation).
+- Worker cache instrumentation: `fetchSlice` in `worker.ts` now records L3 hit/miss and L4 fetch events for cache statistics.
+
+---
+
 ## [1.3.0] - 2026-05-30
 
 ### Added

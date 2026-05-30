@@ -1,6 +1,6 @@
 import { gunzip } from 'fflate';
 import { parseNiiHeader } from './nii-parser';
-import { getCachedChunk, setCachedChunk, makeCacheKey } from './cache';
+import { getCachedChunk, setCachedChunk, makeCacheKey, recordCacheHit, recordCacheMiss, recordL4Fetch } from './cache';
 
 const MAX_RETRIES = 3;
 const CHUNK_SIZE = 4 * 1024 * 1024;
@@ -141,13 +141,16 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     const idbKey = makeCacheKey(url, axis, index);
     const idbData = await getCachedChunk(idbKey);
     if (idbData) {
+      recordCacheHit('l3');
       const data = new Float32Array(idbData);
       const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
       setCachedSlice(url, axis, index, factor, slice);
       return slice;
     }
+    recordCacheMiss('l3');
 
     const startedAt = performance.now();
+    recordL4Fetch();
     const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor));
     if (!resp.ok) {
       throw new Error(`Slice fetch failed: ${resp.status}`);
