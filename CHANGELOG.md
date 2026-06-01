@@ -10,6 +10,15 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.5.1] - 2026-06-01
+
+### Fixed
+- **Overlay display**: `paintOverlaySlice()` now correctly uses the pre-registered `data1` parameter instead of re-extracting slices via `resampleOverlaySlice()`, ensuring both images display simultaneously with proper spatial registration.
+- **SBS registration**: `paintSideBySideSlice()` now uses unified physical extent (`max(pw0, pw1)`, `max(ph0, ph1)`) for both images, ensuring consistent anatomical scale and correct crosshair alignment when comparing volumes with different resolutions or slice thickness.
+- **Auto Contrast on load**: Removed automatic data-driven window/level calculation in `handleCachedVolume()`. W/L now defaults to `[0, 1]` on initial load; users must click "Auto Contrast" to apply data-driven W/L.
+
+---
+
 ## [1.5.0] - 2026-05-30
 
 ### Added

@@ -2363,10 +2363,13 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   const dh = container.clientHeight;
   if (dw === 0 || dh === 0) return;
 
-  const ar0 = pw0 / ph0;
+  // Use unified physical extent for consistent overlay alignment
+  const unifiedPW = Math.max(pw0, pw1);
+  const unifiedPH = Math.max(ph0, ph1);
+  const ar = unifiedPW / unifiedPH;
   let cw: number, ch: number;
-  if (dw / dh > ar0) { ch = dh; cw = Math.floor(dh * ar0); }
-  else { cw = dw; ch = Math.floor(dw / ar0); }
+  if (dw / dh > ar) { ch = dh; cw = Math.floor(dh * ar); }
+  else { cw = dw; ch = Math.floor(dw / ar); }
   cw = Math.floor(cw * zoom);
   ch = Math.floor(ch * zoom);
 
@@ -2386,6 +2389,7 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   const offsetX = (canvas.width - cw * dpr) / 2;
   const offsetY = (canvas.height + ch * dpr) / 2;
 
+  // Draw base image (img0) scaled to unified physical extent
   ctx.save();
   ctx.translate(offsetX, offsetY);
   ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
@@ -2393,21 +2397,16 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   ctx.drawImage(tc0, 0, 0);
   ctx.restore();
 
-  if (img1.data) {
-    const resampled = resampleOverlaySlice(img0, img1, axis as 'axial' | 'coronal' | 'sagittal',
-      axis === 'axial' ? sliceIdx.axial : axis === 'coronal' ? sliceIdx.coronal : sliceIdx.sagittal);
-    if (resampled && resampled.length > 0) {
-      const i1min = img1.min;
-      const i1max = img1.max;
-      const tc1 = renderSliceToTempCanvas(resampled, w0, h0_, i1min, i1max, overlayColormap);
+  // Draw overlay image (img1) using pre-registered data1
+  if (data1 && data1.length > 0) {
+    const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, overlayColormap);
 
-      ctx.save();
-      ctx.translate(offsetX, offsetY);
-      ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
-      ctx.globalAlpha = overlayOpacity;
-      ctx.drawImage(tc1, 0, 0);
-      ctx.restore();
-    }
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(cw * dpr / w1, -ch * dpr / h1_);
+    ctx.globalAlpha = overlayOpacity;
+    ctx.drawImage(tc1, 0, 0);
+    ctx.restore();
   }
 
   ctx.globalAlpha = 1.0;
@@ -2435,19 +2434,17 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
 
   const halfW = Math.floor(dw / 2);
 
-  const ar0 = pw0 / ph0;
-  let cw0: number, ch0: number;
-  if (halfW / dh > ar0) { ch0 = dh; cw0 = Math.floor(dh * ar0); }
-  else { cw0 = halfW; ch0 = Math.floor(halfW / ar0); }
-  cw0 = Math.floor(cw0 * zoom);
-  ch0 = Math.floor(ch0 * zoom);
+  // Unified physical extent for consistent registration display
+  const unifiedPW = Math.max(pw0, pw1);
+  const unifiedPH = Math.max(ph0, ph1);
+  const unifiedAR = unifiedPW / unifiedPH;
 
-  const ar1 = pw1 / ph1;
-  let cw1: number, ch1: number;
-  if (halfW / dh > ar1) { ch1 = dh; cw1 = Math.floor(dh * ar1); }
-  else { cw1 = halfW; ch1 = Math.floor(halfW / ar1); }
-  cw1 = Math.floor(cw1 * zoom);
-  ch1 = Math.floor(ch1 * zoom);
+  // Both images use the same display size based on unified physical extent
+  let cw: number, ch: number;
+  if (halfW / dh > unifiedAR) { ch = dh; cw = Math.floor(dh * unifiedAR); }
+  else { cw = halfW; ch = Math.floor(halfW / unifiedAR); }
+  cw = Math.floor(cw * zoom);
+  ch = Math.floor(ch * zoom);
 
   canvas.style.width = dw + 'px';
   canvas.style.height = dh + 'px';
@@ -2463,19 +2460,21 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const offsetX0 = (halfW * dpr - cw0 * dpr) / 2;
-  const offsetY0 = (dh * dpr + ch0 * dpr) / 2;
+  // Left half: img0 with unified scale
+  const offsetX0 = (halfW * dpr - cw * dpr) / 2;
+  const offsetY0 = (dh * dpr + ch * dpr) / 2;
   ctx.save();
   ctx.translate(offsetX0, offsetY0);
-  ctx.scale(cw0 * dpr / w0, -ch0 * dpr / h0_);
+  ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
   ctx.drawImage(tc0, 0, 0);
   ctx.restore();
 
-  const offsetX1 = halfW * dpr + (halfW * dpr - cw1 * dpr) / 2;
-  const offsetY1 = (dh * dpr + ch1 * dpr) / 2;
+  // Right half: img1 with unified scale (same physical size as img0)
+  const offsetX1 = halfW * dpr + (halfW * dpr - cw * dpr) / 2;
+  const offsetY1 = (dh * dpr + ch * dpr) / 2;
   ctx.save();
   ctx.translate(offsetX1, offsetY1);
-  ctx.scale(cw1 * dpr / w1, -ch1 * dpr / h1_);
+  ctx.scale(cw * dpr / w1, -ch * dpr / h1_);
   ctx.drawImage(tc1, 0, 0);
   ctx.restore();
 
@@ -2500,10 +2499,11 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
     const cx0 = sliceX0 / (nx0 - 1 || 1);
     const cy0 = sliceY0 / (ny0 - 1 || 1);
 
-    const imgLeft0 = (halfW - cw0) / 2 - vs.panX;
-    const imgTop0 = (dh - ch0) / 2 - vs.panY;
-    const sx0 = (imgLeft0 + cx0 * cw0) * dpr;
-    const sy0 = (imgTop0 + (1 - cy0) * ch0) * dpr;
+    // Use unified cw/ch for crosshair positioning
+    const imgLeft0 = (halfW - cw) / 2 - vs.panX;
+    const imgTop0 = (dh - ch) / 2 - vs.panY;
+    const sx0 = (imgLeft0 + cx0 * cw) * dpr;
+    const sy0 = (imgTop0 + (1 - cy0) * ch) * dpr;
 
     ctx.strokeStyle = 'rgba(255,0,0,0.6)';
     ctx.lineWidth = 1 * dpr;
@@ -2524,10 +2524,11 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
     const cx1 = Math.max(0, Math.min(1, sliceX1 / (nx1 - 1 || 1)));
     const cy1 = Math.max(0, Math.min(1, sliceY1 / (ny1 - 1 || 1)));
 
-    const imgLeft1 = halfW + (halfW - cw1) / 2 - vs.panX;
-    const imgTop1 = (dh - ch1) / 2 - vs.panY;
-    const sx1 = (imgLeft1 + cx1 * cw1) * dpr;
-    const sy1 = (imgTop1 + (1 - cy1) * ch1) * dpr;
+    // Use unified cw/ch for crosshair positioning
+    const imgLeft1 = halfW + (halfW - cw) / 2 - vs.panX;
+    const imgTop1 = (dh - ch) / 2 - vs.panY;
+    const sx1 = (imgLeft1 + cx1 * cw) * dpr;
+    const sy1 = (imgTop1 + (1 - cy1) * ch) * dpr;
 
     ctx.strokeStyle = 'rgba(255,200,0,0.6)';
     ctx.lineWidth = 1 * dpr;
@@ -2542,8 +2543,8 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   if (htmlCrosshair) htmlCrosshair.style.display = 'none';
 
   updateDirectionLabels(axis);
-  updateScaleBar(axis, pw0, ph0, zoom, cw0);
-  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw0, ch0);
+  updateScaleBar(axis, pw0, ph0, zoom, cw);
+  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch);
 }
 
 function paintMIP() {
@@ -3068,29 +3069,10 @@ function handleCachedVolume(msg: any): void {
     return;
   }
 
-  const { nx, ny, nz } = header!;
-  const n = nx * ny * nz;
-
-  const s = dataSlope;
-  const t = dataInter;
-  const sampleSize = Math.min(10000, n);
-  const step = Math.max(1, Math.floor(n / sampleSize));
-  const samples: number[] = [];
-  for (let i = 0; i < n; i += step) {
-    samples.push((volumeData as any)[i] * s + t);
-  }
-  samples.sort((a, b) => a - b);
-  const p1Idx = Math.floor(samples.length * 0.01);
-  const p99Idx = Math.floor(samples.length * 0.99);
-  const p1 = samples[p1Idx];
-  const p99 = samples[p99Idx];
-  const range = globalMax - globalMin || 1;
-  windowLevel = ((p1 + p99) / 2 - globalMin) / range;
-  windowWidth = (p99 - p1) / range;
-  if (windowWidth <= 0 || !isFinite(windowWidth) || !isFinite(windowLevel)) {
-    windowWidth = 1.0;
-    windowLevel = 0.5;
-  }
+  // Keep default window/level [0, 1] range on initial load
+  // User can click "Auto Contrast" button to apply data-driven W/L
+  windowWidth = 1.0;
+  windowLevel = 0.5;
 
   const wwSlider = document.getElementById('ww-slider') as HTMLInputElement;
   const wlSlider = document.getElementById('wl-slider') as HTMLInputElement;
