@@ -44,9 +44,12 @@ interface PerformanceProfile {
   tier: 'high' | 'medium' | 'low';
   gpuAvailable: boolean;
   maxTextureSize: number;
+  max3DTextureSize: number;
   cores: number;
   memoryMB: number;
 }
+
+type RenderBackend = 'webgpu' | 'webgl3d' | 'webgl2d' | 'canvas2d';
 
 const images: VolumeImage[] = [];
 let activeImageIdx = 0;
@@ -188,6 +191,34 @@ const glRenderers: Partial<Record<Axis | 'mip', WebGLRenderer>> = {};
 const webgpuRenderers: Partial<Record<Axis, WebGPURenderer>> = {};
 let webgpuAvailable = false;
 let webgpuChecked = false;
+let renderBackend: RenderBackend = 'canvas2d';
+
+function detectBestRenderBackend(): RenderBackend {
+  // 1. Check WebGPU availability
+  if (WebGPURenderer && typeof WebGPURenderer.isAvailable === 'function') {
+    // WebGPU check is async; we do a synchronous heuristic first
+    if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
+      return 'webgpu'; // will be validated asynchronously in getOrCreateWebGPURenderer
+    }
+  }
+  // 2. Check WebGL2 3D texture support
+  try {
+    const testCanvas = document.createElement('canvas');
+    const gl2 = testCanvas.getContext('webgl2') as WebGL2RenderingContext | null;
+    if (gl2) {
+      const max3D = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE) || 0;
+      if (max3D >= 256) {
+        return 'webgl3d';
+      }
+      // 3. WebGL2 available but no 3D texture
+      return 'webgl2d';
+    }
+  } catch { }
+  // 4. Fallback to Canvas 2D
+  return 'canvas2d';
+}
+
+renderBackend = detectBestRenderBackend();
 
 let volumeRaycaster: VolumeRaycaster | null = null;
 let renderMode: 'slice' | 'volume' = 'slice';
@@ -747,12 +778,16 @@ function detectPerformance(): PerformanceProfile {
 
   let gpuAvailable = false;
   let maxTextureSize = 4096;
+  let max3DTextureSize = 0;
   try {
     const testCanvas = document.createElement('canvas');
     const gl = testCanvas.getContext('webgl2') || testCanvas.getContext('webgl');
     if (gl) {
       gpuAvailable = true;
       maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) || 4096;
+      if (gl instanceof WebGL2RenderingContext) {
+        max3DTextureSize = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) || 0;
+      }
     }
   } catch { }
 
@@ -765,7 +800,7 @@ function detectPerformance(): PerformanceProfile {
     tier = 'low';
   }
 
-  return { tier, gpuAvailable, maxTextureSize, cores, memoryMB };
+  return { tier, gpuAvailable, maxTextureSize, max3DTextureSize, cores, memoryMB };
 }
 
 function voxelToWorld(h: NiiHeader, vx: number, vy: number, vz: number): [number, number, number] {
@@ -1131,6 +1166,15 @@ function tryUploadVolume3D() {
   if (!volumeData || !header) return;
   const { nx, ny, nz } = header;
   const n = nx * ny * nz;
+  const estimatedBytes = n * 4; // Float32 = 4 bytes per voxel
+
+  // Skip 3D texture upload if volume exceeds 1GB to prevent GPU OOM
+  const VOLUME_3D_MAX_BYTES = 1 * 1024 * 1024 * 1024; // 1GB
+  const skipVolume3D = estimatedBytes > VOLUME_3D_MAX_BYTES;
+  if (skipVolume3D) {
+    console.log(`[NiftiSpy] Skipping 3D texture upload: volume size ${(estimatedBytes / (1024 * 1024)).toFixed(0)}MB exceeds 1GB limit`);
+  }
+
   let float32Data: Float32Array;
   if (volumeData instanceof Float32Array) {
     float32Data = volumeData;
@@ -1149,16 +1193,18 @@ function tryUploadVolume3D() {
     });
   }
 
-  for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
-    const r = glRenderers[axis];
-    if (r) {
-      if (!r.isVolume3DReady()) {
-        r.uploadVolume3D(float32Data, nx, ny, nz);
+  if (!skipVolume3D) {
+    for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+      const r = glRenderers[axis];
+      if (r) {
+        if (!r.isVolume3DReady()) {
+          r.uploadVolume3D(float32Data, nx, ny, nz);
+        }
       }
-    }
-    const wgr = webgpuRenderers[axis];
-    if (wgr && wgr.isReady()) {
-      wgr.uploadVolume3D(float32Data, nx, ny, nz);
+      const wgr = webgpuRenderers[axis];
+      if (wgr && wgr.isReady()) {
+        wgr.uploadVolume3D(float32Data, nx, ny, nz);
+      }
     }
   }
 
@@ -1767,14 +1813,15 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   const renderer = getOrCreateRenderer(axis as Axis);
   const flips = viewFlips[axis] || { flipX: false, flipY: false };
 
-  if (!webgpuChecked) {
+  if (renderBackend === 'webgpu' && !webgpuChecked) {
     getOrCreateWebGPURenderer(axis as Axis).then(() => {});
   }
 
-  if (renderer && renderer.isVolume3DReady() && header) {
+  // Try 3D texture paths (WebGPU or WebGL2) when volume is uploaded
+  if (renderBackend !== 'canvas2d' && renderBackend !== 'webgl2d' && renderer && renderer.isVolume3DReady() && header) {
     const axisIdx = axis === 'axial' ? 0 : axis === 'coronal' ? 1 : 2;
     const webgpuRenderer = webgpuRenderers[axis as Axis];
-    if (webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
+    if (renderBackend === 'webgpu' && webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
       axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz,
       windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY
     )) {
@@ -1795,7 +1842,8 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   }
 
   // Fallback to 2D rendering when volume3D is not ready (still loading) or 3D path failed
-  if (renderer && data && data.length > 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
+  // renderSlice() handles zoom/pan via canvas transform, so no zoom/pan restriction needed
+  if (renderBackend !== 'canvas2d' && renderer && data && data.length > 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
     updateDirectionLabels(axis);
     updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
     updateScaleBar(axis, pixelW, pixelH, zoom, cw);

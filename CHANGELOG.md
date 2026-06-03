@@ -10,6 +10,18 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.5.3] - 2026-06-03
+
+### Added
+- **Rendering backend auto-selection**: New `detectBestRenderBackend()` function that probes WebGPU → WebGL2 3D texture → WebGL2 2D → Canvas 2D in priority order. The detected `renderBackend` is stored globally and used in `paintSlice()` to skip unnecessary capability checks on every frame.
+- **Performance profile detection**: `detectPerformance()` now also probes `MAX_3D_TEXTURE_SIZE` from the WebGL2 context and stores it in the `PerformanceProfile` object. This is used to decide whether 3D texture upload is feasible on the current GPU.
+- **Smart volume upload**: `tryUploadVolume3D()` now checks estimated volume size (nx × ny × nz × 4 bytes) before uploading to GPU. Volumes exceeding 1GB skip 3D texture upload entirely, preventing GPU out-of-memory crashes on large datasets.
+
+### Changed
+- **paintSlice() rendering dispatch**: The rendering path selection now uses the pre-detected `renderBackend` variable instead of re-checking WebGPU availability every frame. WebGPU renderer initialization is only attempted when `renderBackend === 'webgpu'`. The 2D WebGL2 fallback path (`renderer.renderSlice()`) is always attempted for non-canvas2d backends regardless of zoom/pan state, since `renderSlice()` handles transforms via the canvas context.
+
+---
+
 ## [1.5.2] - 2026-06-03
 
 ### Changed
