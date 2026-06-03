@@ -44,6 +44,28 @@ interface GzipIndexEntry {
   windowBits: Uint8Array | null;
 }
 
+interface ConnectionStats {
+  protocol: 'h2' | 'http/1.1';
+  activeStreams: number;
+  totalRequests: number;
+  pushedSlices: number;
+}
+
+interface PrioritizedRequest {
+  priority: number;
+  execute: () => Promise<void>;
+}
+
+const REQUEST_PRIORITY = {
+  header: 100,
+  preview: 80,
+  previewBin: 80,
+  slice: 50,
+  lod: 20,
+  file: 10,
+  stats: 0,
+} as const;
+
 export class LocalFileProxy {
   private server: http2.Http2Server | http.Server | null = null;
   private port = 0;
@@ -52,6 +74,11 @@ export class LocalFileProxy {
   private cleanupInterval: NodeJS.Timeout | null = null;
   private volumeCache: VolumeCache | null;
   private useHttp2 = false;
+  private stats: ConnectionStats = { protocol: 'http/1.1', activeStreams: 0, totalRequests: 0, pushedSlices: 0 };
+  private recentSliceRequests = new Map<string, number>(); // key -> timestamp
+  private priorityQueue: PrioritizedRequest[] = [];
+  private priorityProcessing = false;
+  private activeStreamCount = 0;
 
   constructor(volumeCache?: VolumeCache) {
     this.volumeCache = volumeCache || null;
@@ -60,11 +87,17 @@ export class LocalFileProxy {
   async start(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
-        this.server = http2.createServer(this.handleRequest.bind(this) as any);
+        const h2Server = http2.createServer();
+        h2Server.on('stream', (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+          this.handleHttp2Stream(stream, headers);
+        });
+        this.server = h2Server;
         this.useHttp2 = true;
+        this.stats.protocol = 'h2';
       } catch {
-        this.server = http.createServer(this.handleRequest.bind(this));
+        this.server = http.createServer(this.handleRequest.bind(this) as any);
         this.useHttp2 = false;
+        this.stats.protocol = 'http/1.1';
       }
       this.server.listen(0, '127.0.0.1', () => {
         const addr = this.server!.address() as { port: number };
@@ -94,6 +127,10 @@ export class LocalFileProxy {
       }
       this.volumeCache?.cleanup();
       this.volumeCache?.evictIfNeeded();
+      // Prune stale recent slice request tracking
+      for (const [key, ts] of this.recentSliceRequests.entries()) {
+        if (now - ts > 30000) this.recentSliceRequests.delete(key);
+      }
     }, 30000);
   }
 
@@ -114,6 +151,171 @@ export class LocalFileProxy {
 
   getEntry(entryId: string): FileEntry | undefined {
     return this.files.get(entryId);
+  }
+
+  private enqueueRequest(priority: number, execute: () => Promise<void>): void {
+    this.priorityQueue.push({ priority, execute });
+    this.priorityQueue.sort((a, b) => b.priority - a.priority);
+    this.processPriorityQueue();
+  }
+
+  private processPriorityQueue(): void {
+    if (this.priorityProcessing) return;
+    this.priorityProcessing = true;
+    const next = () => {
+      if (this.priorityQueue.length === 0) {
+        this.priorityProcessing = false;
+        return;
+      }
+      const job = this.priorityQueue.shift()!;
+      job.execute().then(next).catch(next);
+    };
+    next();
+  }
+
+  private handleHttp2Stream(stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders): void {
+    const path = headers[':path'] || '';
+    const method = headers[':method'] || 'GET';
+
+    this.activeStreamCount++;
+    this.stats.activeStreams = this.activeStreamCount;
+    this.stats.totalRequests++;
+
+    stream.on('close', () => {
+      this.activeStreamCount = Math.max(0, this.activeStreamCount - 1);
+      this.stats.activeStreams = this.activeStreamCount;
+    });
+
+    if (method === 'OPTIONS') {
+      stream.respond({
+        ':status': 204,
+        'access-control-allow-origin': '*',
+        'access-control-allow-headers': 'Range, Accept-Encoding',
+        'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding',
+        'cross-origin-opener-policy': 'same-origin',
+        'cross-origin-embedder-policy': 'require-corp',
+      });
+      stream.end();
+      return;
+    }
+
+    const statsMatch = path.match(/^\/stats$/);
+    if (statsMatch) {
+      stream.respond({ ':status': 200, 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+      stream.end(JSON.stringify(this.getStats()));
+      return;
+    }
+
+    const headerMatch = path.match(/^\/header\/(\d+)$/);
+    const previewMatch = path.match(/^\/preview\/(\d+)$/);
+    const previewBinMatch = path.match(/^\/preview-bin\/(\d+)$/);
+    const sliceMatch = path.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
+    const lodMatch = path.match(/^\/lod\/(\d+)\/(\d+)$/);
+    const fileMatch = path.match(/^\/file\/(\d+)$/);
+    const match = headerMatch || previewMatch || previewBinMatch || sliceMatch || lodMatch || fileMatch;
+
+    if (!match) {
+      stream.respond({ ':status': 404, 'access-control-allow-origin': '*' });
+      stream.end();
+      return;
+    }
+
+    const entry = this.files.get(match[1]);
+    if (!entry) {
+      stream.respond({ ':status': 404, 'access-control-allow-origin': '*' });
+      stream.end('File not found');
+      return;
+    }
+
+    const priority = headerMatch ? REQUEST_PRIORITY.header
+      : previewMatch ? REQUEST_PRIORITY.preview
+      : previewBinMatch ? REQUEST_PRIORITY.previewBin
+      : sliceMatch ? REQUEST_PRIORITY.slice
+      : lodMatch ? REQUEST_PRIORITY.lod
+      : REQUEST_PRIORITY.file;
+
+    const h2Headers = {
+      'access-control-allow-origin': '*',
+      'access-control-allow-headers': 'Range, Accept-Encoding',
+      'access-control-expose-headers': 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding',
+      'cross-origin-opener-policy': 'same-origin',
+      'cross-origin-embedder-policy': 'require-corp',
+    };
+
+    const fakeReq = { headers: { 'accept-encoding': (headers['accept-encoding'] as string) || '', 'range': (headers['range'] as string) || '' }, method, url: path } as any as http.IncomingMessage;
+    const h2Response = new Http2ResponseAdapter(stream, h2Headers);
+
+    this.enqueueRequest(priority, async () => {
+      try {
+        if (headerMatch) {
+          await this.handleHeader(entry, h2Response, fakeReq);
+        } else if (previewMatch) {
+          await this.handlePreview(entry, h2Response, fakeReq);
+        } else if (previewBinMatch) {
+          await this.handlePreviewBinary(entry, h2Response, fakeReq);
+        } else if (sliceMatch) {
+          await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), h2Response, fakeReq);
+          // Server push for adjacent slices
+          if (this.useHttp2 && sliceMatch) {
+            this.pushAdjacentSlices(stream, entry, sliceMatch[2], parseInt(sliceMatch[3]));
+          }
+        } else if (lodMatch) {
+          await this.handleLOD(entry, parseInt(lodMatch[2]), h2Response, fakeReq);
+        } else {
+          await this.handleFile(entry, h2Response, fakeReq);
+        }
+      } catch (err) {
+        console.error('LocalFileProxy h2 error:', err);
+        if (!stream.destroyed) {
+          try { stream.respond({ ':status': 500 }); } catch { /* already responded */ }
+          stream.end(String(err));
+        }
+      }
+    });
+  }
+
+  private pushAdjacentSlices(stream: http2.ServerHttp2Stream, entry: FileEntry, axis: string, idx: number): void {
+    const maxIdx = axis === 'axial' ? (entry.headerCache?.nz ?? 0)
+      : axis === 'coronal' ? (entry.headerCache?.ny ?? 0)
+      : (entry.headerCache?.nx ?? 0);
+
+    for (let offset = 1; offset <= 2; offset++) {
+      const pushIdx = idx + offset;
+      if (pushIdx >= maxIdx) break;
+      const pushKey = `${entry.id}:${axis}:${pushIdx}`;
+      if (this.recentSliceRequests.has(pushKey)) continue;
+      // Skip if already cached
+      if (entry.sliceCache?.has(pushKey)) continue;
+
+      const pushPath = `/slice/${entry.id}/${axis}/${pushIdx}`;
+      try {
+        stream.pushStream({ ':path': pushPath, ':method': 'GET' }, (err, pushStream) => {
+          if (err) return;
+          this.stats.pushedSlices++;
+          this.recentSliceRequests.set(pushKey, Date.now());
+          const pushHeaders = {
+            ':status': 200,
+            'content-type': 'application/octet-stream',
+            'access-control-allow-origin': '*',
+            'cross-origin-opener-policy': 'same-origin',
+            'cross-origin-embedder-policy': 'require-corp',
+          };
+          this.handleSlice(entry, axis, pushIdx, new Http2ResponseAdapter(pushStream, {
+            'access-control-allow-origin': '*',
+            'cross-origin-opener-policy': 'same-origin',
+            'cross-origin-embedder-policy': 'require-corp',
+          }), { headers: { 'accept-encoding': '', 'range': '' } } as any as http.IncomingMessage).catch(() => {
+            try { pushStream.close(http2.constants.NGHTTP2_INTERNAL_ERROR); } catch { /* ignore */ }
+          });
+        });
+      } catch {
+        // Push not supported or stream already closed
+      }
+    }
+  }
+
+  getStats(): ConnectionStats {
+    return { ...this.stats, activeStreams: this.activeStreamCount };
   }
 
   private async handleRequest(
@@ -137,6 +339,15 @@ export class LocalFileProxy {
       return;
     }
 
+    this.stats.totalRequests++;
+
+    const statsMatch = _req.url?.match(/^\/stats$/);
+    if (statsMatch) {
+      _res.writeHead(200, { 'Content-Type': 'application/json' });
+      _res.end(JSON.stringify(this.getStats()));
+      return;
+    }
+
     const headerMatch = _req.url?.match(/^\/header\/(\d+)$/);
     const previewMatch = _req.url?.match(/^\/preview\/(\d+)$/);
     const previewBinMatch = _req.url?.match(/^\/preview-bin\/(\d+)$/);
@@ -157,98 +368,111 @@ export class LocalFileProxy {
       return;
     }
 
-    try {
-      if (headerMatch) {
-        await this.handleHeader(entry, _res, _req);
-        return;
-      }
-      if (previewMatch) {
-        await this.handlePreview(entry, _res, _req);
-        return;
-      }
-      if (previewBinMatch) {
-        await this.handlePreviewBinary(entry, _res, _req);
-        return;
-      }
-      if (sliceMatch) {
-        await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), _res, _req);
-        return;
-      }
-      if (lodMatch) {
-        await this.handleLOD(entry, parseInt(lodMatch[2]), _res, _req);
-        return;
-      }
+    const priority = headerMatch ? REQUEST_PRIORITY.header
+      : previewMatch ? REQUEST_PRIORITY.preview
+      : previewBinMatch ? REQUEST_PRIORITY.previewBin
+      : sliceMatch ? REQUEST_PRIORITY.slice
+      : lodMatch ? REQUEST_PRIORITY.lod
+      : REQUEST_PRIORITY.file;
 
-      if (!entry.size) {
-        const stat = await vscode.workspace.fs.stat(entry.uri);
-        entry.size = Number(stat.size);
-      }
-      const totalSize = entry.size!;
-
-      const rangeHeader = _req.headers['range'];
-      if (rangeHeader) {
-        const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
-        if (!m) {
-          _res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
-          _res.end();
+    this.enqueueRequest(priority, async () => {
+      try {
+        if (headerMatch) {
+          await this.handleHeader(entry, _res, _req);
           return;
         }
-        const start = parseInt(m[1]);
-        const end = m[2] ? Math.min(parseInt(m[2]), totalSize - 1) : totalSize - 1;
-        const chunkSize = end - start + 1;
+        if (previewMatch) {
+          await this.handlePreview(entry, _res, _req);
+          return;
+        }
+        if (previewBinMatch) {
+          await this.handlePreviewBinary(entry, _res, _req);
+          return;
+        }
+        if (sliceMatch) {
+          await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), _res, _req);
+          return;
+        }
+        if (lodMatch) {
+          await this.handleLOD(entry, parseInt(lodMatch[2]), _res, _req);
+          return;
+        }
 
-        const fsPath = entry.uri.fsPath;
-        if (fsPath) {
-          _res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-            'Content-Length': chunkSize,
-            'Accept-Ranges': 'bytes',
-            'Content-Type': 'application/octet-stream',
-          });
-          fs.createReadStream(fsPath, { start, end }).pipe(_res);
-        } else {
-          entry.lastAccess = Date.now();
-          if (!entry.dataCache) {
-            entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
-          }
-          const chunk = entry.dataCache.slice(start, end + 1);
-          _res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-            'Content-Length': chunkSize,
-            'Accept-Ranges': 'bytes',
-            'Content-Type': 'application/octet-stream',
-          });
-          _res.end(Buffer.from(chunk));
-        }
-      } else {
-        const fsPath = entry.uri.fsPath;
-        const shouldCompress = (_req.headers['accept-encoding'] || '').includes('gzip');
-        if (fsPath && !shouldCompress) {
-          _res.writeHead(200, {
-            'Content-Length': totalSize,
-            'Accept-Ranges': 'bytes',
-            'Content-Type': 'application/octet-stream',
-          });
-          fs.createReadStream(fsPath).pipe(_res);
-        } else if (fsPath && shouldCompress) {
-          _res.writeHead(200, {
-            'Content-Encoding': 'gzip',
-            'Accept-Ranges': 'bytes',
-            'Content-Type': 'application/octet-stream',
-          });
-          fs.createReadStream(fsPath).pipe(zlib.createGzip({ level: 1 })).pipe(_res);
-        } else {
-          entry.lastAccess = Date.now();
-          if (!entry.dataCache) {
-            entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
-          }
-          compressResponse(Buffer.from(entry.dataCache), _req, _res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
-        }
+        await this.handleFile(entry, _res, _req);
+      } catch (err) {
+        console.error('LocalFileProxy error:', err);
+        _res.writeHead(500);
+        _res.end(String(err));
       }
-    } catch (err) {
-      console.error('LocalFileProxy error:', err);
-      _res.writeHead(500);
-      _res.end(String(err));
+    });
+  }
+
+  private async handleFile(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    if (!entry.size) {
+      const stat = await vscode.workspace.fs.stat(entry.uri);
+      entry.size = Number(stat.size);
+    }
+    const totalSize = entry.size!;
+
+    const rangeHeader = req.headers['range'];
+    if (rangeHeader) {
+      const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+      if (!m) {
+        res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
+        res.end();
+        return;
+      }
+      const start = parseInt(m[1]);
+      const end = m[2] ? Math.min(parseInt(m[2]), totalSize - 1) : totalSize - 1;
+      const chunkSize = end - start + 1;
+
+      const fsPath = entry.uri.fsPath;
+      if (fsPath) {
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+          'Content-Length': chunkSize,
+          'Accept-Ranges': 'bytes',
+          'Content-Type': 'application/octet-stream',
+        });
+        fs.createReadStream(fsPath, { start, end }).pipe(res);
+      } else {
+        entry.lastAccess = Date.now();
+        if (!entry.dataCache) {
+          entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
+        }
+        const chunk = entry.dataCache.slice(start, end + 1);
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${totalSize}`,
+          'Content-Length': chunkSize,
+          'Accept-Ranges': 'bytes',
+          'Content-Type': 'application/octet-stream',
+        });
+        res.end(Buffer.from(chunk));
+      }
+    } else {
+      const fsPath = entry.uri.fsPath;
+      const shouldCompress = (req.headers['accept-encoding'] || '').includes('gzip');
+      if (fsPath && !shouldCompress) {
+        res.writeHead(200, {
+          'Content-Length': totalSize,
+          'Accept-Ranges': 'bytes',
+          'Content-Type': 'application/octet-stream',
+        });
+        fs.createReadStream(fsPath).pipe(res);
+      } else if (fsPath && shouldCompress) {
+        res.writeHead(200, {
+          'Content-Encoding': 'gzip',
+          'Accept-Ranges': 'bytes',
+          'Content-Type': 'application/octet-stream',
+        });
+        fs.createReadStream(fsPath).pipe(zlib.createGzip({ level: 1 })).pipe(res);
+      } else {
+        entry.lastAccess = Date.now();
+        if (!entry.dataCache) {
+          entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
+        }
+        compressResponse(Buffer.from(entry.dataCache), req, res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
+      }
     }
   }
 
@@ -1057,5 +1281,84 @@ export class LocalFileProxy {
       console.error('extractPreviewForWebview error:', err);
       return null;
     }
+  }
+}
+
+/**
+ * Adapter that wraps an HTTP/2 ServerHttp2Stream to provide the same
+ * interface as http.ServerResponse, so existing handler methods work
+ * without modification for both HTTP/1.1 and HTTP/2.
+ */
+class Http2ResponseAdapter extends (require('http').ServerResponse as any) {
+  private stream: http2.ServerHttp2Stream;
+  private extraHeaders: Record<string, string>;
+  private responded = false;
+  private statusCode = 200;
+  private statusMessage = 'OK';
+  private headersSent = false;
+  private storedHeaders: Record<string, string | string[]> = {};
+
+  constructor(stream: http2.ServerHttp2Stream, extraHeaders: Record<string, string> = {}) {
+    super({ /* fake socket to satisfy ServerResponse constructor */ });
+    this.stream = stream;
+    this.extraHeaders = extraHeaders;
+  }
+
+  setHeader(name: string, value: string | string[]): this {
+    this.storedHeaders[name] = value;
+    return this;
+  }
+
+  getHeader(name: string): string | string[] | undefined {
+    return this.storedHeaders[name];
+  }
+
+  writeHead(statusCode: number, headers?: Record<string, string | string[]>): this {
+    this.statusCode = statusCode;
+    if (headers) {
+      for (const [k, v] of Object.entries(headers)) {
+        this.storedHeaders[k] = v;
+      }
+    }
+    this.responded = true;
+    return this;
+  }
+
+  end(data?: any, encoding?: any, callback?: any): this {
+    if (!this.headersSent) {
+      this.flushHeaders();
+    }
+    if (data !== undefined) {
+      this.stream.end(data);
+    } else {
+      this.stream.end();
+    }
+    return this;
+  }
+
+  write(data: any, encoding?: any, callback?: any): boolean {
+    if (!this.headersSent) {
+      this.flushHeaders();
+    }
+    return this.stream.write(data);
+  }
+
+  private flushHeaders(): void {
+    if (this.headersSent) return;
+    const h2Headers: http2.OutgoingHttpHeaders = {
+      ':status': this.statusCode,
+    };
+    for (const [k, v] of Object.entries(this.extraHeaders)) {
+      h2Headers[k] = v;
+    }
+    for (const [k, v] of Object.entries(this.storedHeaders)) {
+      h2Headers[k] = v;
+    }
+    this.stream.respond(h2Headers);
+    this.headersSent = true;
+  }
+
+  get finished(): boolean {
+    return this.stream.destroyed || this.stream.writableEnded;
   }
 }
