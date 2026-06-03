@@ -1972,9 +1972,17 @@ class PrefetchPriorityQueue {
         const dataRange = globalMax - globalMin || 1;
         const n = w * h;
 
+        // Apply window/level normalization to Uint8 (mirrors fast_apply_window_level in native)
+        const normalized = new Uint8Array(n);
         for (let i = 0; i < n; i++) {
           const norm = (slice[i] - globalMin) / dataRange;
           const t = Math.max(0, Math.min(1, (norm - lo) / range));
+          normalized[i] = (t * 255 + 0.5) | 0;
+        }
+
+        // Apply colormap to normalized values
+        for (let i = 0; i < n; i++) {
+          const t = normalized[i] / 255;
           const [r, g, b] = cmapFn(t);
           const idx4 = i * 4;
           pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
@@ -2365,14 +2373,21 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   const pixels = imgData.data;
   const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
   const lo = windowLevel - windowWidth * 0.5;
-  const hi = windowLevel + windowWidth * 0.5;
-  const range = hi - lo || 1;
+  const range = windowWidth || 1;
   const dataRange = globalMax - globalMin || 1;
   const n = w * h;
 
+  // Apply window/level normalization to Uint8 (mirrors fast_apply_window_level in native)
+  const normalized = new Uint8Array(n);
   for (let i = 0; i < n; i++) {
     const norm = (data[i] - globalMin) / dataRange;
     const t = Math.max(0, Math.min(1, (norm - lo) / range));
+    normalized[i] = (t * 255 + 0.5) | 0;
+  }
+
+  // Apply colormap to normalized values
+  for (let i = 0; i < n; i++) {
+    const t = normalized[i] / 255;
     const [r, g, b] = cmapFn(t);
     const idx = i * 4;
     pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;

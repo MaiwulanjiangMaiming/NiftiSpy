@@ -557,3 +557,173 @@ pub fn fast_decompress_gzip(buffer: Buffer) -> Result<Buffer> {
   decoder.read_to_end(&mut out).map_err(|e| Error::from_reason(e.to_string()))?;
   Ok(Buffer::from(out))
 }
+
+// ── v1.9.0: Batch slice extraction ──────────────────────────────────────
+
+#[napi]
+pub fn mmap_extract_slice_batch(path: String, header_json: String, axis: String, indices: Vec<u32>) -> Option<Vec<Buffer>> {
+  let file = std::fs::File::open(&path).ok()?;
+  let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+  let header: Header = serde_json::from_str(&header_json).ok()?;
+  let axis_enum = match axis.as_str() {
+    "axial" => Axis::Axial,
+    "coronal" => Axis::Coronal,
+    "sagittal" => Axis::Sagittal,
+    _ => return None,
+  };
+  let mut results = Vec::with_capacity(indices.len());
+  for &idx in &indices {
+    let (slice, _w, _h) = extract_slice_impl(mmap.as_ref(), &header, axis_enum, idx as usize)?;
+    results.push(Buffer::from(bytemuck(&slice)));
+  }
+  Some(results)
+}
+
+// ── v1.9.0: Volume statistics via streaming ─────────────────────────────
+
+#[napi(object)]
+pub struct VolumeStats {
+  pub min: f64,
+  pub max: f64,
+  pub mean: f64,
+  pub std: f64,
+  pub p1: f64,
+  pub p5: f64,
+  pub p95: f64,
+  pub p99: f64,
+  pub histogram: Vec<u32>,
+}
+
+#[napi]
+pub fn mmap_get_volume_stats(path: String, header_json: String) -> Option<VolumeStats> {
+  let file = std::fs::File::open(&path).ok()?;
+  let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+  let header: Header = serde_json::from_str(&header_json).ok()?;
+  let n = header.totalVoxels3D;
+  if n == 0 { return None; }
+
+  // Streaming pass: compute min, max, mean (Welford), and build histogram
+  let num_bins: usize = 256;
+  let mut histogram = vec![0u32; num_bins];
+  let mut min_val = f64::INFINITY;
+  let mut max_val = f64::NEG_INFINITY;
+  let mut mean = 0.0f64;
+  let mut m2 = 0.0f64; // Welford's online variance
+
+  // First pass: find min/max and compute mean/std with Welford
+  let sample_step = std::cmp::max(1, n / 200000); // sample up to ~200k voxels
+  let mut count = 0usize;
+  for i in (0..n).step_by(sample_step) {
+    let v = voxel_value(mmap.as_ref(), &header, i) as f64;
+    if v < min_val { min_val = v; }
+    if v > max_val { max_val = v; }
+    count += 1;
+    let delta = v - mean;
+    mean += delta / count as f64;
+    let delta2 = v - mean;
+    m2 += delta * delta2;
+  }
+
+  if count == 0 || min_val == max_val {
+    max_val = min_val + 1.0;
+  }
+
+  let variance = if count > 1 { m2 / (count - 1) as f64 } else { 0.0 };
+  let std_val = variance.sqrt();
+
+  // Second pass: build histogram and collect samples for percentiles
+  let range = max_val - min_val;
+  let mut samples = Vec::with_capacity(count);
+  for i in (0..n).step_by(sample_step) {
+    let v = voxel_value(mmap.as_ref(), &header, i) as f64;
+    let bin = if range > 0.0 {
+      std::cmp::min(num_bins - 1, ((v - min_val) / range * num_bins as f64) as usize)
+    } else {
+      0
+    };
+    histogram[bin] += 1;
+    samples.push(v);
+  }
+
+  // Compute percentiles from samples
+  samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+  let p1 = samples[samples.len() / 100].min(max_val).max(min_val);
+  let p5 = samples[samples.len() / 20].min(max_val).max(min_val);
+  let p95 = samples[samples.len() * 19 / 20].min(max_val).max(min_val);
+  let p99 = samples[samples.len() * 99 / 100].min(max_val).max(min_val);
+
+  Some(VolumeStats {
+    min: min_val,
+    max: max_val,
+    mean,
+    std: std_val,
+    p1,
+    p5,
+    p95,
+    p99,
+    histogram,
+  })
+}
+
+// ── v1.9.0: Bilinear resampling ─────────────────────────────────────────
+
+#[napi]
+pub fn fast_resample_slice(data: Float32Array, src_width: u32, src_height: u32, dst_width: u32, dst_height: u32) -> Buffer {
+  let src = data.as_ref();
+  let sw = src_width as usize;
+  let sh = src_height as usize;
+  let dw = dst_width as usize;
+  let dh = dst_height as usize;
+  let mut out = vec![0.0f32; dw * dh];
+
+  let x_ratio = if dw > 0 && sw > 0 { sw as f32 / dw as f32 } else { 1.0 };
+  let y_ratio = if dh > 0 && sh > 0 { sh as f32 / dh as f32 } else { 1.0 };
+
+  for y in 0..dh {
+    for x in 0..dw {
+      let src_x = x as f32 * x_ratio;
+      let src_y = y as f32 * y_ratio;
+      let x0 = (src_x as usize).min(sw - 1);
+      let y0 = (src_y as usize).min(sh - 1);
+      let x1 = (x0 + 1).min(sw - 1);
+      let y1 = (y0 + 1).min(sh - 1);
+      let xf = src_x - x0 as f32;
+      let yf = src_y - y0 as f32;
+
+      let v00 = src[y0 * sw + x0];
+      let v10 = src[y0 * sw + x1];
+      let v01 = src[y1 * sw + x0];
+      let v11 = src[y1 * sw + x1];
+
+      let v0 = v00 * (1.0 - xf) + v10 * xf;
+      let v1 = v01 * (1.0 - xf) + v11 * xf;
+      out[y * dw + x] = v0 * (1.0 - yf) + v1 * yf;
+    }
+  }
+
+  Buffer::from(bytemuck(&out))
+}
+
+// ── v1.9.0: Window/Level normalization ──────────────────────────────────
+
+#[napi]
+pub fn fast_apply_window_level(data: Float32Array, window_level: f64, window_width: f64, global_min: f64, global_max: f64) -> Buffer {
+  let src = data.as_ref();
+  let n = src.len();
+  let mut out = vec![0u8; n];
+
+  let lo = window_level - window_width * 0.5;
+  let range = window_width;
+  let data_range = global_max - global_min;
+  if data_range == 0.0 || range == 0.0 {
+    return Buffer::from(out);
+  }
+
+  for i in 0..n {
+    let norm = (src[i] as f64 - global_min) / data_range;
+    let t = ((norm - lo) / range).clamp(0.0, 1.0);
+    out[i] = (t * 255.0 + 0.5) as u8;
+  }
+
+  Buffer::from(out)
+}

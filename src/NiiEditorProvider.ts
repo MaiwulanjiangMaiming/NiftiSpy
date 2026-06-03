@@ -6,6 +6,7 @@ import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
 import { downsampleSlice } from './nifti/sliceExtractor';
+import { getNativeBindings } from './nativeBridge';
 
 interface LoadJob {
   webviewId: string;
@@ -281,7 +282,20 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     };
   }
 
-  private computeVoxelStats(rawData: Uint8Array, header: any): { min: number; max: number } {
+  private computeVoxelStats(rawData: Uint8Array, header: any, fsPath?: string): { min: number; max: number } {
+    // Try native mmap_get_volume_stats for faster computation
+    const native = getNativeBindings();
+    if (native?.mmapGetVolumeStats && fsPath && !fsPath.endsWith('.gz')) {
+      try {
+        const stats = native.mmapGetVolumeStats(fsPath, header);
+        if (stats) {
+          return { min: stats.min, max: stats.max };
+        }
+      } catch {
+        // Fall through to JS implementation
+      }
+    }
+
     const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
     const n = nx * ny * nz;
     const slope = scl_slope || 1;
@@ -392,7 +406,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const n = header.nx * header.ny * header.nz;
           const elemSize = header.bytesPerVoxel;
           const voxelOnly = rawData.slice(voxOffset, voxOffset + n * elemSize);
-          const { min, max } = this.computeVoxelStats(rawData, header);
+          const { min, max } = this.computeVoxelStats(rawData, header, fsPath);
 
           this.volumeCache.set(uriKey, {
             header,
@@ -426,7 +440,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           });
 
           // Generate LOD levels in background for progressive loading
-          this.generateAndSendLOD(webview, header, voxelOnly, signal);
+          this.generateAndSendLOD(webview, header, voxelOnly, signal, fsPath);
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Local load error:', err);
@@ -542,7 +556,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     webview: vscode.Webview,
     header: any,
     voxelOnly: Uint8Array,
-    signal: AbortSignal
+    signal: AbortSignal,
+    fsPath?: string
   ): Promise<void> {
     const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, bytesPerVoxel } = header;
     const n = nx * ny * nz;
@@ -571,13 +586,64 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       floatData[i] = val * slope + inter;
     }
 
+    // Try native mmap_extract_slice_batch for efficient batch slice extraction
+    const native = getNativeBindings();
+    let nativeBatchAvailable = false;
+    if (native?.mmapExtractSliceBatch && fsPath && !fsPath.endsWith('.gz')) {
+      nativeBatchAvailable = true;
+    }
+
     // Generate LOD2 (1/4 resolution) — send immediately
     if (signal.aborted) return;
     try {
-      const axialSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2));
+      let axialSliceLod2: { data: Float32Array; w: number; h: number } | null = null;
+      let coronalSliceLod2: { data: Float32Array; w: number; h: number } | null = null;
+      let sagittalSliceLod2: { data: Float32Array; w: number; h: number } | null = null;
+
+      // Use mmap_extract_slice_batch for efficient batch extraction from local .nii files
+      if (nativeBatchAvailable) {
+        try {
+          const axialIdx = Math.floor(nz / 2);
+          const coronalIdx = Math.floor(ny / 2);
+          const sagittalIdx = Math.floor(nx / 2);
+          const axialSlices = native!.mmapExtractSliceBatch!(fsPath!, header, 'axial', [axialIdx]);
+          const coronalSlices = native!.mmapExtractSliceBatch!(fsPath!, header, 'coronal', [coronalIdx]);
+          const sagittalSlices = native!.mmapExtractSliceBatch!(fsPath!, header, 'sagittal', [sagittalIdx]);
+          if (axialSlices && axialSlices[0]) {
+            const dstW = Math.max(1, Math.floor(nx / 4));
+            const dstH = Math.max(1, Math.floor(ny / 4));
+            const resampled = native!.fastResampleSlice?.(axialSlices[0], nx, ny, dstW, dstH);
+            axialSliceLod2 = resampled ? { data: resampled, w: dstW, h: dstH } : null;
+          }
+          if (coronalSlices && coronalSlices[0]) {
+            const dstW = Math.max(1, Math.floor(nx / 4));
+            const dstH = Math.max(1, Math.floor(nz / 4));
+            const resampled = native!.fastResampleSlice?.(coronalSlices[0], nx, nz, dstW, dstH);
+            coronalSliceLod2 = resampled ? { data: resampled, w: dstW, h: dstH } : null;
+          }
+          if (sagittalSlices && sagittalSlices[0]) {
+            const dstW = Math.max(1, Math.floor(ny / 4));
+            const dstH = Math.max(1, Math.floor(nz / 4));
+            const resampled = native!.fastResampleSlice?.(sagittalSlices[0], ny, nz, dstW, dstH);
+            sagittalSliceLod2 = resampled ? { data: resampled, w: dstW, h: dstH } : null;
+          }
+        } catch {
+          // Fall through to JS path
+        }
+      }
+
+      // Fallback to JS-based extraction
+      if (!axialSliceLod2) {
+        axialSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2), 4);
+      }
+      if (!coronalSliceLod2) {
+        coronalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2), 4);
+      }
+      if (!sagittalSliceLod2) {
+        sagittalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2), 4);
+      }
+
       if (axialSliceLod2 && !signal.aborted) {
-        const coronalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2));
-        const sagittalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2));
         webview.postMessage({
           type: 'lodData',
           level: 2,
@@ -598,10 +664,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     await new Promise<void>(r => setTimeout(r, 100));
     if (signal.aborted) return;
     try {
-      const axialSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2));
+      const axialSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2), 2);
+      const coronalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2), 2);
+      const sagittalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2), 2);
       if (axialSliceLod1 && !signal.aborted) {
-        const coronalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2));
-        const sagittalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2));
         webview.postMessage({
           type: 'lodData',
           level: 1,
@@ -628,34 +694,51 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     floatData: Float32Array,
     nx: number, ny: number, nz: number,
     axis: 'axial' | 'coronal' | 'sagittal',
-    idx: number
+    idx: number,
+    factor: number = 2
   ): { data: Float32Array; w: number; h: number } | null {
+    let slice: Float32Array;
+    let w: number, h: number;
+
     if (axis === 'axial') {
       if (idx < 0 || idx >= nz) return null;
-      const slice = new Float32Array(nx * ny);
+      slice = new Float32Array(nx * ny);
       const base = idx * ny * nx;
       for (let i = 0; i < nx * ny; i++) slice[i] = floatData[base + i];
-      const ds = downsampleSlice(slice, nx, ny, 2);
-      return { data: ds.data, w: ds.w, h: ds.h };
+      w = nx; h = ny;
     } else if (axis === 'coronal') {
       if (idx < 0 || idx >= ny) return null;
-      const slice = new Float32Array(nx * nz);
+      slice = new Float32Array(nx * nz);
       for (let z = 0; z < nz; z++) {
         const base = z * ny * nx + idx * nx;
         for (let x = 0; x < nx; x++) slice[z * nx + x] = floatData[base + x];
       }
-      const ds = downsampleSlice(slice, nx, nz, 2);
-      return { data: ds.data, w: ds.w, h: ds.h };
+      w = nx; h = nz;
     } else {
       if (idx < 0 || idx >= nx) return null;
-      const slice = new Float32Array(ny * nz);
+      slice = new Float32Array(ny * nz);
       for (let z = 0; z < nz; z++) {
         const base = z * ny * nx;
         for (let y = 0; y < ny; y++) slice[z * ny + y] = floatData[base + y * nx + idx];
       }
-      const ds = downsampleSlice(slice, ny, nz, 2);
-      return { data: ds.data, w: ds.w, h: ds.h };
+      w = ny; h = nz;
     }
+
+    // Use native fast_resample_slice for bilinear interpolation when available
+    const dstW = Math.max(1, Math.floor(w / factor));
+    const dstH = Math.max(1, Math.floor(h / factor));
+    const native = getNativeBindings();
+    if (native?.fastResampleSlice) {
+      try {
+        const resampled = native.fastResampleSlice(slice, w, h, dstW, dstH);
+        if (resampled) return { data: resampled, w: dstW, h: dstH };
+      } catch {
+        // Fall through to JS fallback
+      }
+    }
+
+    const ds = downsampleSlice(slice, w, h, factor);
+    return { data: ds.data, w: ds.w, h: ds.h };
   }
 
   private buildGzipIndexInBackground(fsPath: string, uriKey: string): void {
@@ -865,7 +948,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.8.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.9.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
