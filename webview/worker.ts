@@ -1,6 +1,7 @@
 import { gunzip } from 'fflate';
 import { parseNiiHeader } from './nii-parser';
 import { getCachedChunk, setCachedChunk, makeCacheKey, recordCacheHit, recordCacheMiss, recordL4Fetch } from './cache';
+import { SliceCacheDB, deriveFileHash, makeSliceCacheKey, getSliceCacheDB } from './SliceCacheDB';
 
 const MAX_RETRIES = 3;
 const CHUNK_SIZE = 4 * 1024 * 1024;
@@ -18,6 +19,23 @@ interface CachedSlice {
 }
 
 const sliceCache = new Map<string, CachedSlice>();
+
+// SliceCacheDB — persistent IndexedDB disk cache
+const sliceCacheDB = getSliceCacheDB();
+let sliceCacheDBReady = false;
+async function ensureSliceCacheDB(): Promise<SliceCacheDB> {
+  if (!sliceCacheDBReady) {
+    await sliceCacheDB.init();
+    sliceCacheDBReady = true;
+  }
+  return sliceCacheDB;
+}
+
+// Track file hash for cache key generation
+let currentFileHash = '';
+function setFileHashForCache(fileName: string, fileSize: number): void {
+  currentFileHash = deriveFileHash(fileName, fileSize);
+}
 
 let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; ready: Int32Array } | null = null;
 
@@ -53,6 +71,12 @@ self.onmessage = async (e: MessageEvent) => {
       handleInitOffscreenCanvas(e.data);
     } else if (type === 'renderRequest') {
       handleRenderRequest(e.data);
+    } else if (type === 'setFileHash') {
+      setFileHashForCache(e.data.fileName || '', e.data.fileSize || 0);
+    } else if (type === 'invalidateCache') {
+      await handleInvalidateCache(e.data);
+    } else if (type === 'getCacheStats') {
+      await handleGetCacheStats(id);
     }
   } catch (err: any) {
     if (err?.name === 'AbortError') {
@@ -72,6 +96,58 @@ function handleInitOffscreenCanvas(data: { axis: string; canvas: OffscreenCanvas
     }
   } catch {
     // OffscreenCanvas WebGL2 context creation failed; skip
+  }
+}
+
+// Track validation tokens per file hash for cache invalidation
+const validationTokens = new Map<string, string>();
+
+async function handleGetCacheStats(id: number): Promise<void> {
+  try {
+    const db = await ensureSliceCacheDB();
+    const stats = db.getStats();
+    const cacheSize = await db.cacheSize();
+    const cacheEntries = await db.cacheEntries();
+    self.postMessage({
+      id,
+      type: 'cacheStats',
+      cacheHits: stats.cacheHits,
+      cacheMisses: stats.cacheMisses,
+      cacheSize,
+      cacheEntries,
+    });
+  } catch {
+    self.postMessage({
+      id,
+      type: 'cacheStats',
+      cacheHits: 0,
+      cacheMisses: 0,
+      cacheSize: 0,
+      cacheEntries: 0,
+    });
+  }
+}
+
+async function handleInvalidateCache(data: { fileName?: string; fileSize?: number; validationToken?: string }): Promise<void> {
+  try {
+    if (data.fileName && data.fileSize !== undefined) {
+      const fileHash = deriveFileHash(data.fileName, data.fileSize);
+      const prevToken = validationTokens.get(fileHash);
+      const newToken = data.validationToken || '';
+
+      // If validation token changed, invalidate all cached slices for this file
+      if (newToken && prevToken && prevToken !== newToken) {
+        const db = await ensureSliceCacheDB();
+        await db.invalidateByPrefix(fileHash);
+      }
+
+      // Update stored token
+      if (newToken) {
+        validationTokens.set(fileHash, newToken);
+      }
+    }
+  } catch {
+    // Invalidation failure is non-critical
   }
 }
 
@@ -178,6 +254,25 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
   if (pending) return pending;
 
   const request = (async () => {
+    // Check new SliceCacheDB first (primary L3 disk cache)
+    if (currentFileHash) {
+      try {
+        const db = await ensureSliceCacheDB();
+        const dbKey = makeSliceCacheKey(currentFileHash, axis, index);
+        const dbData = await db.get(dbKey);
+        if (dbData) {
+          recordCacheHit('l3');
+          const data = new Float32Array(dbData);
+          const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
+          setCachedSlice(url, axis, index, factor, slice);
+          return slice;
+        }
+      } catch {
+        // SliceCacheDB not available; fall through
+      }
+    }
+
+    // Fall back to legacy IndexedDB cache
     const idbKey = makeCacheKey(url, axis, index);
     const idbData = await getCachedChunk(idbKey);
     if (idbData) {
@@ -208,6 +303,16 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     };
     setCachedSlice(url, axis, index, factor, slice);
 
+    // Store in new SliceCacheDB (primary)
+    if (currentFileHash) {
+      const db = await ensureSliceCacheDB();
+      const dbKey = makeSliceCacheKey(currentFileHash, axis, index);
+      db.put(dbKey, buffer).catch(() => {});
+      // Background eviction
+      db.evictLRU().catch(() => {});
+    }
+
+    // Also store in legacy cache for backward compatibility
     setCachedChunk(idbKey, buffer).catch(() => {});
 
     self.postMessage({

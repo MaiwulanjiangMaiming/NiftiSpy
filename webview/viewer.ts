@@ -1,6 +1,7 @@
 import { NiiHeader, DATATYPE_NAMES } from './nii-parser';
 import { WebGPURenderer } from './webgpuRenderer';
 import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
+import { deriveFileHash } from './SliceCacheDB';
 
 declare function acquireVsCodeApi(): any;
 const vscode = acquireVsCodeApi();
@@ -246,6 +247,27 @@ const viewerConfig: ViewerConfig = {
 const previewRequestCache = new Map<string, Promise<any | null>>();
 let thumbnailObserver: IntersectionObserver | null = null;
 
+// Disk cache statistics (updated from worker responses)
+const diskCacheStats = {
+  cacheHits: 0,
+  cacheMisses: 0,
+  cacheSize: 0,
+  cacheEntries: 0,
+};
+
+function requestDiskCacheStats(): void {
+  if (slicePool) {
+    slicePool.dispatch<any>({ type: 'getCacheStats' }).then((msg: any) => {
+      if (msg && msg.type === 'cacheStats') {
+        diskCacheStats.cacheHits = msg.cacheHits || 0;
+        diskCacheStats.cacheMisses = msg.cacheMisses || 0;
+        diskCacheStats.cacheSize = msg.cacheSize || 0;
+        diskCacheStats.cacheEntries = msg.cacheEntries || 0;
+      }
+    }).catch(() => {});
+  }
+}
+
 function publishPerfMonitor() {
   (window as any).__niftiPerf = {
     previewLoads: [...perfMonitor.previewLoads],
@@ -267,7 +289,10 @@ function publishPerfMonitor() {
       savedBytes: workerCopyBytes > 0 ? workerCopyBytes - sharedBufferBytes : 0,
     },
     prefetch: prefetchStats.getStats(),
+    diskCache: { ...diskCacheStats },
   };
+  // Request fresh stats from workers for next publish
+  requestDiskCacheStats();
 }
 
 function makeAbortError(): Error {
@@ -3472,6 +3497,23 @@ window.addEventListener('message', async (e) => {
   currentSlices.coronal = null;
   currentSlices.sagittal = null;
   colormap = msg.defaultColormap || 'gray';
+
+  // Send file hash to slice workers for IndexedDB cache key generation
+  if (msg.fileName) {
+    const fileSize = msg.fileSize || 0;
+    broadcastToSliceWorkers({ type: 'setFileHash', fileName: msg.fileName, fileSize });
+  }
+
+  // Cache invalidation: if validation token changed, invalidate cached slices
+  if (msg.validationToken && msg.fileName) {
+    const fileSize = msg.fileSize || 0;
+    broadcastToSliceWorkers({
+      type: 'invalidateCache',
+      fileName: msg.fileName,
+      fileSize,
+      validationToken: msg.validationToken,
+    });
+  }
 
   const cmapSelect = document.getElementById('colormap') as HTMLSelectElement;
   if (cmapSelect && msg.defaultColormap) cmapSelect.value = msg.defaultColormap;

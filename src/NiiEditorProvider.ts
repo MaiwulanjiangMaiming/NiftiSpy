@@ -144,6 +144,19 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       if (msg.type === 'ready') {
         const config = vscode.workspace.getConfiguration('niiFastView');
 
+        // Compute validation token and file size for cache invalidation
+        let fileSize = 0;
+        let validationToken = '';
+        try {
+          if (!isRemote && uri.fsPath) {
+            const stat = await fs.promises.stat(uri.fsPath);
+            fileSize = stat.size;
+            validationToken = `${stat.mtimeMs}:${stat.size}`;
+          }
+        } catch {
+          // stat may fail for remote URIs; validationToken stays empty
+        }
+
         webview.postMessage({
           type: 'config',
           enableLOD: config.get('enableLOD', true),
@@ -156,6 +169,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           fileUrl,
           fileName: path.basename(uri.fsPath ?? uri.toString()),
           webviewId,
+          fileSize,
+          validationToken,
         });
 
         if (isRemote && entryId) {
@@ -684,7 +699,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.7.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.7.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
