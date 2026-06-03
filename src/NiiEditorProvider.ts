@@ -78,6 +78,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private activeWebviews = new Map<string, { panel: vscode.WebviewPanel; abortController: AbortController }>();
   private gzipIndexes = new Map<string, GzipIndex>();
   private gzipIndexStatusItems = new Map<string, vscode.Disposable>();
+  private chunkProgressItem: vscode.StatusBarItem | null = null;
 
   constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
     this.volumeCache = volumeCache;
@@ -441,6 +442,13 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
           // Generate LOD levels in background for progressive loading
           this.generateAndSendLOD(webview, header, voxelOnly, signal, fsPath);
+
+          // Show chunk loading progress for large volumes
+          const totalChunks = Math.ceil(header.nx / 64) * Math.ceil(header.ny / 64) * Math.ceil(header.nz / 64);
+          if (totalChunks > 10) {
+            this.showChunkProgress(totalChunks, totalChunks);
+            setTimeout(() => this.hideChunkProgress(), 3000);
+          }
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Local load error:', err);
@@ -550,6 +558,21 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private isWebviewActive(webviewId: string): boolean {
     const entry = this.activeWebviews.get(webviewId);
     return !!entry && entry.panel.active;
+  }
+
+  private showChunkProgress(loaded: number, total: number): void {
+    if (!this.chunkProgressItem) {
+      this.chunkProgressItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
+    }
+    const pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
+    this.chunkProgressItem.text = `$(database) Chunks: ${loaded}/${total} (${pct}%)`;
+    this.chunkProgressItem.show();
+  }
+
+  private hideChunkProgress(): void {
+    if (this.chunkProgressItem) {
+      this.chunkProgressItem.hide();
+    }
   }
 
   private async generateAndSendLOD(
@@ -948,7 +971,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.9.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.9.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
