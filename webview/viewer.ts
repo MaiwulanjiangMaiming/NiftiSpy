@@ -191,8 +191,7 @@ let webgpuChecked = false;
 
 let volumeRaycaster: VolumeRaycaster | null = null;
 let renderMode: 'slice' | 'volume' = 'slice';
-let volumeRotationX = 0;
-let volumeRotationY = 0;
+let volumeRotationMatrix = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
 let volumeZoom = 1.0;
 let isDraggingVolume = false;
 let lastVolumeMouseX = 0;
@@ -1662,20 +1661,15 @@ function renderVolume3D(): void {
   projMatrix[11] = -1;
   projMatrix[14] = (2 * far * near) / (near - far);
 
-  const cx = Math.cos(volumeRotationX);
-  const sx = Math.sin(volumeRotationX);
-  const cy = Math.cos(volumeRotationY);
-  const sy = Math.sin(volumeRotationY);
-
+  // Build view matrix: translate back, then apply arcball rotation
   const viewMatrix = new Float32Array(16);
-  viewMatrix[0] = cy;
-  viewMatrix[2] = -sy;
-  viewMatrix[5] = cx;
-  viewMatrix[6] = sx * sy;
-  viewMatrix[8] = sx;
-  viewMatrix[9] = -cx * sy;
-  viewMatrix[10] = cx * cy;
+  // Start with rotation
+  for (let i = 0; i < 16; i++) viewMatrix[i] = volumeRotationMatrix[i];
+  // Apply translation in column 3
+  viewMatrix[12] = 0;
+  viewMatrix[13] = 0;
   viewMatrix[14] = -3.0 / volumeZoom;
+  viewMatrix[15] = 1;
 
   volumeRaycaster.render(viewMatrix, projMatrix, windowLevel - windowWidth * 0.5, windowWidth || 1);
 }
@@ -1695,10 +1689,18 @@ function setupVolumeInteraction(): void {
     if (!isDraggingVolume) return;
     const dx = e.clientX - lastVolumeMouseX;
     const dy = e.clientY - lastVolumeMouseY;
-    volumeRotationY += dx * 0.01;
-    volumeRotationX += dy * 0.01;
     lastVolumeMouseX = e.clientX;
     lastVolumeMouseY = e.clientY;
+
+    // Arcball rotation: map mouse coords to NDC
+    const rect = canvas!.getBoundingClientRect();
+    const prevX = (2 * (e.clientX - dx - rect.left)) / rect.width - 1;
+    const prevY = 1 - (2 * (e.clientY - dy - rect.top)) / rect.height;
+    const currX = (2 * (e.clientX - rect.left)) / rect.width - 1;
+    const currY = 1 - (2 * (e.clientY - rect.top)) / rect.height;
+
+    const deltaRot = VolumeRaycaster.arcballRotation(prevX, prevY, currX, currY);
+    volumeRotationMatrix = multiply4x4(deltaRot, volumeRotationMatrix);
     renderVolume3D();
   });
 
@@ -1713,6 +1715,19 @@ function setupVolumeInteraction(): void {
     volumeZoom = Math.max(0.1, Math.min(10, volumeZoom));
     renderVolume3D();
   }, { passive: false });
+}
+
+function multiply4x4(a: Float32Array, b: Float32Array): Float32Array {
+  const out = new Float32Array(16);
+  for (let i = 0; i < 4; i++) {
+    for (let j = 0; j < 4; j++) {
+      out[i * 4 + j] = 0;
+      for (let k = 0; k < 4; k++) {
+        out[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+      }
+    }
+  }
+  return out;
 }
 
 function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
@@ -1779,7 +1794,8 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
     }
   }
 
-  if (renderer && zoom === 1 && panX === 0 && panY === 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
+  // Fallback to 2D rendering when volume3D is not ready (still loading) or 3D path failed
+  if (renderer && data && data.length > 0 && renderer.renderSlice(canvas, data, w, h, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
     updateDirectionLabels(axis);
     updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
     updateScaleBar(axis, pixelW, pixelH, zoom, cw);

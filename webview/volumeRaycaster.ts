@@ -277,6 +277,14 @@ void main() {
     this.createTransferFunctionTexture();
   }
 
+  getTransferFunction(): TransferFunctionPoint[] {
+    return [...this.transferFunction];
+  }
+
+  setConfig(config: Partial<RayMarchingConfig>): void {
+    Object.assign(this.config, config);
+  }
+
   render(
     viewMatrix: Float32Array,
     projMatrix: Float32Array,
@@ -367,6 +375,24 @@ void main() {
     return this.volumeReady;
   }
 
+  /**
+   * Compute a 4×4 rotation matrix from arcball drag.
+   * prevPos/currPos are normalized device coordinates in [-1,1]².
+   * Maps each 2D point onto a virtual sphere and computes the rotation
+   * that takes prevPos to currPos.
+   */
+  static arcballRotation(prevX: number, prevY: number, currX: number, currY: number): Float32Array {
+    const p = arcballProject(prevX, prevY);
+    const q = arcballProject(currX, currY);
+    const axis = new Float32Array(3);
+    cross3(axis, q, p);
+    let dot = dot3(p, q);
+    if (dot > 1.0) dot = 1.0;
+    if (dot < -1.0) dot = -1.0;
+    const angle = Math.acos(dot);
+    return axisAngleToMatrix(axis, angle);
+  }
+
   destroy(): void {
     const gl = this.gl;
     if (!gl) return;
@@ -377,4 +403,55 @@ void main() {
     if (this.vertexBuffer) gl.deleteBuffer(this.vertexBuffer);
     this.volumeReady = false;
   }
+}
+
+// --- Arcball helper functions ---
+
+function arcballProject(x: number, y: number): Float32Array {
+  const r = 1.0;
+  const d = Math.sqrt(x * x + y * y);
+  if (d < r * 0.7071067811865476) {
+    // Inside sphere
+    return new Float32Array([x, y, Math.sqrt(r * r - d * d)]);
+  }
+  // On hyperbola (outside sphere)
+  const s = r * 0.7071067811865476;
+  return new Float32Array([x, y, s * s / d]);
+}
+
+function dot3(a: Float32Array, b: Float32Array): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+function cross3(out: Float32Array, a: Float32Array, b: Float32Array): void {
+  const ax = a[0], ay = a[1], az = a[2];
+  const bx = b[0], by = b[1], bz = b[2];
+  out[0] = ay * bz - az * by;
+  out[1] = az * bx - ax * bz;
+  out[2] = ax * by - ay * bx;
+}
+
+function axisAngleToMatrix(axis: Float32Array, angle: number): Float32Array {
+  const c = Math.cos(angle);
+  const s = Math.sin(angle);
+  const t = 1 - c;
+  const len = Math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+  if (len < 1e-10) {
+    const m = new Float32Array(16);
+    m[0] = m[5] = m[10] = m[15] = 1;
+    return m;
+  }
+  const x = axis[0] / len, y = axis[1] / len, z = axis[2] / len;
+  const m = new Float32Array(16);
+  m[0] = t * x * x + c;
+  m[1] = t * x * y + s * z;
+  m[2] = t * x * z - s * y;
+  m[4] = t * x * y - s * z;
+  m[5] = t * y * y + c;
+  m[6] = t * y * z + s * x;
+  m[8] = t * x * z + s * y;
+  m[9] = t * y * z - s * x;
+  m[10] = t * z * z + c;
+  m[15] = 1;
+  return m;
 }

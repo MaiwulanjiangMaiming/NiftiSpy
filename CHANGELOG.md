@@ -10,6 +10,22 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.5.2] - 2026-06-03
+
+### Changed
+- **WebGPU persistent uniform buffers**: `renderSlice3D()` and `computeHistogram()` no longer create and destroy a uniform buffer every frame. Persistent buffers are created during pipeline setup and updated via `device.queue.writeBuffer()`, eliminating per-frame GPU allocation overhead.
+- **WebGPU colormap & flip support**: The `_colormap`, `_flipX`, `_flipY` parameters in `renderSlice3D()` are now fully implemented. Flip is applied in the vertex shader via UV coordinate inversion; colormap LUT textures are generated from the shared `COLORMAPS` table and uploaded to GPU on change.
+
+### Added
+- **VolumeRaycaster `setConfig()`**: New method to update ray marching parameters (step size, max steps, lighting) without recreating the renderer.
+- **VolumeRaycaster `getTransferFunction()`**: New method that returns a copy of the current transfer function control points.
+- **Arcball rotation**: Volume 3D rotation now uses proper arcball rotation instead of simple Euler angles. Mouse drag is mapped onto a virtual sphere to compute rotation quaternions, providing intuitive and gimbal-lock-free 3D interaction.
+
+### Fixed
+- **Rendering fallback when volume3D not ready**: `paintSlice()` now gracefully falls back to 2D rendering when the 3D volume texture is not yet uploaded (e.g., still loading), instead of skipping the 2D WebGL2 path. The zoom/pan restriction on the 2D WebGL2 fallback has been removed.
+
+---
+
 ## [1.5.1] - 2026-06-01
 
 ### Fixed

@@ -1,5 +1,7 @@
 type Axis = 'axial' | 'coronal' | 'sagittal';
 
+declare const COLORMAPS: Record<string, (t: number) => [number, number, number]>;
+
 interface WebGPUVolumeState {
   texture: GPUTexture;
   bindGroup: GPUBindGroup;
@@ -24,6 +26,8 @@ export class WebGPURenderer {
   private histogramBuffer: GPUBuffer | null = null;
   private histogramReadBuffer: GPUBuffer | null = null;
   private histogramBindGroupLayout: GPUBindGroupLayout | null = null;
+  private sliceUniformBuffer: GPUBuffer | null = null;
+  private histUniformBuffer: GPUBuffer | null = null;
 
   private shaderCode = `
 struct VertexOutput {
@@ -41,7 +45,9 @@ struct Uniforms {
   sliceIndex: f32,
   axis: i32,
   volumeSize: vec3u,
-  _pad: u32,
+  flipX: u32,
+  flipY: u32,
+  _pad0: u32,
 };
 
 @group(0) @binding(3) var<uniform> uniforms: Uniforms;
@@ -53,7 +59,10 @@ fn vertexMain(
 ) -> VertexOutput {
   var output: VertexOutput;
   output.position = vec4f(pos, 0.0, 1.0);
-  output.texCoord = uv;
+  var finalUv = uv;
+  if (uniforms.flipX == 1u) { finalUv.x = 1.0 - finalUv.x; }
+  if (uniforms.flipY == 1u) { finalUv.y = 1.0 - finalUv.y; }
+  output.texCoord = finalUv;
   return output;
 }
 
@@ -228,6 +237,17 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       size: 256 * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
+
+    // Persistent uniform buffers — updated via writeBuffer each frame
+    this.sliceUniformBuffer = this.device.createBuffer({
+      size: 40, // 10 × u32 (matches Uniforms struct: 4 f32 + 3 u32 + 2 u32 + 1 u32 = 40 bytes)
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+
+    this.histUniformBuffer = this.device.createBuffer({
+      size: 32,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
   }
 
   isReady(): boolean {
@@ -253,19 +273,15 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       { width: nx, height: ny, depthOrArrayLayers: nz }
     );
 
-    const uniformBufferSize = 32;
-    const uniformBuffer = this.device.createBuffer({
-      size: uniformBufferSize,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
+    const lutView = this.lutTexture ? this.lutTexture.createView() : this.createDefaultLut();
 
     const bindGroup = this.device.createBindGroup({
       layout: (this.pipeline.getBindGroupLayout(0)),
       entries: [
         { binding: 0, resource: this.sampler! },
         { binding: 1, resource: texture.createView({ dimension: '3d' }) },
-        { binding: 2, resource: this.lutTexture ? this.lutTexture.createView() : this.createDefaultLut() },
-        { binding: 3, resource: { buffer: uniformBuffer } },
+        { binding: 2, resource: lutView },
+        { binding: 3, resource: { buffer: this.sliceUniformBuffer! } },
       ],
     });
 
@@ -310,13 +326,18 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     nx: number, ny: number, nz: number,
     windowLevel: number,
     windowWidth: number,
-    _colormap: string,
-    _flipX: boolean,
-    _flipY: boolean
+    colormap: string,
+    flipX: boolean,
+    flipY: boolean
   ): boolean {
-    if (!this.device || !this.context || !this.pipeline || !this.volumeState) return false;
+    if (!this.device || !this.context || !this.pipeline || !this.volumeState || !this.sliceUniformBuffer) return false;
 
-    const uniformData = new ArrayBuffer(32);
+    // Apply colormap LUT if changed
+    if (colormap && colormap !== 'gray') {
+      this.applyColormapLut(colormap);
+    }
+
+    const uniformData = new ArrayBuffer(40);
     const view = new DataView(uniformData);
     view.setFloat32(0, windowLevel, true);
     view.setFloat32(4, windowWidth, true);
@@ -325,23 +346,11 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     view.setUint32(16, nx, true);
     view.setUint32(20, ny, true);
     view.setUint32(24, nz, true);
-    view.setUint32(28, 0, true);
+    view.setUint32(28, flipX ? 1 : 0, true);
+    view.setUint32(32, flipY ? 1 : 0, true);
+    view.setUint32(36, 0, true);
 
-    const uniformBuffer = this.device.createBuffer({
-      size: 32,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(uniformBuffer, 0, uniformData);
-
-    const bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: this.sampler! },
-        { binding: 1, resource: this.volumeState.texture.createView({ dimension: '3d' }) },
-        { binding: 2, resource: this.lutTexture ? this.lutTexture.createView() : this.createDefaultLut() },
-        { binding: 3, resource: { buffer: uniformBuffer } },
-      ],
-    });
+    this.device.queue.writeBuffer(this.sliceUniformBuffer, 0, uniformData);
 
     const commandEncoder = this.device.createCommandEncoder();
     const textureView = this.context.getCurrentTexture().createView();
@@ -356,20 +365,61 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     });
 
     renderPass.setPipeline(this.pipeline);
-    renderPass.setBindGroup(0, bindGroup);
+    renderPass.setBindGroup(0, this.volumeState.bindGroup);
     renderPass.setVertexBuffer(0, this.posBuffer!);
     renderPass.setVertexBuffer(1, this.texCoordBuffer!);
     renderPass.draw(4);
     renderPass.end();
 
     this.device.queue.submit([commandEncoder.finish()]);
-
-    uniformBuffer.destroy();
     return true;
   }
 
+  private currentColormapName: string = 'gray';
+
+  private applyColormapLut(cmapName: string): void {
+    if (cmapName === this.currentColormapName || !this.device) return;
+    this.currentColormapName = cmapName;
+    const cmapFn = (COLORMAPS as Record<string, (t: number) => [number, number, number]>)[cmapName];
+    if (!cmapFn) return;
+    this.updateLutFromCmapFn(cmapFn);
+  }
+
+  updateLutFromCmapFn(cmapFn: (t: number) => [number, number, number]): void {
+    if (!this.device) return;
+    const lutData = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) {
+      const t = i / 255;
+      const [r, g, b] = cmapFn(t);
+      lutData[i * 4] = r;
+      lutData[i * 4 + 1] = g;
+      lutData[i * 4 + 2] = b;
+      lutData[i * 4 + 3] = 255;
+    }
+    this.lutTexture?.destroy();
+    const tex = this.device.createTexture({
+      size: { width: 256, height: 1 },
+      format: 'rgba8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeTexture({ texture: tex }, lutData as Uint8Array<ArrayBuffer>, { bytesPerRow: 256 * 4 }, { width: 256, height: 1 });
+    this.lutTexture = tex;
+    // Rebuild bind group with new LUT
+    if (this.volumeState && this.pipeline) {
+      this.volumeState.bindGroup = this.device.createBindGroup({
+        layout: this.pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: this.sampler! },
+          { binding: 1, resource: this.volumeState.texture.createView({ dimension: '3d' }) },
+          { binding: 2, resource: tex.createView() },
+          { binding: 3, resource: { buffer: this.sliceUniformBuffer! } },
+        ],
+      });
+    }
+  }
+
   async computeHistogram(windowLevel: number, windowWidth: number): Promise<Uint32Array | null> {
-    if (!this.device || !this.histogramPipeline || !this.volumeState || !this.histogramBuffer || !this.histogramReadBuffer) return null;
+    if (!this.device || !this.histogramPipeline || !this.volumeState || !this.histogramBuffer || !this.histogramReadBuffer || !this.histUniformBuffer) return null;
 
     const uniformData = new ArrayBuffer(32);
     const view = new DataView(uniformData);
@@ -381,18 +431,14 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     view.setUint32(20, 0, true);
     view.setUint32(24, 0, true);
 
-    const uniformBuffer = this.device.createBuffer({
-      size: 32,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    });
-    this.device.queue.writeBuffer(uniformBuffer, 0, uniformData);
+    this.device.queue.writeBuffer(this.histUniformBuffer, 0, uniformData);
 
     const bindGroup = this.device.createBindGroup({
       layout: this.histogramBindGroupLayout!,
       entries: [
         { binding: 0, resource: this.volumeState.texture.createView({ dimension: '3d' }) },
         { binding: 1, resource: { buffer: this.histogramBuffer } },
-        { binding: 2, resource: { buffer: uniformBuffer } },
+        { binding: 2, resource: { buffer: this.histUniformBuffer } },
       ],
     });
 
@@ -415,7 +461,6 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     const result = new Uint32Array(this.histogramReadBuffer.getMappedRange().slice(0));
     this.histogramReadBuffer.unmap();
 
-    uniformBuffer.destroy();
     return result;
   }
 
@@ -431,6 +476,8 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     this.texCoordBuffer?.destroy();
     this.histogramBuffer?.destroy();
     this.histogramReadBuffer?.destroy();
+    this.sliceUniformBuffer?.destroy();
+    this.histUniformBuffer?.destroy();
     this.device?.destroy();
     this.ready = false;
   }
