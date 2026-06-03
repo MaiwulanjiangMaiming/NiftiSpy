@@ -266,6 +266,7 @@ function publishPerfMonitor() {
       sabAvailable,
       savedBytes: workerCopyBytes > 0 ? workerCopyBytes - sharedBufferBytes : 0,
     },
+    prefetch: prefetchStats.getStats(),
   };
 }
 
@@ -1844,121 +1845,246 @@ function setCachedSliceRender(axis: string, idx: number, canvas: HTMLCanvasEleme
   pruneSliceCache();
 }
 
+// ── Prefetch Priority Queue ──────────────────────────────────────────
+type PrefetchPriority = 'high' | 'medium' | 'low';
+
+interface PrefetchJob {
+  axis: string;
+  sliceIdx: number;
+  priority: PrefetchPriority;
+  priorityValue: number; // numeric for sorting: high=3, medium=2, low=1
+  cancelled: boolean;
+}
+
+class PrefetchPriorityQueue {
+  private queue: PrefetchJob[] = [];
+  private activeCount = 0;
+  private maxActive = 2;
+
+  enqueue(job: PrefetchJob): void {
+    this.queue.push(job);
+    this.queue.sort((a, b) => b.priorityValue - a.priorityValue);
+    this.processNext();
+  }
+
+  cancelByAxisAndDirection(axis: string, behindStart: number, behindEnd: number): void {
+    for (const job of this.queue) {
+      if (job.axis === axis && job.sliceIdx >= behindStart && job.sliceIdx <= behindEnd) {
+        job.cancelled = true;
+      }
+    }
+  }
+
+  promoteHighPriority(axis: string, slices: number[]): void {
+    for (const job of this.queue) {
+      if (job.axis === axis && slices.includes(job.sliceIdx) && job.priority !== 'high') {
+        job.priority = 'high';
+        job.priorityValue = 3;
+      }
+    }
+    this.queue.sort((a, b) => b.priorityValue - a.priorityValue);
+  }
+
+  clear(): void {
+    for (const job of this.queue) job.cancelled = true;
+    this.queue.length = 0;
+  }
+
+  private processNext(): void {
+    while (this.queue.length > 0 && this.activeCount < this.maxActive) {
+      const job = this.queue.shift()!;
+      if (job.cancelled) continue;
+      this.activeCount++;
+      this.executeJob(job).finally(() => {
+        this.activeCount--;
+        this.processNext();
+      });
+    }
+  }
+
+  private async executeJob(job: PrefetchJob): Promise<void> {
+    if (job.cancelled || !header || !volumeData) return;
+    const cacheKey = `${job.axis}:${job.sliceIdx}:${colormap}:${windowWidth}:${windowLevel}`;
+    if (sliceRenderCache.has(cacheKey)) {
+      prefetchStats.recordHit();
+      return;
+    }
+    await new Promise<void>(resolve => {
+      requestIdleCallback(() => {
+        if (job.cancelled || !header || !volumeData) { resolve(); return; }
+        const { nx, ny, nz, dx, dy, dz } = header;
+        const slice = extractSlice(job.axis as 'axial' | 'coronal' | 'sagittal', job.sliceIdx);
+        let w: number, h: number;
+        if (job.axis === 'axial') { w = nx; h = ny; }
+        else if (job.axis === 'coronal') { w = nx; h = nz; }
+        else { w = ny; h = nz; }
+
+        const tc = document.createElement('canvas');
+        tc.width = w; tc.height = h;
+        const tctx = tc.getContext('2d')!;
+        const imgData = tctx.createImageData(w, h);
+        const pixels = imgData.data;
+        const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
+        const lo = windowLevel - windowWidth * 0.5;
+        const range = windowWidth || 1;
+        const dataRange = globalMax - globalMin || 1;
+        const n = w * h;
+
+        for (let i = 0; i < n; i++) {
+          const norm = (slice[i] - globalMin) / dataRange;
+          const t = Math.max(0, Math.min(1, (norm - lo) / range));
+          const [r, g, b] = cmapFn(t);
+          const idx4 = i * 4;
+          pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
+        }
+        tctx.putImageData(imgData, 0, 0);
+        setCachedSliceRender(job.axis, job.sliceIdx, tc);
+        float32Pool.release(slice);
+        resolve();
+      });
+    });
+  }
+}
+
+// ── Prefetch Statistics ──────────────────────────────────────────────
+const prefetchStats = {
+  hits: 0,
+  misses: 0,
+  waste: 0,
+  _prefetchedSlices: new Set<string>(),
+
+  recordPrefetch(axis: string, idx: number): void {
+    this._prefetchedSlices.add(`${axis}:${idx}`);
+  },
+
+  recordHit(): void { this.hits++; },
+
+  recordMiss(axis: string, idx: number): void {
+    const key = `${axis}:${idx}`;
+    if (!this._prefetchedSlices.has(key)) {
+      this.misses++;
+    }
+  },
+
+  recordWaste(axis: string, idx: number): void {
+    const key = `${axis}:${idx}`;
+    if (this._prefetchedSlices.has(key)) {
+      this.waste++;
+      this._prefetchedSlices.delete(key);
+    }
+  },
+
+  reset(): void {
+    this.hits = 0;
+    this.misses = 0;
+    this.waste = 0;
+    this._prefetchedSlices.clear();
+  },
+
+  getStats() {
+    return { hits: this.hits, misses: this.misses, waste: this.waste };
+  },
+};
+
+// ── Predictive Prefetcher ────────────────────────────────────────────
 class PredictivePrefetcher {
   private lastSlice: Record<string, number> = {};
   private lastTime: Record<string, number> = {};
-  private velocity: Record<string, number> = {};
+  private velocity: Record<string, number> = {}; // slices per 100ms (EMA)
+  private priorityQueue = new PrefetchPriorityQueue();
 
   onSliceChange(axis: string, sliceIndex: number): number {
     const now = performance.now();
     const prevSlice = this.lastSlice[axis] ?? sliceIndex;
     const prevTime = this.lastTime[axis] ?? now;
-    const dt = now - prevTime;
+    const dt = now - prevTime; // ms
 
     if (dt > 0 && prevTime > 0) {
-      const instantVelocity = (sliceIndex - prevSlice) / (dt / 1000);
+      // velocity in slices per 100ms
+      const instantVelocity = (sliceIndex - prevSlice) / (dt / 100);
+      // EMA: α = 0.3
       this.velocity[axis] = this.velocity[axis] * 0.7 + instantVelocity * 0.3;
     }
 
     this.lastSlice[axis] = sliceIndex;
     this.lastTime[axis] = now;
 
-    const v = Math.abs(this.velocity[axis] || 0);
-    if (v > 20) return Math.min(15, Math.ceil(v * 0.5));
-    if (v > 5) return Math.min(10, Math.ceil(v * 0.4));
-    return PRELOAD_RANGE;
+    // Record miss if this slice wasn't prefetched
+    const cacheKey = `${axis}:${sliceIndex}:${colormap}:${windowWidth}:${windowLevel}`;
+    if (!sliceRenderCache.has(cacheKey)) {
+      prefetchStats.recordMiss(axis, sliceIndex);
+    } else {
+      prefetchStats.recordHit();
+    }
+
+    // Cancel prefetches behind the scroll direction
+    const direction = this.getDirection(axis);
+    const behindStart = direction > 0 ? 0 : sliceIndex + 1;
+    const behindEnd = direction > 0 ? sliceIndex - 1 : (axis === 'axial' ? (header?.nz ?? 0) - 1 : axis === 'coronal' ? (header?.ny ?? 0) - 1 : (header?.nx ?? 0) - 1);
+    if (behindEnd >= behindStart) {
+      this.priorityQueue.cancelByAxisAndDirection(axis, behindStart, behindEnd);
+    }
+
+    return this.getPrefetchRange(axis);
+  }
+
+  getPrefetchRange(axis: string): number {
+    const v = Math.abs(this.velocity[axis] || 0); // slices/100ms
+    if (v > 3) return 15; // fast scrolling
+    if (v >= 1) return 8;  // medium scrolling
+    return 3;              // slow scrolling
   }
 
   getDirection(axis: string): 1 | -1 {
     return (this.velocity[axis] || 0) >= 0 ? 1 : -1;
+  }
+
+  getQueue(): PrefetchPriorityQueue {
+    return this.priorityQueue;
   }
 }
 
 const prefetcher = new PredictivePrefetcher();
 
 function preloadSlices(axis: 'axial' | 'coronal' | 'sagittal', currentIdx: number): void {
+  // No prefetch needed for 3D texture mode (GPU already has all data)
+  if (renderBackend === 'webgl3d' || renderBackend === 'webgpu') return;
   if (!header || !volumeData) return;
   const max = axis === 'axial' ? header.nz : axis === 'coronal' ? header.ny : header.nx;
   const prefetchRange = prefetcher.onSliceChange(axis, currentIdx);
   const direction = prefetcher.getDirection(axis);
+  const queue = prefetcher.getQueue();
 
-  const forwardRange = Math.min(prefetchRange * 2, max);
-  for (let d = 1; d <= forwardRange; d++) {
+  // Issue prefetch requests with priority
+  // High priority: 1-2 slices ahead
+  // Medium priority: 3-5 slices ahead
+  // Low priority: 6-15 slices ahead
+  for (let d = 1; d <= prefetchRange; d++) {
     const idx = currentIdx + d * direction;
     if (idx < 0 || idx >= max) continue;
     const cacheKey = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
     if (sliceRenderCache.has(cacheKey)) continue;
 
-    requestIdleCallback(() => {
-      if (!header || !volumeData) return;
-      const { nx, ny, nz, dx, dy, dz } = header;
-      const slice = extractSlice(axis, idx);
-      let w: number, h: number, pw: number, ph: number;
-      if (axis === 'axial') { w = nx; h = ny; pw = nx * dx; ph = ny * dy; }
-      else if (axis === 'coronal') { w = nx; h = nz; pw = nx * dx; ph = nz * dz; }
-      else { w = ny; h = nz; pw = ny * dy; ph = nz * dz; }
+    prefetchStats.recordPrefetch(axis, idx);
 
-      const tc = document.createElement('canvas');
-      tc.width = w; tc.height = h;
-      const tctx = tc.getContext('2d')!;
-      const imgData = tctx.createImageData(w, h);
-      const pixels = imgData.data;
-      const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
-      const lo = windowLevel - windowWidth * 0.5;
-      const range = windowWidth || 1;
-      const dataRange = globalMax - globalMin || 1;
-      const n = w * h;
+    let priority: PrefetchPriority;
+    let priorityValue: number;
+    if (d <= 2) { priority = 'high'; priorityValue = 3; }
+    else if (d <= 5) { priority = 'medium'; priorityValue = 2; }
+    else { priority = 'low'; priorityValue = 1; }
 
-      for (let i = 0; i < n; i++) {
-        const norm = (slice[i] - globalMin) / dataRange;
-        const t = Math.max(0, Math.min(1, (norm - lo) / range));
-        const [r, g, b] = cmapFn(t);
-        const idx4 = i * 4;
-        pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
-      }
-      tctx.putImageData(imgData, 0, 0);
-      setCachedSliceRender(axis, idx, tc);
-      float32Pool.release(slice);
-    });
+    queue.enqueue({ axis, sliceIdx: idx, priority, priorityValue, cancelled: false });
   }
 
-  for (let d = 1; d <= prefetchRange; d++) {
+  // Also prefetch a small range behind (1-2 slices) at low priority
+  for (let d = 1; d <= 2; d++) {
     const idx = currentIdx - d * direction;
     if (idx < 0 || idx >= max) continue;
     const cacheKey = `${axis}:${idx}:${colormap}:${windowWidth}:${windowLevel}`;
     if (sliceRenderCache.has(cacheKey)) continue;
 
-    requestIdleCallback(() => {
-      if (!header || !volumeData) return;
-      const { nx, ny, nz, dx, dy, dz } = header;
-      const slice = extractSlice(axis, idx);
-      let w: number, h: number;
-      if (axis === 'axial') { w = nx; h = ny; }
-      else if (axis === 'coronal') { w = nx; h = nz; }
-      else { w = ny; h = nz; }
-
-      const tc = document.createElement('canvas');
-      tc.width = w; tc.height = h;
-      const tctx = tc.getContext('2d')!;
-      const imgData = tctx.createImageData(w, h);
-      const pixels = imgData.data;
-      const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
-      const lo = windowLevel - windowWidth * 0.5;
-      const range = windowWidth || 1;
-      const dataRange = globalMax - globalMin || 1;
-      const n = w * h;
-
-      for (let i = 0; i < n; i++) {
-        const norm = (slice[i] - globalMin) / dataRange;
-        const t = Math.max(0, Math.min(1, (norm - lo) / range));
-        const [r, g, b] = cmapFn(t);
-        const idx4 = i * 4;
-        pixels[idx4] = r; pixels[idx4 + 1] = g; pixels[idx4 + 2] = b; pixels[idx4 + 3] = 255;
-      }
-      tctx.putImageData(imgData, 0, 0);
-      setCachedSliceRender(axis, idx, tc);
-      float32Pool.release(slice);
-    });
+    prefetchStats.recordPrefetch(axis, idx);
+    queue.enqueue({ axis, sliceIdx: idx, priority: 'low', priorityValue: 1, cancelled: false });
   }
 }
 
