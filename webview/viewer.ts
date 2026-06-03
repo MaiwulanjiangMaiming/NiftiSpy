@@ -342,15 +342,29 @@ class WebGLRenderer {
   private texture: WebGLTexture | null = null;
   private texture3D: WebGLTexture | null = null;
   private lutTexture: WebGLTexture | null = null;
+  private colormapTexture: WebGLTexture | null = null;
   private posBuffer: WebGLBuffer | null = null;
   private texCoordBuffer: WebGLBuffer | null = null;
   private ready = false;
   private currentLut: string = '';
+  private currentCmap3D: string = '';
   private supportsFloatTexture = false;
   private isWebGL2 = false;
   private floatLinear = false;
   private volume3DReady = false;
   private volume3DSize = 0;
+  // Chunked 3D texture fields
+  private texture3DChunks: WebGLTexture[] = [];
+  private chunkZSize = 0;
+  private chunkCount = 0;
+  private chunkNx = 0;
+  private chunkNy = 0;
+  private chunkNz = 0;
+  // Smooth slice transition
+  private targetSliceIdx: Record<string, number> = { axial: 0, coronal: 0, sagittal: 0 };
+  private animatingSliceIdx: Record<string, number> = { axial: 0, coronal: 0, sagittal: 0 };
+  private animationFrameId: number | null = null;
+  private static readonly SLICE_LERP_SPEED = 0.25;
 
   private vertexShaderSource = `#version 100
 attribute vec2 a_position;
@@ -414,26 +428,30 @@ void main() {
 precision highp float;
 in vec2 v_texCoord;
 uniform sampler3D u_volume;
-uniform sampler2D u_lut;
+uniform sampler2D u_colormap;
 uniform float u_windowLevel;
 uniform float u_windowWidth;
 uniform float u_sliceIndex;
 uniform int u_axis;
 uniform vec3 u_volumeSize;
+uniform int u_flipX;
+uniform int u_flipY;
 out vec4 fragColor;
 void main() {
+  float fx = (u_flipX == 1) ? 1.0 - v_texCoord.x : v_texCoord.x;
+  float fy = (u_flipY == 1) ? 1.0 - v_texCoord.y : v_texCoord.y;
   vec3 uvw;
   if (u_axis == 0) {
-    uvw = vec3(v_texCoord.x, v_texCoord.y, u_sliceIndex / u_volumeSize.z);
+    uvw = vec3(fx, fy, u_sliceIndex / u_volumeSize.z);
   } else if (u_axis == 1) {
-    uvw = vec3(v_texCoord.x, u_sliceIndex / u_volumeSize.y, v_texCoord.y);
+    uvw = vec3(fx, u_sliceIndex / u_volumeSize.y, fy);
   } else {
-    uvw = vec3(u_sliceIndex / u_volumeSize.x, v_texCoord.x, v_texCoord.y);
+    uvw = vec3(u_sliceIndex / u_volumeSize.x, fx, fy);
   }
   float rawValue = texture(u_volume, uvw).r;
   float lo = u_windowLevel - u_windowWidth * 0.5;
   float t = clamp((rawValue - lo) / u_windowWidth, 0.0, 1.0);
-  vec4 color = texture(u_lut, vec2(t, 0.5));
+  vec4 color = texture(u_colormap, vec2(t, 0.5));
   fragColor = color;
 }`;
 
@@ -501,6 +519,9 @@ void main() {
 
     this.texture = gl.createTexture();
     this.lutTexture = gl.createTexture();
+    if (this.isWebGL2) {
+      this.colormapTexture = gl.createTexture();
+    }
     this.posBuffer = gl.createBuffer();
     this.texCoordBuffer = gl.createBuffer();
 
@@ -640,6 +661,22 @@ void main() {
     const availableMB = (maxTextureSize * maxTextureSize * 4) / (1024 * 1024);
     if (estimatedBytes > availableMB * 1024 * 1024) return false;
 
+    // Clean up any previous chunked textures
+    this.deleteChunkedTextures();
+
+    const CHUNK_THRESHOLD = 512 * 1024 * 1024; // 512MB
+    const VOLUME_3D_MAX_BYTES = 1 * 1024 * 1024 * 1024; // 1GB
+
+    if (estimatedBytes > VOLUME_3D_MAX_BYTES) {
+      return false; // Too large even for chunked
+    }
+
+    if (estimatedBytes > CHUNK_THRESHOLD) {
+      // Chunked upload for volumes between 512MB and 1GB
+      return this.uploadVolume3DChunked(data, nx, ny, nz);
+    }
+
+    // Single texture upload for smaller volumes
     if (!this.texture3D) {
       this.texture3D = gl2.createTexture();
     }
@@ -669,13 +706,85 @@ void main() {
 
     this.volume3DReady = true;
     this.volume3DSize = nx * ny * nz;
+    this.chunkCount = 0;
     return true;
+  }
+
+  private uploadVolume3DChunked(data: Float32Array, nx: number, ny: number, nz: number): boolean {
+    const gl2 = this.gl as WebGL2RenderingContext;
+    // Determine chunk size: split along Z axis
+    const sliceSize = nx * ny;
+    const bytesPerSlice = sliceSize * 4;
+    const targetChunkBytes = 256 * 1024 * 1024; // 256MB per chunk
+    const slicesPerChunk = Math.max(1, Math.floor(targetChunkBytes / bytesPerSlice));
+    const numChunks = Math.ceil(nz / slicesPerChunk);
+
+    this.texture3DChunks = [];
+    this.chunkZSize = slicesPerChunk;
+    this.chunkCount = numChunks;
+    this.chunkNx = nx;
+    this.chunkNy = ny;
+    this.chunkNz = nz;
+
+    const filter = this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
+
+    for (let c = 0; c < numChunks; c++) {
+      const zStart = c * slicesPerChunk;
+      const zEnd = Math.min(zStart + slicesPerChunk, nz);
+      const chunkDepth = zEnd - zStart;
+      const chunkVoxels = sliceSize * chunkDepth;
+      const chunkData = data.slice(zStart * sliceSize, zStart * sliceSize + chunkVoxels);
+
+      const tex = gl2.createTexture()!;
+      gl2.activeTexture(gl2.TEXTURE0);
+      gl2.bindTexture(gl2.TEXTURE_3D, tex);
+      gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_MIN_FILTER, filter);
+      gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_MAG_FILTER, filter);
+      gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
+      gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
+      gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_R, gl2.CLAMP_TO_EDGE);
+
+      try {
+        gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, chunkDepth, 0, gl2.RED, gl2.FLOAT, chunkData);
+      } catch {
+        // Clean up already created chunk textures
+        for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
+        this.texture3DChunks = [];
+        this.chunkCount = 0;
+        gl2.deleteTexture(tex);
+        return false;
+      }
+
+      if (gl2.getError() !== gl2.NO_ERROR) {
+        for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
+        this.texture3DChunks = [];
+        this.chunkCount = 0;
+        gl2.deleteTexture(tex);
+        return false;
+      }
+
+      this.texture3DChunks.push(tex);
+    }
+
+    this.volume3DReady = true;
+    this.volume3DSize = nx * ny * nz;
+    return true;
+  }
+
+  private deleteChunkedTextures(): void {
+    if (this.texture3DChunks.length > 0 && this.gl) {
+      for (const t of this.texture3DChunks) {
+        this.gl!.deleteTexture(t);
+      }
+      this.texture3DChunks = [];
+      this.chunkCount = 0;
+    }
   }
 
   renderSlice3D(canvas: HTMLCanvasElement, axis: number, sliceIndex: number,
     nx: number, ny: number, nz: number, lo: number, range: number,
     cmapName: string, flipX: boolean = false, flipY: boolean = false): boolean {
-    if (!this.volume3DReady || !this.texture3D || !this.program3D || !this.isWebGL2) return false;
+    if (!this.volume3DReady || !this.program3D || !this.isWebGL2) return false;
     const gl2 = this.gl as WebGL2RenderingContext;
 
     const dpr = window.devicePixelRatio || 1;
@@ -685,24 +794,38 @@ void main() {
 
     gl2.useProgram(this.program3D);
 
+    // Bind the correct 3D texture (single or chunked)
     gl2.activeTexture(gl2.TEXTURE0);
-    gl2.bindTexture(gl2.TEXTURE_3D, this.texture3D);
+    if (this.chunkCount > 0) {
+      // Chunked: select the correct chunk based on slice index
+      const effectiveSliceZ = axis === 0 ? sliceIndex : axis === 1 ? sliceIndex : sliceIndex;
+      const chunkIdx = Math.min(Math.floor(effectiveSliceZ / this.chunkZSize), this.chunkCount - 1);
+      const tex = this.texture3DChunks[chunkIdx];
+      if (!tex) return false;
+      gl2.bindTexture(gl2.TEXTURE_3D, tex);
+    } else {
+      if (!this.texture3D) return false;
+      gl2.bindTexture(gl2.TEXTURE_3D, this.texture3D);
+    }
 
-    if (this.currentLut !== cmapName) {
-      this.updateLUT(cmapName);
-      this.currentLut = cmapName;
+    // Update colormap 1D LUT texture if changed
+    if (this.currentCmap3D !== cmapName) {
+      this.createColormapTexture(cmapName);
+      this.currentCmap3D = cmapName;
     }
 
     gl2.activeTexture(gl2.TEXTURE1);
-    gl2.bindTexture(gl2.TEXTURE_2D, this.lutTexture);
+    gl2.bindTexture(gl2.TEXTURE_2D, this.colormapTexture);
 
     gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_volume'), 0);
-    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_lut'), 1);
+    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_colormap'), 1);
     gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_windowLevel'), lo + range * 0.5);
     gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_windowWidth'), range);
     gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_sliceIndex'), sliceIndex);
     gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_axis'), axis);
     gl2.uniform3f(gl2.getUniformLocation(this.program3D, 'u_volumeSize'), nx, ny, nz);
+    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_flipX'), flipX ? 1 : 0);
+    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_flipY'), flipY ? 1 : 0);
 
     const aPos = gl2.getAttribLocation(this.program3D, 'a_position');
     const aTex = gl2.getAttribLocation(this.program3D, 'a_texCoord');
@@ -713,14 +836,37 @@ void main() {
     gl2.vertexAttribPointer(aPos, 2, gl2.FLOAT, false, 0, 0);
 
     gl2.bindBuffer(gl2.ARRAY_BUFFER, this.texCoordBuffer);
-    const tx0 = flipX ? 1 : 0, tx1 = flipX ? 0 : 1;
-    const ty0 = flipY ? 0 : 1, ty1 = flipY ? 1 : 0;
-    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([tx0, ty0, tx1, ty0, tx0, ty1, tx1, ty1]), gl2.DYNAMIC_DRAW);
+    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]), gl2.STATIC_DRAW);
     gl2.enableVertexAttribArray(aTex);
     gl2.vertexAttribPointer(aTex, 2, gl2.FLOAT, false, 0, 0);
 
     gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
     return gl2.getError() === gl2.NO_ERROR;
+  }
+
+  createColormapTexture(cmapName: string): void {
+    if (!this.isWebGL2 || !this.gl) return;
+    const gl2 = this.gl as WebGL2RenderingContext;
+    const cmapFn = COLORMAPS[cmapName] || COLORMAPS.gray;
+    const lutData = new Uint8Array(256 * 4);
+    for (let i = 0; i < 256; i++) {
+      const t = i / 255;
+      const [r, g, b] = cmapFn(t);
+      lutData[i * 4] = r;
+      lutData[i * 4 + 1] = g;
+      lutData[i * 4 + 2] = b;
+      lutData[i * 4 + 3] = 255;
+    }
+    if (!this.colormapTexture) {
+      this.colormapTexture = gl2.createTexture();
+    }
+    gl2.activeTexture(gl2.TEXTURE1);
+    gl2.bindTexture(gl2.TEXTURE_2D, this.colormapTexture);
+    gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MIN_FILTER, gl2.LINEAR);
+    gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_MAG_FILTER, gl2.LINEAR);
+    gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
+    gl2.texParameteri(gl2.TEXTURE_2D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
+    gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.RGBA, 256, 1, 0, gl2.RGBA, gl2.UNSIGNED_BYTE, lutData);
   }
 
   isVolume3DReady(): boolean { return this.volume3DReady; }
@@ -730,6 +876,7 @@ void main() {
       this.gl.deleteTexture(this.texture3D);
       this.texture3D = null;
     }
+    this.deleteChunkedTextures();
     this.volume3DReady = false;
     this.volume3DSize = 0;
   }
@@ -764,10 +911,57 @@ void main() {
     if (this.program) this.gl.deleteProgram(this.program);
     if (this.texture) this.gl.deleteTexture(this.texture);
     if (this.lutTexture) this.gl.deleteTexture(this.lutTexture);
+    if (this.colormapTexture) this.gl.deleteTexture(this.colormapTexture);
     if (this.posBuffer) this.gl.deleteBuffer(this.posBuffer);
     if (this.texCoordBuffer) this.gl.deleteBuffer(this.texCoordBuffer);
+    this.deleteChunkedTextures();
+    this.stopSliceAnimation();
     this.ready = false;
     this.gl = null;
+  }
+
+  // Smooth slice transition methods
+  setTargetSlice(axis: string, targetIdx: number): void {
+    this.targetSliceIdx[axis] = targetIdx;
+    if (this.animatingSliceIdx[axis] === undefined) {
+      this.animatingSliceIdx[axis] = targetIdx;
+    }
+    if (this.animationFrameId === null) {
+      this.startSliceAnimation();
+    }
+  }
+
+  getCurrentAnimatedSlice(axis: string): number {
+    return this.animatingSliceIdx[axis] ?? this.targetSliceIdx[axis] ?? 0;
+  }
+
+  private startSliceAnimation(): void {
+    const tick = () => {
+      let allSettled = true;
+      for (const axis of ['axial', 'coronal', 'sagittal']) {
+        const target = this.targetSliceIdx[axis] ?? 0;
+        const current = this.animatingSliceIdx[axis] ?? 0;
+        if (Math.abs(target - current) > 0.01) {
+          this.animatingSliceIdx[axis] = current + (target - current) * WebGLRenderer.SLICE_LERP_SPEED;
+          allSettled = false;
+        } else {
+          this.animatingSliceIdx[axis] = target;
+        }
+      }
+      if (!allSettled) {
+        this.animationFrameId = requestAnimationFrame(tick);
+      } else {
+        this.animationFrameId = null;
+      }
+    };
+    this.animationFrameId = requestAnimationFrame(tick);
+  }
+
+  private stopSliceAnimation(): void {
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
+    }
   }
 }
 
