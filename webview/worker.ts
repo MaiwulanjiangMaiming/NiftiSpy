@@ -19,7 +19,7 @@ interface CachedSlice {
 
 const sliceCache = new Map<string, CachedSlice>();
 
-let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number } | null = null;
+let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; ready: Int32Array } | null = null;
 
 // OffscreenCanvas rendering state
 const offscreenCanvases = new Map<string, { canvas: OffscreenCanvas; gl: WebGL2RenderingContext | null }>();
@@ -36,6 +36,7 @@ self.onmessage = async (e: MessageEvent) => {
     } else if (type === 'fetchSlice') {
       await handleFetchSlice(e.data);
     } else if (type === 'sharedVolume') {
+      const readyFlag = new Int32Array(e.data.buffer as SharedArrayBuffer, 0, 1);
       sharedVolume = {
         buffer: e.data.buffer as SharedArrayBuffer,
         nx: e.data.nx,
@@ -43,7 +44,11 @@ self.onmessage = async (e: MessageEvent) => {
         nz: e.data.nz,
         slope: e.data.slope ?? 1,
         inter: e.data.inter ?? 0,
+        ready: readyFlag,
       };
+      // Signal that shared volume data is ready for reading
+      Atomics.store(readyFlag, 0, 1);
+      Atomics.notify(readyFlag, 0);
     } else if (type === 'initOffscreenCanvas') {
       handleInitOffscreenCanvas(e.data);
     } else if (type === 'renderRequest') {
@@ -231,6 +236,10 @@ async function handleFetchSlice(message: {
   const factor = Math.max(1, message.factor || 1);
 
   if (sharedVolume && factor === 1) {
+    // Wait for shared volume data to be ready using Atomics
+    if (sharedVolume.ready && Atomics.load(sharedVolume.ready, 0) !== 1) {
+      Atomics.wait(sharedVolume.ready, 0, 0, 5000); // wait up to 5s
+    }
     const { buffer, nx, ny, nz, slope, inter } = sharedVolume;
     const data = new Float32Array(buffer);
     const idx = message.index;

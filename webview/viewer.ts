@@ -62,6 +62,22 @@ let sabAvailable = false;
 
 try { sabAvailable = typeof SharedArrayBuffer !== 'undefined'; } catch { sabAvailable = false; }
 
+function verifySABSupport(): boolean {
+  try {
+    const testBuf = new SharedArrayBuffer(1024);
+    // If we got here, SAB is available
+    sabAvailable = true;
+    return true;
+  } catch (err: any) {
+    console.warn('[NiftiSpy] SharedArrayBuffer not available:', err?.message || err);
+    sabAvailable = false;
+    return false;
+  }
+}
+
+// Verify SAB support on load
+verifySABSupport();
+
 function createSharedVolumeBuffer(data: Float32Array): SharedArrayBuffer | null {
   if (!sabAvailable) return null;
   try {
@@ -79,6 +95,11 @@ let globalMin = 0;
 let globalMax = 1;
 let initialWindowWidth = 1.0;
 let initialWindowLevel = 0.5;
+
+// Memory usage tracking
+let totalVolumeBytes = 0;
+let sharedBufferBytes = 0;
+let workerCopyBytes = 0;
 
 const sliceIdx = { axial: 0, coronal: 0, sagittal: 0 };
 let windowWidth = 1.0;
@@ -238,6 +259,13 @@ function publishPerfMonitor() {
     scheduledActiveIndex,
     fps: fpsCounter.getFPS(),
     offscreenCanvas: { ...offscreenCanvasEnabled },
+    memory: {
+      totalVolumeBytes,
+      sharedBufferBytes,
+      workerCopyBytes,
+      sabAvailable,
+      savedBytes: workerCopyBytes > 0 ? workerCopyBytes - sharedBufferBytes : 0,
+    },
   };
 }
 
@@ -3432,6 +3460,34 @@ function handleCachedVolume(msg: any): void {
       default: volumeData = new Float32Array(voxelBuffer); break;
     }
     fullVolumeLoaded = true;
+
+    // Track memory usage
+    totalVolumeBytes = volumeData.byteLength;
+    workerCopyBytes = volumeData.byteLength; // would be duplicated in workers without SAB
+    sharedBufferBytes = 0;
+
+    // Create SharedArrayBuffer and broadcast to slice workers for zero-copy access
+    if (header && volumeData) {
+      const n = header.nx * header.ny * header.nz;
+      let float32Data: Float32Array;
+      if (volumeData instanceof Float32Array) {
+        float32Data = volumeData;
+      } else {
+        float32Data = new Float32Array(n);
+        for (let i = 0; i < n; i++) float32Data[i] = (volumeData as any)[i] * dataSlope + dataInter;
+      }
+      sharedVolumeBuffer = createSharedVolumeBuffer(float32Data);
+      if (sharedVolumeBuffer) {
+        sharedBufferBytes = sharedVolumeBuffer.byteLength;
+        workerCopyBytes = 0; // workers no longer need their own copy
+        broadcastToSliceWorkers({
+          type: 'sharedVolume',
+          buffer: sharedVolumeBuffer,
+          nx: header.nx, ny: header.ny, nz: header.nz,
+          slope: dataSlope, inter: dataInter,
+        });
+      }
+    }
   }
 
   if (!voxelBuffer || !volumeData) {
