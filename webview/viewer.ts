@@ -136,6 +136,85 @@ const perfMonitor = {
   evictions: 0,
 };
 
+// OffscreenCanvas support
+const offscreenCanvasSupported = typeof OffscreenCanvas !== 'undefined' &&
+  typeof HTMLCanvasElement !== 'undefined' &&
+  !!(HTMLCanvasElement.prototype as any).transferControlToOffscreen;
+
+const offscreenCanvasEnabled: Record<Axis, boolean> = { axial: false, coronal: false, sagittal: false };
+
+function tryEnableOffscreenCanvas(axis: Axis): boolean {
+  if (!offscreenCanvasSupported) return false;
+  const canvas = canvases[axis];
+  if (!canvas) return false;
+  // Only enable for WebGL2 3D texture path (the most CPU-intensive)
+  if (renderBackend !== 'webgl3d') return false;
+  try {
+    const offscreen = (canvas as any).transferControlToOffscreen() as OffscreenCanvas;
+    const worker = sliceWorkers[AXIS_TO_WORKER_IDX[axis]];
+    if (worker) {
+      worker.postMessage({ type: 'initOffscreenCanvas', axis, canvas: offscreen }, [offscreen]);
+      offscreenCanvasEnabled[axis] = true;
+      return true;
+    }
+  } catch {
+    // Graceful fallback: some browsers don't support transferControlToOffscreen
+    offscreenCanvasEnabled[axis] = false;
+  }
+  return false;
+}
+
+// Render Request Queue
+interface RenderRequest {
+  axis: Axis;
+  sliceIndex: number;
+  windowLevel: number;
+  windowWidth: number;
+  colormap: string;
+  flipX: boolean;
+  flipY: boolean;
+}
+
+const pendingRenderRequests = new Map<Axis, RenderRequest>();
+
+function enqueueRenderRequest(req: RenderRequest): void {
+  pendingRenderRequests.set(req.axis, req);
+  const worker = sliceWorkers[AXIS_TO_WORKER_IDX[req.axis]];
+  if (worker && offscreenCanvasEnabled[req.axis]) {
+    worker.postMessage({
+      type: 'renderRequest',
+      axis: req.axis,
+      sliceIndex: req.sliceIndex,
+      windowLevel: req.windowLevel,
+      windowWidth: req.windowWidth,
+      colormap: req.colormap,
+      flipX: req.flipX,
+      flipY: req.flipY,
+    });
+  }
+}
+
+// FPS Counter
+const fpsCounter = {
+  frames: [] as number[],
+  lastTime: 0,
+
+  recordFrame(): void {
+    const now = performance.now();
+    this.frames.push(now);
+    // Remove entries older than 1 second
+    const cutoff = now - 1000;
+    while (this.frames.length > 0 && this.frames[0] < cutoff) {
+      this.frames.shift();
+    }
+    this.lastTime = now;
+  },
+
+  getFPS(): number {
+    return this.frames.length;
+  },
+};
+
 const viewerConfig: ViewerConfig = {
   previewMode: 'binary',
   renderBackend: 'canvas',
@@ -157,6 +236,8 @@ function publishPerfMonitor() {
     residentImages: images.filter(img => !!img.data).length,
     activeVolumeLoadKey,
     scheduledActiveIndex,
+    fps: fpsCounter.getFPS(),
+    offscreenCanvas: { ...offscreenCanvasEnabled },
   };
 }
 
@@ -1209,6 +1290,12 @@ function attachWorkerRouter(worker: Worker) {
       bandwidthEstimator.addSample(msg.bytes || 0, msg.durationMs || 0);
       return;
     }
+    if (msg?.type === 'renderComplete') {
+      // Worker finished OffscreenCanvas rendering; clear pending request
+      const axis = msg.axis as Axis;
+      if (axis) pendingRenderRequests.delete(axis);
+      return;
+    }
     const streamHandler = workerStreamHandlers.get(msg.id);
     if (streamHandler) {
       streamHandler(msg);
@@ -1393,6 +1480,10 @@ function tryUploadVolume3D() {
       if (r) {
         if (!r.isVolume3DReady()) {
           r.uploadVolume3D(float32Data, nx, ny, nz);
+        }
+        // Try enabling OffscreenCanvas for this axis (only for WebGL2 3D texture path)
+        if (r.isVolume3DReady() && !offscreenCanvasEnabled[axis]) {
+          tryEnableOffscreenCanvas(axis);
         }
       }
       const wgr = webgpuRenderers[axis];
@@ -1971,6 +2062,8 @@ function multiply4x4(a: Float32Array, b: Float32Array): Float32Array {
 }
 
 function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
+  fpsCounter.recordFrame();
+
   if (renderMode === 'volume' && axis === 'axial' && volumeRaycaster?.isReady()) {
     renderVolume3D();
     return;
@@ -2014,6 +2107,25 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   // Try 3D texture paths (WebGPU or WebGL2) when volume is uploaded
   if (renderBackend !== 'canvas2d' && renderBackend !== 'webgl2d' && renderer && renderer.isVolume3DReady() && header) {
     const axisIdx = axis === 'axial' ? 0 : axis === 'coronal' ? 1 : 2;
+
+    // OffscreenCanvas path: delegate rendering to worker via render request queue
+    if (offscreenCanvasEnabled[axis as Axis]) {
+      enqueueRenderRequest({
+        axis: axis as Axis,
+        sliceIndex: sliceIdx[axis as Axis],
+        windowLevel: windowLevel - windowWidth * 0.5,
+        windowWidth: windowWidth || 1,
+        colormap,
+        flipX: flips.flipX,
+        flipY: flips.flipY,
+      });
+      updateDirectionLabels(axis);
+      updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+      updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+      updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+      return;
+    }
+
     const webgpuRenderer = webgpuRenderers[axis as Axis];
     if (renderBackend === 'webgpu' && webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
       axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz,

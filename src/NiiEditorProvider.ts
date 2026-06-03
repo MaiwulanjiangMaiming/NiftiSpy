@@ -684,7 +684,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.6.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.6.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>

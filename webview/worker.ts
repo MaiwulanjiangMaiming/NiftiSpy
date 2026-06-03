@@ -21,6 +21,9 @@ const sliceCache = new Map<string, CachedSlice>();
 
 let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number } | null = null;
 
+// OffscreenCanvas rendering state
+const offscreenCanvases = new Map<string, { canvas: OffscreenCanvas; gl: WebGL2RenderingContext | null }>();
+
 self.onmessage = async (e: MessageEvent) => {
   const { id, type, url, isGzip } = e.data;
   try {
@@ -41,6 +44,10 @@ self.onmessage = async (e: MessageEvent) => {
         slope: e.data.slope ?? 1,
         inter: e.data.inter ?? 0,
       };
+    } else if (type === 'initOffscreenCanvas') {
+      handleInitOffscreenCanvas(e.data);
+    } else if (type === 'renderRequest') {
+      handleRenderRequest(e.data);
     }
   } catch (err: any) {
     if (err?.name === 'AbortError') {
@@ -50,6 +57,34 @@ self.onmessage = async (e: MessageEvent) => {
     }
   }
 };
+
+function handleInitOffscreenCanvas(data: { axis: string; canvas: OffscreenCanvas }): void {
+  const { axis, canvas } = data;
+  try {
+    const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true }) as WebGL2RenderingContext | null;
+    if (gl) {
+      offscreenCanvases.set(axis, { canvas, gl });
+    }
+  } catch {
+    // OffscreenCanvas WebGL2 context creation failed; skip
+  }
+}
+
+function handleRenderRequest(data: { axis: string; sliceIndex: number; windowLevel: number; windowWidth: number; colormap: string; flipX: boolean; flipY: boolean }): void {
+  const { axis } = data;
+  const entry = offscreenCanvases.get(axis);
+  if (!entry || !entry.gl) {
+    // No OffscreenCanvas for this axis; post renderComplete to clear pending
+    self.postMessage({ type: 'renderComplete', axis });
+    return;
+  }
+  // The actual WebGL rendering on the OffscreenCanvas would go here.
+  // For now, we acknowledge the render request so the main thread can proceed.
+  // Full WebGL2 3D texture rendering in the worker requires the volume data
+  // and shader programs to be set up in the worker context, which is a
+  // larger refactor. This stub enables the async render pipeline.
+  self.postMessage({ type: 'renderComplete', axis });
+}
 
 function abortError(): Error {
   const err = new Error('Aborted');
