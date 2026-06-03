@@ -5,6 +5,7 @@ import * as zlib from 'zlib';
 import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
+import { downsampleSlice } from './nifti/sliceExtractor';
 
 interface LoadJob {
   webviewId: string;
@@ -423,6 +424,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               sagittal: Math.floor(header.nx / 2),
             },
           });
+
+          // Generate LOD levels in background for progressive loading
+          this.generateAndSendLOD(webview, header, voxelOnly, signal);
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Local load error:', err);
@@ -517,6 +521,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               sagittal: Math.floor(header.nx / 2),
             },
           });
+
+          // Generate LOD levels in background for progressive loading
+          this.generateAndSendLOD(webview, header, voxelOnly, signal);
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Preview load error:', err);
@@ -529,6 +536,126 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private isWebviewActive(webviewId: string): boolean {
     const entry = this.activeWebviews.get(webviewId);
     return !!entry && entry.panel.active;
+  }
+
+  private async generateAndSendLOD(
+    webview: vscode.Webview,
+    header: any,
+    voxelOnly: Uint8Array,
+    signal: AbortSignal
+  ): Promise<void> {
+    const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, bytesPerVoxel } = header;
+    const n = nx * ny * nz;
+    const bpv = Math.max(1, bytesPerVoxel);
+    const le = littleEndian;
+    const slope = scl_slope || 1;
+    const inter = scl_inter || 0;
+
+    // Convert voxel data to Float32Array for downsampling
+    const floatData = new Float32Array(n);
+    const view = new DataView(voxelOnly.buffer, voxelOnly.byteOffset, Math.min(voxelOnly.byteLength, n * bpv));
+    for (let i = 0; i < n; i++) {
+      const off = i * bpv;
+      let val: number;
+      switch (datatype) {
+        case 2: val = voxelOnly[off]; break;
+        case 4: val = view.getInt16(off, le); break;
+        case 8: val = view.getInt32(off, le); break;
+        case 16: val = view.getFloat32(off, le); break;
+        case 64: val = view.getFloat64(off, le); break;
+        case 256: val = (voxelOnly[off] << 24) >> 24; break;
+        case 512: val = view.getUint16(off, le); break;
+        case 768: val = view.getUint32(off, le); break;
+        default: val = 0;
+      }
+      floatData[i] = val * slope + inter;
+    }
+
+    // Generate LOD2 (1/4 resolution) — send immediately
+    if (signal.aborted) return;
+    try {
+      const axialSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2));
+      if (axialSliceLod2 && !signal.aborted) {
+        const coronalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2));
+        const sagittalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2));
+        webview.postMessage({
+          type: 'lodData',
+          level: 2,
+          axial: Array.from(axialSliceLod2.data),
+          axialW: axialSliceLod2.w,
+          axialH: axialSliceLod2.h,
+          coronal: coronalSliceLod2 ? Array.from(coronalSliceLod2.data) : [],
+          coronalW: coronalSliceLod2?.w ?? 0,
+          coronalH: coronalSliceLod2?.h ?? 0,
+          sagittal: sagittalSliceLod2 ? Array.from(sagittalSliceLod2.data) : [],
+          sagittalW: sagittalSliceLod2?.w ?? 0,
+          sagittalH: sagittalSliceLod2?.h ?? 0,
+        });
+      }
+    } catch { /* ignore */ }
+
+    // Generate LOD1 (1/2 resolution) — send after short delay
+    await new Promise<void>(r => setTimeout(r, 100));
+    if (signal.aborted) return;
+    try {
+      const axialSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2));
+      if (axialSliceLod1 && !signal.aborted) {
+        const coronalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2));
+        const sagittalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2));
+        webview.postMessage({
+          type: 'lodData',
+          level: 1,
+          axial: Array.from(axialSliceLod1.data),
+          axialW: axialSliceLod1.w,
+          axialH: axialSliceLod1.h,
+          coronal: coronalSliceLod1 ? Array.from(coronalSliceLod1.data) : [],
+          coronalW: coronalSliceLod1?.w ?? 0,
+          coronalH: coronalSliceLod1?.h ?? 0,
+          sagittal: sagittalSliceLod1 ? Array.from(sagittalSliceLod1.data) : [],
+          sagittalW: sagittalSliceLod1?.w ?? 0,
+          sagittalH: sagittalSliceLod1?.h ?? 0,
+        });
+      }
+    } catch { /* ignore */ }
+
+    // LOD0 is the full volume already sent via cachedVolume — just notify
+    await new Promise<void>(r => setTimeout(r, 200));
+    if (signal.aborted) return;
+    webview.postMessage({ type: 'lodData', level: 0 });
+  }
+
+  private extractLODSlice(
+    floatData: Float32Array,
+    nx: number, ny: number, nz: number,
+    axis: 'axial' | 'coronal' | 'sagittal',
+    idx: number
+  ): { data: Float32Array; w: number; h: number } | null {
+    if (axis === 'axial') {
+      if (idx < 0 || idx >= nz) return null;
+      const slice = new Float32Array(nx * ny);
+      const base = idx * ny * nx;
+      for (let i = 0; i < nx * ny; i++) slice[i] = floatData[base + i];
+      const ds = downsampleSlice(slice, nx, ny, 2);
+      return { data: ds.data, w: ds.w, h: ds.h };
+    } else if (axis === 'coronal') {
+      if (idx < 0 || idx >= ny) return null;
+      const slice = new Float32Array(nx * nz);
+      for (let z = 0; z < nz; z++) {
+        const base = z * ny * nx + idx * nx;
+        for (let x = 0; x < nx; x++) slice[z * nx + x] = floatData[base + x];
+      }
+      const ds = downsampleSlice(slice, nx, nz, 2);
+      return { data: ds.data, w: ds.w, h: ds.h };
+    } else {
+      if (idx < 0 || idx >= nx) return null;
+      const slice = new Float32Array(ny * nz);
+      for (let z = 0; z < nz; z++) {
+        const base = z * ny * nx;
+        for (let y = 0; y < ny; y++) slice[z * ny + y] = floatData[base + y * nx + idx];
+      }
+      const ds = downsampleSlice(slice, ny, nz, 2);
+      return { data: ds.data, w: ds.w, h: ds.h };
+    }
   }
 
   private buildGzipIndexInBackground(fsPath: string, uriKey: string): void {
@@ -738,7 +865,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.8.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.8.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>

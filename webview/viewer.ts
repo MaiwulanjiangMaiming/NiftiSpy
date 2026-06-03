@@ -119,6 +119,23 @@ let isRemoteSource = false;
 let fullVolumeLoaded = false;
 let interactionInitialized = false;
 
+// LOD (Level of Detail) progressive loading
+interface LODSliceData {
+  data: Float32Array;
+  w: number;
+  h: number;
+}
+interface LODLevelData {
+  axial: LODSliceData | null;
+  coronal: LODSliceData | null;
+  sagittal: LODSliceData | null;
+}
+const lodData: Record<number, LODLevelData> = {};
+const currentLOD: Record<Axis, number> = { axial: 2, coronal: 2, sagittal: 2 };
+let enableLOD = true;
+let lodUpgradeTimer: number | null = null;
+let lastScrollTime = 0;
+
 const MAX_RESIDENT_IMAGE_DATA = 2;
 const MAX_PARALLEL_VOLUME_LOADS = 1;
 const ACTIVE_FULL_LOAD_DEBOUNCE_MS = 180;
@@ -2653,9 +2670,23 @@ function renderAllViews() {
     paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
     paintMIP();
   } else {
-    if (currentSlices.axial) paintSlice('axial', currentSlices.axial.data, currentSlices.axial.width, currentSlices.axial.height, nx * dx, ny * dy);
-    if (currentSlices.coronal) paintSlice('coronal', currentSlices.coronal.data, currentSlices.coronal.width, currentSlices.coronal.height, nx * dx, nz * dz);
-    if (currentSlices.sagittal) paintSlice('sagittal', currentSlices.sagittal.data, currentSlices.sagittal.width, currentSlices.sagittal.height, ny * dy, nz * dz);
+    // LOD-aware rendering: use best available LOD level
+    for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+      const lodLevel = currentLOD[axis];
+      const lod = lodData[lodLevel];
+      const lodSlice = lod?.[axis];
+      const fallback = currentSlices[axis];
+
+      if (enableLOD && lodSlice) {
+        const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+        const pixelH = axis === 'axial' ? ny * dy : nz * dz;
+        paintSlice(axis, lodSlice.data, lodSlice.w, lodSlice.h, pixelW, pixelH);
+      } else if (fallback) {
+        const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+        const pixelH = axis === 'axial' ? ny * dy : nz * dz;
+        paintSlice(axis, fallback.data, fallback.width, fallback.height, pixelW, pixelH);
+      }
+    }
   }
 
   updateAllInfo();
@@ -3172,14 +3203,19 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
       paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
     }
   } else {
-    const slice = currentSlices[axis];
-    if (!slice) return;
-    if (axis === 'axial') {
-      paintSlice('axial', slice.data, slice.width, slice.height, nx * dx, ny * dy);
-    } else if (axis === 'coronal') {
-      paintSlice('coronal', slice.data, slice.width, slice.height, nx * dx, nz * dz);
-    } else {
-      paintSlice('sagittal', slice.data, slice.width, slice.height, ny * dy, nz * dz);
+    // LOD-aware rendering for single view update
+    const lodLevel = currentLOD[axis];
+    const lod = lodData[lodLevel];
+    const lodSlice = lod?.[axis];
+    const fallback = currentSlices[axis];
+
+    const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+    const pixelH = axis === 'axial' ? ny * dy : nz * dz;
+
+    if (enableLOD && lodSlice) {
+      paintSlice(axis, lodSlice.data, lodSlice.w, lodSlice.h, pixelW, pixelH);
+    } else if (fallback) {
+      paintSlice(axis, fallback.data, fallback.width, fallback.height, pixelW, pixelH);
     }
   }
 
@@ -3477,6 +3513,11 @@ window.addEventListener('message', async (e) => {
     return;
   }
 
+  if (msg.type === 'lodData') {
+    handleLODData(msg);
+    return;
+  }
+
   if (msg.type !== 'config') return;
 
   broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
@@ -3497,6 +3538,11 @@ window.addEventListener('message', async (e) => {
   currentSlices.coronal = null;
   currentSlices.sagittal = null;
   colormap = msg.defaultColormap || 'gray';
+  enableLOD = msg.enableLOD !== undefined ? msg.enableLOD : true;
+
+  // Reset LOD state for new volume
+  for (const k of Object.keys(lodData)) delete lodData[Number(k)];
+  currentLOD.axial = 2; currentLOD.coronal = 2; currentLOD.sagittal = 2;
 
   // Send file hash to slice workers for IndexedDB cache key generation
   if (msg.fileName) {
@@ -3720,6 +3766,108 @@ function handleCachedVolume(msg: any): void {
   if (!volumeData) {
     scheduleActiveImageLoad(0);
   }
+}
+
+function handleLODData(msg: any): void {
+  if (!enableLOD || !header) return;
+  const level = msg.level as number;
+
+  // LOD0 means full volume is ready — upgrade all axes to LOD0
+  if (level === 0) {
+    // Full volume data is already available via volumeData
+    // Just upgrade current LOD and re-render
+    for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+      if (currentLOD[axis] > 0) {
+        currentLOD[axis] = 0;
+      }
+    }
+    renderAllViews();
+    return;
+  }
+
+  // Store LOD slice data
+  if (!lodData[level]) {
+    lodData[level] = { axial: null, coronal: null, sagittal: null };
+  }
+  const ld = lodData[level];
+
+  if (msg.axial && msg.axialW && msg.axialH) {
+    ld.axial = { data: new Float32Array(msg.axial), w: msg.axialW, h: msg.axialH };
+  }
+  if (msg.coronal && msg.coronalW && msg.coronalH) {
+    ld.coronal = { data: new Float32Array(msg.coronal), w: msg.coronalW, h: msg.coronalH };
+  }
+  if (msg.sagittal && msg.sagittalW && msg.sagittalH) {
+    ld.sagittal = { data: new Float32Array(msg.sagittal), w: msg.sagittalW, h: msg.sagittalH };
+  }
+
+  // If volumeData is not yet loaded, show LOD data immediately
+  if (!volumeData) {
+    for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+      if (ld[axis] && currentLOD[axis] > level) {
+        currentLOD[axis] = level;
+      }
+    }
+    renderAllViews();
+  }
+}
+
+function scheduleLODUpgrade(axis: Axis): void {
+  if (!enableLOD || volumeData) return;
+  lastScrollTime = Date.now();
+
+  // While scrolling, stay at LOD2
+  if (currentLOD[axis] > 2) {
+    currentLOD[axis] = 2;
+    updateSingleView(axis);
+  }
+
+  // Clear any pending upgrade timer
+  if (lodUpgradeTimer) {
+    window.clearTimeout(lodUpgradeTimer);
+    lodUpgradeTimer = null;
+  }
+
+  // After 300ms of no scrolling, upgrade to LOD1
+  lodUpgradeTimer = window.setTimeout(() => {
+    const elapsed = Date.now() - lastScrollTime;
+    if (elapsed < 280) return; // still scrolling
+
+    if (!volumeData && currentLOD[axis] > 1 && lodData[1]?.[axis]) {
+      currentLOD[axis] = 1;
+      updateSingleView(axis);
+      // Apply cross-fade transition
+      applyLODTransition(axis);
+    }
+
+    // After 1000ms total of no scrolling, upgrade to LOD0
+    lodUpgradeTimer = window.setTimeout(() => {
+      const elapsed2 = Date.now() - lastScrollTime;
+      if (elapsed2 < 980) return;
+
+      if (!volumeData && currentLOD[axis] > 0) {
+        currentLOD[axis] = 0;
+        updateSingleView(axis);
+        applyLODTransition(axis);
+      }
+      lodUpgradeTimer = null;
+    }, 700);
+  }, 300);
+}
+
+function applyLODTransition(axis: Axis): void {
+  const canvas = canvases[axis];
+  if (!canvas) return;
+  canvas.style.transition = 'opacity 0.2s ease-in-out';
+  canvas.style.opacity = '0.7';
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      canvas.style.opacity = '1';
+      setTimeout(() => {
+        canvas.style.transition = '';
+      }, 200);
+    });
+  });
 }
 
 function setPrimaryImageFromDirectPreview(msg: any, axial: Float32Array, coronal: Float32Array, sagittal: Float32Array): void {
@@ -4255,7 +4403,10 @@ function setupInteraction() {
     const handler = (val: number) => {
       sliceIdx[axis] = val;
       if (volumeData) updateSingleView(axis);
-      else void refreshSlices([axis], true);
+      else {
+        void refreshSlices([axis], true);
+        scheduleLODUpgrade(axis);
+      }
     };
     const sl = document.getElementById(sliderId) as HTMLInputElement;
     const ssl = document.getElementById(sideSliderId) as HTMLInputElement;
@@ -4307,7 +4458,10 @@ function setupInteraction() {
           if (newIdx !== sliceIdx[axis]) {
             sliceIdx[axis] = newIdx;
             if (volumeData) updateSingleView(axis);
-            else void refreshSlices([axis], true);
+            else {
+              void refreshSlices([axis], true);
+              scheduleLODUpgrade(axis);
+            }
           }
         }
       }
