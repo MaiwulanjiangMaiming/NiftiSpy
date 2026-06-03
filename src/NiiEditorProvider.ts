@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as zlib from 'zlib';
 import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
+import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
 
 interface LoadJob {
   webviewId: string;
@@ -73,6 +74,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private loadQueue: LoadQueue;
   private webviewCounter = 0;
   private activeWebviews = new Map<string, { panel: vscode.WebviewPanel; abortController: AbortController }>();
+  private gzipIndexes = new Map<string, GzipIndex>();
+  private gzipIndexStatusItems = new Map<string, vscode.Disposable>();
 
   constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
     this.volumeCache = volumeCache;
@@ -398,6 +401,11 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             inter: header.scl_inter || 0,
           });
 
+          // Build gzip index in background for .nii.gz files
+          if (isGzip && !this.gzipIndexes.has(uriKey)) {
+            this.buildGzipIndexInBackground(fsPath, uriKey);
+          }
+
           const voxelBuffer = voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
 
           webview.postMessage({
@@ -521,6 +529,37 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private isWebviewActive(webviewId: string): boolean {
     const entry = this.activeWebviews.get(webviewId);
     return !!entry && entry.panel.active;
+  }
+
+  private buildGzipIndexInBackground(fsPath: string, uriKey: string): void {
+    // Try loading cached index first
+    loadCachedIndex(fsPath).then((cachedIndex) => {
+      if (cachedIndex) {
+        this.gzipIndexes.set(uriKey, cachedIndex);
+        return;
+      }
+
+      // No cached index — build one with progress reporting
+      const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+      statusItem.text = `$(sync~spin) Building gzip index...`;
+      statusItem.show();
+      this.gzipIndexStatusItems.set(uriKey, statusItem);
+
+      GzipIndex.buildIndex(fsPath, undefined, (pct: number) => {
+        statusItem.text = `$(sync~spin) Building gzip index... ${pct}%`;
+      }).then((index) => {
+        this.gzipIndexes.set(uriKey, index);
+        statusItem.dispose();
+        this.gzipIndexStatusItems.delete(uriKey);
+        // Save to cache for reuse
+        saveCachedIndex(fsPath, index).catch(() => {});
+      }).catch(() => {
+        statusItem.dispose();
+        this.gzipIndexStatusItems.delete(uriKey);
+      });
+    }).catch(() => {
+      // If cache load fails, silently skip
+    });
   }
 
   private buildHtml(
@@ -699,7 +738,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.7.2 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.8.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>

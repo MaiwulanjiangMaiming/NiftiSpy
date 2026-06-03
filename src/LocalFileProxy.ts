@@ -21,7 +21,7 @@ import {
   streamingGunzipPreview,
   streamingHttpGunzipPreview,
 } from './io/compression';
-import { buildGzipIndex, extractRangeFromGzipIndex } from './io/gzipIndex';
+import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
 
 interface FileEntry {
   uri: vscode.Uri;
@@ -34,14 +34,8 @@ interface FileEntry {
   sliceCache?: Map<string, { data: Buffer; timestamp: number }>;
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
   pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
-  gzipIndex?: GzipIndexEntry[];
+  gzipIndex?: GzipIndex;
   gzipIndexBuilding?: boolean;
-}
-
-interface GzipIndexEntry {
-  compressedOffset: number;
-  decompressedOffset: number;
-  windowBits: Uint8Array | null;
 }
 
 interface ConnectionStats {
@@ -814,7 +808,7 @@ export class LocalFileProxy {
           }
 
           if (axis === 'axial') {
-            const sliceBytes = await extractRangeFromGzipIndex(fsPath, entry.gzipIndex, sliceStart, sliceStart + sliceSize);
+            const sliceBytes = await GzipIndex.readRange(fsPath, entry.gzipIndex, sliceStart, sliceStart + sliceSize);
             const slice = extractAxialSliceFromRange(sliceBytes, header);
             const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
             entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
@@ -830,7 +824,7 @@ export class LocalFileProxy {
             const inter = header.scl_inter || 0;
             for (let z = 0; z < nz; z++) {
               const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bytesPerVoxel;
-              const rowBytes = await extractRangeFromGzipIndex(fsPath, entry.gzipIndex, rowOffset, rowOffset + nx * bpv);
+              const rowBytes = await GzipIndex.readRange(fsPath, entry.gzipIndex, rowOffset, rowOffset + nx * bpv);
               const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
               for (let x = 0; x < nx; x++) {
                 const off = x * bpv;
@@ -863,7 +857,7 @@ export class LocalFileProxy {
             const inter = header.scl_inter || 0;
             for (let z = 0; z < nz; z++) {
               const axialOffset = voxOffset + z * nx * ny * bytesPerVoxel;
-              const axialBytes = await extractRangeFromGzipIndex(fsPath, entry.gzipIndex, axialOffset, axialOffset + nx * ny * bpv);
+              const axialBytes = await GzipIndex.readRange(fsPath, entry.gzipIndex, axialOffset, axialOffset + nx * ny * bpv);
               const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
               for (let y = 0; y < ny; y++) {
                 const off = (y * nx + idx) * bpv;
@@ -894,11 +888,28 @@ export class LocalFileProxy {
 
       if (fsPath && isGzip && !entry.gzipIndex && !entry.gzipIndexBuilding) {
         entry.gzipIndexBuilding = true;
-        buildGzipIndex(fsPath).then(idx => {
-          entry.gzipIndex = idx;
-          entry.gzipIndexBuilding = false;
+        // Try loading cached index first, then build if needed
+        loadCachedIndex(fsPath).then(cachedIdx => {
+          if (cachedIdx) {
+            entry.gzipIndex = cachedIdx;
+            entry.gzipIndexBuilding = false;
+          } else {
+            GzipIndex.buildIndex(fsPath).then(idx => {
+              entry.gzipIndex = idx;
+              entry.gzipIndexBuilding = false;
+              saveCachedIndex(fsPath, idx).catch(() => {});
+            }).catch(() => {
+              entry.gzipIndexBuilding = false;
+            });
+          }
         }).catch(() => {
-          entry.gzipIndexBuilding = false;
+          GzipIndex.buildIndex(fsPath).then(idx => {
+            entry.gzipIndex = idx;
+            entry.gzipIndexBuilding = false;
+            saveCachedIndex(fsPath, idx).catch(() => {});
+          }).catch(() => {
+            entry.gzipIndexBuilding = false;
+          });
         });
       }
 
