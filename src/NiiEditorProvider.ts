@@ -39,7 +39,7 @@ class LoadQueue {
 
   cancel(webviewId: string): void {
     for (let i = this.queue.length - 1; i >= 0; i--) {
-      if (this.queue[i].webviewId === webviewId) {
+      if (webviewId === '__all__' || this.queue[i].webviewId === webviewId) {
         this.queue[i].abortController.abort();
         this.queue.splice(i, 1);
       }
@@ -89,6 +89,27 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     this.cacheStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
     this.updateCacheStatusBar();
     this.cacheStatusBarItem.show();
+  }
+
+  dispose(): void {
+    // Terminate all active webview abort controllers
+    for (const [, entry] of this.activeWebviews) {
+      entry.abortController.abort();
+    }
+    this.activeWebviews.clear();
+    // Cancel all queued loads
+    this.loadQueue.cancel('__all__');
+    // Close HTTP proxy server
+    this.proxy?.stop();
+    this.proxy = null;
+    // Dispose all status bar items
+    this.cacheStatusBarItem?.dispose();
+    this.nativeStatusBarItem?.dispose();
+    this.chunkProgressItem?.dispose();
+    for (const [, item] of this.gzipIndexStatusItems) {
+      item.dispose();
+    }
+    this.gzipIndexStatusItems.clear();
   }
 
   private updateCacheStatusBar(): void {
@@ -968,6 +989,8 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 #header-panel{max-height:300px;overflow-y:auto}
 #header-info-content{overflow-y:auto;max-height:240px}
 .format-badge{display:inline-block;background:rgba(233,69,96,.2);border:1px solid var(--accent);color:var(--accent);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.5px;vertical-align:middle;margin-left:4px}
+.measure-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:6}
+@media(prefers-contrast:more){.crosshair-h{height:2px!important}.crosshair-v{width:2px!important}.vl{font-size:14px!important}.vi{font-size:12px!important}}
 </style>
 </head>
 <body>
@@ -977,31 +1000,33 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
     <span class="file-name" id="file-name">Loading...</span><span class="format-badge" id="format-badge" style="display:none">ZARR</span>
     <div class="file-detail" id="file-detail"></div>
   </div>
-  <button class="btn btn-fit" id="btn-fit" title="Zoom to Fit">Fit</button>
-  <button class="btn" id="btn-auto" title="Auto Contrast">Auto Contrast</button>
-  <button class="btn" id="btn-reset" title="Reset View">Reset</button>
-  <button class="btn" id="btn-crosshair" title="Toggle Crosshair">✛</button>
-  <button class="btn" id="btn-export" title="Export Slice as PNG">📷</button>
-  <button class="btn" id="btn-header" title="Toggle Header Info">ℹ️</button>
-  <div class="tg"><label>W</label><input id="ww-slider" type="range" min="1" max="200" value="100"></div>
-  <div class="tg"><label>L</label><input id="wl-slider" type="range" min="0" max="100" value="50"></div>
+  <button class="btn btn-fit" id="btn-fit" title="Zoom to Fit" aria-label="Zoom to fit">Fit</button>
+  <button class="btn" id="btn-auto" title="Auto Contrast" aria-label="Auto contrast">Auto Contrast</button>
+  <button class="btn" id="btn-reset" title="Reset View" aria-label="Reset view">Reset</button>
+  <button class="btn" id="btn-crosshair" title="Toggle Crosshair" aria-label="Toggle crosshair">✛</button>
+  <button class="btn" id="btn-measure" title="Toggle Measure Mode" aria-label="Toggle measure mode">📏</button>
+  <button class="btn" id="btn-clear-measure" title="Clear Measurements" aria-label="Clear all measurements">🗑️</button>
+  <button class="btn" id="btn-export" title="Export Slice as PNG" aria-label="Export slice as PNG">📷</button>
+  <button class="btn" id="btn-header" title="Toggle Header Info" aria-label="Toggle header info">ℹ️</button>
+  <div class="tg"><label>W</label><input id="ww-slider" type="range" min="1" max="200" value="100" role="slider" aria-label="Window width" aria-valuemin="1" aria-valuemax="200" aria-valuenow="100"></div>
+  <div class="tg"><label>L</label><input id="wl-slider" type="range" min="0" max="100" value="50" role="slider" aria-label="Window level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
   <div class="tg"><label>Map</label><select id="colormap"><option value="gray">Gray</option><option value="hot">Hot</option><option value="cool">Cool</option><option value="jet">Jet</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option></select></div>
   <canvas id="colormap-preview" width="200" height="20" style="height:14px;border-radius:3px;border:1px solid var(--border);cursor:pointer"></canvas>
 </div>
-<div id="main">
+<div id="main" role="application" aria-label="NIfTI image viewer">
   <div id="views">
-    <div class="vc" id="axial-c"><canvas id="axial"></canvas><span class="vl">Axial</span><span class="vi" id="axial-info"></span><button class="vb" data-view="axial">A</button><div class="ssc"><input id="axial-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">A</span><span class="dir-label dir-p">P</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-axial"></span><span class="sbs-label sbs-label-l" id="sbs-l-axial"></span><span class="sbs-label sbs-label-r" id="sbs-r-axial"></span></div>
-    <div class="vc" id="coronal-c"><canvas id="coronal"></canvas><span class="vl">Coronal</span><span class="vi" id="coronal-info"></span><button class="vb" data-view="coronal">C</button><div class="ssc"><input id="coronal-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-coronal"></span><span class="sbs-label sbs-label-l" id="sbs-l-coronal"></span><span class="sbs-label sbs-label-r" id="sbs-r-coronal"></span></div>
-    <div class="vc" id="sagittal-c"><canvas id="sagittal"></canvas><span class="vl">Sagittal</span><span class="vi" id="sagittal-info"></span><button class="vb" data-view="sagittal">S</button><div class="ssc"><input id="sagittal-slider" type="range" min="0" max="100" value="50"></div><span class="dir-label dir-l">A</span><span class="dir-label dir-r">P</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-sagittal"></span><span class="sbs-label sbs-label-l" id="sbs-l-sagittal"></span><span class="sbs-label sbs-label-r" id="sbs-r-sagittal"></span></div>
-    <div class="vc" id="mip-c"><canvas id="mip"></canvas><span class="vl">3D MIP</span><span class="vi">Drag to rotate</span><button class="vb" data-view="mip">M</button></div>
+    <div class="vc" id="axial-c"><canvas id="axial" tabindex="0" aria-label="Axial slice viewer"></canvas><span class="vl">Axial</span><span class="vi" id="axial-info"></span><button class="vb" data-view="axial" aria-label="Maximize axial view">A</button><div class="ssc"><input id="axial-slider" type="range" min="0" max="100" value="50" role="slider" aria-label="Axial slice index" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">A</span><span class="dir-label dir-p">P</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-axial"></span><span class="sbs-label sbs-label-l" id="sbs-l-axial"></span><span class="sbs-label sbs-label-r" id="sbs-r-axial"></span><canvas class="measure-canvas" id="measure-axial"></canvas></div>
+    <div class="vc" id="coronal-c"><canvas id="coronal" tabindex="0" aria-label="Coronal slice viewer"></canvas><span class="vl">Coronal</span><span class="vi" id="coronal-info"></span><button class="vb" data-view="coronal" aria-label="Maximize coronal view">C</button><div class="ssc"><input id="coronal-slider" type="range" min="0" max="100" value="50" role="slider" aria-label="Coronal slice index" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div><span class="dir-label dir-l">R</span><span class="dir-label dir-r">L</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-coronal"></span><span class="sbs-label sbs-label-l" id="sbs-l-coronal"></span><span class="sbs-label sbs-label-r" id="sbs-r-coronal"></span><canvas class="measure-canvas" id="measure-coronal"></canvas></div>
+    <div class="vc" id="sagittal-c"><canvas id="sagittal" tabindex="0" aria-label="Sagittal slice viewer"></canvas><span class="vl">Sagittal</span><span class="vi" id="sagittal-info"></span><button class="vb" data-view="sagittal" aria-label="Maximize sagittal view">S</button><div class="ssc"><input id="sagittal-slider" type="range" min="0" max="100" value="50" role="slider" aria-label="Sagittal slice index" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div><span class="dir-label dir-l">A</span><span class="dir-label dir-r">P</span><span class="dir-label dir-a">S</span><span class="dir-label dir-p">I</span><div class="crosshair"><div class="crosshair-h"></div><div class="crosshair-v"></div></div><div class="scale-bar"><span></span></div><div class="minimap hidden"><canvas class="minimap-canvas"></canvas><div class="minimap-rect"></div></div><span class="overlay-label" id="overlay-label-sagittal"></span><span class="sbs-label sbs-label-l" id="sbs-l-sagittal"></span><span class="sbs-label sbs-label-r" id="sbs-r-sagittal"></span><canvas class="measure-canvas" id="measure-sagittal"></canvas></div>
+    <div class="vc" id="mip-c"><canvas id="mip" tabindex="0" aria-label="3D MIP viewer"></canvas><span class="vl">3D MIP</span><span class="vi">Drag to rotate</span><button class="vb" data-view="mip" aria-label="Maximize MIP view">M</button></div>
   </div>
-  <div id="sidebar">
+  <div id="sidebar" aria-label="Sidebar controls">
     <div id="sidebar-resize"></div>
     <div class="ss">
       <h3>Slice Navigation</h3>
-      <div class="sr"><label>Axial Z:</label><input id="axial-slider-side" type="range" min="0" max="100" value="50"><span class="sv" id="axial-val">0</span></div>
-      <div class="sr"><label>Coronal Y:</label><input id="coronal-slider-side" type="range" min="0" max="100" value="50"><span class="sv" id="coronal-val">0</span></div>
-      <div class="sr"><label>Sagittal X:</label><input id="sagittal-slider-side" type="range" min="0" max="100" value="50"><span class="sv" id="sagittal-val">0</span></div>
+      <div class="sr"><label>Axial Z:</label><input id="axial-slider-side" type="range" min="0" max="100" value="50" role="slider" aria-label="Axial slice Z" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="sv" id="axial-val">0</span></div>
+      <div class="sr"><label>Coronal Y:</label><input id="coronal-slider-side" type="range" min="0" max="100" value="50" role="slider" aria-label="Coronal slice Y" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="sv" id="coronal-val">0</span></div>
+      <div class="sr"><label>Sagittal X:</label><input id="sagittal-slider-side" type="range" min="0" max="100" value="50" role="slider" aria-label="Sagittal slice X" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="sv" id="sagittal-val">0</span></div>
     </div>
     <div class="ss">
       <h3>Images</h3>
@@ -1034,8 +1059,9 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.10.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v2.0.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
+<div id="a11y-announce" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)"></div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
 <script src="${viewerUri}"></script>

@@ -119,6 +119,21 @@ let isRemoteSource = false;
 let fullVolumeLoaded = false;
 let interactionInitialized = false;
 
+// Measurement tools state
+let measureMode = false;
+type MeasureType = 'line' | 'roi';
+interface LineMeasurement { type: 'line'; axis: Axis; x1: number; y1: number; x2: number; y2: number; distance: number; }
+interface RoiMeasurement { type: 'roi'; axis: Axis; x1: number; y1: number; x2: number; y2: number; area: number; }
+type Measurement = LineMeasurement | RoiMeasurement;
+const measurements: Measurement[] = [];
+let measureDragStart: { x: number; y: number; axis: Axis } | null = null;
+let measureClickPending: { x: number; y: number; axis: Axis } | null = null;
+
+// Accessibility state
+let highContrastPreferred = false;
+try { highContrastPreferred = window.matchMedia('(prefers-contrast: more)').matches; } catch {}
+let focusedCanvas: Axis | null = null;
+
 // LOD (Level of Detail) progressive loading
 interface LODSliceData {
   data: Float32Array;
@@ -1246,6 +1261,165 @@ function worldToVoxel(h: NiiHeader, wx: number, wy: number, wz: number): [number
   return [wx / h.dx, wy / h.dy, wz / h.dz];
 }
 
+// --- Measurement Tools ---
+function canvasToVoxel(axis: Axis, cx: number, cy: number): [number, number, number] | null {
+  if (!header) return null;
+  const { nx, ny, nz, dx, dy, dz } = header;
+  const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+  const pixelH = axis === 'axial' ? ny * dy : nz * dz;
+  const canvas = canvases[axis];
+  const container = canvas.parentElement!;
+  const dw = container.clientWidth;
+  const dh = container.clientHeight;
+  const vs = viewState[axis];
+  const ar = pixelW / pixelH;
+  let cw: number, ch: number;
+  if (dw / dh > ar) { ch = dh; cw = ch * ar; }
+  else { cw = dw; ch = cw / ar; }
+  cw *= vs.zoom; ch *= vs.zoom;
+  const imgLeft = (dw - cw) / 2 + vs.panX;
+  const imgTop = (dh - ch) / 2 + vs.panY;
+  const nx_c = (cx - imgLeft) / cw;
+  const ny_c = (cy - imgTop) / ch;
+  if (nx_c < 0 || nx_c > 1 || ny_c < 0 || ny_c > 1) return null;
+  if (axis === 'axial') return [nx_c * nx, (1 - ny_c) * ny, sliceIdx.axial];
+  if (axis === 'coronal') return [nx_c * nx, sliceIdx.coronal, (1 - ny_c) * nz];
+  return [sliceIdx.sagittal, nx_c * ny, (1 - ny_c) * nz];
+}
+
+function computeLineDistance(axis: Axis, x1: number, y1: number, x2: number, y2: number): number {
+  if (!header) return 0;
+  const v1 = canvasToVoxel(axis, x1, y1);
+  const v2 = canvasToVoxel(axis, x2, y2);
+  if (!v1 || !v2) return 0;
+  const [wx1, wy1, wz1] = voxelToWorld(header, v1[0], v1[1], v1[2]);
+  const [wx2, wy2, wz2] = voxelToWorld(header, v2[0], v2[1], v2[2]);
+  return Math.sqrt((wx2 - wx1) ** 2 + (wy2 - wy1) ** 2 + (wz2 - wz1) ** 2);
+}
+
+function computeRoiArea(axis: Axis, x1: number, y1: number, x2: number, y2: number): number {
+  if (!header) return 0;
+  const v1 = canvasToVoxel(axis, x1, y1);
+  const v2 = canvasToVoxel(axis, x2, y2);
+  if (!v1 || !v2) return 0;
+  const [wx1, wy1, wz1] = voxelToWorld(header, v1[0], v1[1], v1[2]);
+  const [wx2, wy2, wz2] = voxelToWorld(header, v2[0], v2[1], v2[2]);
+  // For ROI, area is computed in the plane of the view
+  if (axis === 'axial') return Math.abs(wx2 - wx1) * Math.abs(wy2 - wy1);
+  if (axis === 'coronal') return Math.abs(wx2 - wx1) * Math.abs(wz2 - wz1);
+  return Math.abs(wy2 - wy1) * Math.abs(wz2 - wz1);
+}
+
+function drawMeasurements(): void {
+  for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+    const measureCanvas = document.getElementById(`measure-${axis}`) as HTMLCanvasElement;
+    if (!measureCanvas) continue;
+    const container = measureCanvas.parentElement!;
+    const dpr = window.devicePixelRatio || 1;
+    measureCanvas.width = container.clientWidth * dpr;
+    measureCanvas.height = container.clientHeight * dpr;
+    measureCanvas.style.width = container.clientWidth + 'px';
+    measureCanvas.style.height = container.clientHeight + 'px';
+    const ctx = measureCanvas.getContext('2d');
+    if (!ctx) continue;
+    ctx.clearRect(0, 0, measureCanvas.width, measureCanvas.height);
+    ctx.scale(dpr, dpr);
+    const axisMeasurements = measurements.filter(m => m.axis === axis);
+    for (const m of axisMeasurements) {
+      if (m.type === 'line') {
+        ctx.strokeStyle = '#00ff00';
+        ctx.lineWidth = highContrastPreferred ? 3 : 2;
+        ctx.beginPath();
+        ctx.moveTo(m.x1, m.y1);
+        ctx.lineTo(m.x2, m.y2);
+        ctx.stroke();
+        // Distance label at midpoint
+        const mx = (m.x1 + m.x2) / 2;
+        const my = (m.y1 + m.y2) / 2;
+        ctx.font = highContrastPreferred ? 'bold 13px sans-serif' : '11px sans-serif';
+        ctx.fillStyle = '#00ff00';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${m.distance.toFixed(2)} mm`, mx, my - 6);
+      } else {
+        ctx.strokeStyle = '#ffff00';
+        ctx.lineWidth = highContrastPreferred ? 3 : 2;
+        ctx.setLineDash([4, 4]);
+        ctx.strokeRect(Math.min(m.x1, m.x2), Math.min(m.y1, m.y2), Math.abs(m.x2 - m.x1), Math.abs(m.y2 - m.y1));
+        ctx.setLineDash([]);
+        const rx = (m.x1 + m.x2) / 2;
+        const ry = (m.y1 + m.y2) / 2;
+        ctx.font = highContrastPreferred ? 'bold 13px sans-serif' : '11px sans-serif';
+        ctx.fillStyle = '#ffff00';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${m.area.toFixed(2)} mm²`, rx, ry - 6);
+      }
+    }
+  }
+}
+
+function clearMeasurements(): void {
+  measurements.length = 0;
+  drawMeasurements();
+}
+
+// --- Accessibility ---
+function a11yAnnounce(text: string): void {
+  const el = document.getElementById('a11y-announce');
+  if (el) el.textContent = text;
+}
+
+// --- Input Validation ---
+function validateSliceIndex(axis: Axis, idx: number): number {
+  if (!header) return 0;
+  const max = axis === 'axial' ? header.nz - 1 : axis === 'coronal' ? header.ny - 1 : header.nx - 1;
+  return Math.max(0, Math.min(max, Math.round(idx)));
+}
+
+function validateWindowLevel(ww: number, wl: number): { windowWidth: number; windowLevel: number } {
+  return {
+    windowWidth: isFinite(ww) && ww > 0 ? ww : 1,
+    windowLevel: isFinite(wl) ? wl : 0.5,
+  };
+}
+
+function validateVolumeData(hdr: NiiHeader | null, data: Float32Array | null): boolean {
+  if (!hdr || !data) return false;
+  const expectedLen = hdr.nx * hdr.ny * hdr.nz;
+  return data.length >= expectedLen;
+}
+
+// --- Error Recovery ---
+function handleWebGLContextLoss(canvas: HTMLCanvasElement, axis: Axis): void {
+  console.warn(`[NiftiSpy] WebGL context lost for ${axis}, attempting recovery...`);
+  const renderer = glRenderers[axis];
+  if (renderer) {
+    renderer.destroy();
+    delete glRenderers[axis];
+  }
+  // Attempt to reinitialize after a short delay
+  setTimeout(() => {
+    const newRenderer = new WebGLRenderer();
+    if (newRenderer.init(canvas)) {
+      glRenderers[axis] = newRenderer;
+      if (volumeData && header) {
+        tryUploadVolume3D();
+      }
+      renderAllViews();
+    }
+  }, 500);
+}
+
+function restartCrashedWorker(axis: Axis): void {
+  const idx = AXIS_TO_WORKER_IDX[axis];
+  const oldWorker = sliceWorkers[idx];
+  if (oldWorker) {
+    oldWorker.terminate();
+    sliceWorkers[idx] = null as any;
+  }
+  // Worker will be recreated on next use via getSliceWorker
+  console.warn(`[NiftiSpy] Restarted worker for ${axis}`);
+}
+
 const loading = document.getElementById('loading') as HTMLDivElement;
 const loadingText = document.getElementById('loading-text') as HTMLSpanElement;
 const loadingDetail = document.getElementById('loading-detail') as HTMLSpanElement;
@@ -1411,6 +1585,16 @@ function attachWorkerRouter(worker: Worker) {
     }
     if (msg?.type === 'progress' || msg?.type === 'preview' || msg?.type === 'volume' || msg?.type === 'error') {
       workerStreamListener?.(msg);
+    }
+  };
+  // Worker crash recovery
+  worker.onerror = (e: ErrorEvent) => {
+    console.error('[NiftiSpy] Worker error:', e.message);
+    // Find which axis this worker belongs to and restart it
+    const idx = sliceWorkers.indexOf(worker);
+    if (idx >= 0) {
+      const axis = (['axial', 'coronal', 'sagittal'] as Axis[])[idx];
+      if (axis) restartCrashedWorker(axis);
     }
   };
 }
@@ -2865,6 +3049,7 @@ function renderAllViews() {
 
   updateAllInfo();
   if (crosshairVisible) updateCoordInfoFromCenter();
+  drawMeasurements();
 
   if (volumeData) {
     preloadSlices('axial', sliceIdx.axial);
@@ -4550,8 +4735,8 @@ function setupInteraction() {
     renderTimer = requestAnimationFrame(() => { renderAllViews(); renderTimer = null; });
   };
 
-  wwSlider?.addEventListener('input', () => { windowWidth = Number(wwSlider.value) / 100; scheduleRender(); });
-  wlSlider?.addEventListener('input', () => { windowLevel = Number(wlSlider.value) / 100; scheduleRender(); });
+  wwSlider?.addEventListener('input', () => { const v = validateWindowLevel(Number(wwSlider.value) / 100, windowLevel); windowWidth = v.windowWidth; scheduleRender(); a11yAnnounce(`Window width: ${Math.round(windowWidth * 100)}`); });
+  wlSlider?.addEventListener('input', () => { const v = validateWindowLevel(windowWidth, Number(wlSlider.value) / 100); windowLevel = v.windowLevel; scheduleRender(); a11yAnnounce(`Window level: ${Math.round(windowLevel * 100)}`); });
   cmapSelect?.addEventListener('change', () => { colormap = cmapSelect.value; sliceRenderCache.clear(); renderColormapPreview(); scheduleRender(); });
   btnAuto?.addEventListener('click', autoContrast);
   btnReset?.addEventListener('click', resetViews);
@@ -4635,6 +4820,27 @@ function setupInteraction() {
     renderAllViews();
   });
   if (crosshairVisible) btnCrosshair?.classList.add('active');
+
+  // Measurement mode toggle
+  const btnMeasure = document.getElementById('btn-measure') as HTMLButtonElement;
+  btnMeasure?.addEventListener('click', () => {
+    measureMode = !measureMode;
+    btnMeasure.classList.toggle('active', measureMode);
+    measureClickPending = null;
+    measureDragStart = null;
+    // Change cursor on canvases
+    for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+      canvases[axis].style.cursor = measureMode ? 'crosshair' : 'crosshair';
+    }
+    a11yAnnounce(measureMode ? 'Measure mode enabled' : 'Measure mode disabled');
+  });
+
+  // Clear measurements button
+  const btnClearMeasure = document.getElementById('btn-clear-measure') as HTMLButtonElement;
+  btnClearMeasure?.addEventListener('click', () => {
+    clearMeasurements();
+    a11yAnnounce('Measurements cleared');
+  });
 
   const btnExport = document.getElementById('btn-export') as HTMLButtonElement;
   btnExport?.addEventListener('click', () => {
@@ -4728,7 +4934,8 @@ function setupInteraction() {
 
   const bindSlider = (sliderId: string, sideSliderId: string, axis: 'axial' | 'coronal' | 'sagittal') => {
     const handler = (val: number) => {
-      sliceIdx[axis] = val;
+      sliceIdx[axis] = validateSliceIndex(axis, val);
+      a11yAnnounce(`${axis} slice ${sliceIdx[axis] + 1}`);
       if (volumeData) updateSingleView(axis);
       else {
         void refreshSlices([axis], true);
@@ -4780,8 +4987,7 @@ function setupInteraction() {
         if (Math.abs(scrollAccumulator) >= SCROLL_THRESHOLD) {
           const delta = scrollAccumulator > 0 ? adaptiveStep : -adaptiveStep;
           scrollAccumulator = 0;
-          const max = axis === 'axial' ? header.nz - 1 : axis === 'coronal' ? header.ny - 1 : header.nx - 1;
-          const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
+          const newIdx = validateSliceIndex(axis, sliceIdx[axis] + delta);
           if (newIdx !== sliceIdx[axis]) {
             sliceIdx[axis] = newIdx;
             if (volumeData) updateSingleView(axis);
@@ -4804,6 +5010,13 @@ function setupInteraction() {
 
     canvas.addEventListener('mousedown', (e) => {
       if (e.button === 0) {
+        // ROI measurement: click and drag
+        if (measureMode) {
+          const rect = canvas.getBoundingClientRect();
+          measureDragStart = { x: e.clientX - rect.left, y: e.clientY - rect.top, axis };
+          measureClickPending = null; // Cancel any pending line click
+          return;
+        }
         isDragging = true;
         lastX = e.clientX;
         lastY = e.clientY;
@@ -4829,7 +5042,23 @@ function setupInteraction() {
       }
     });
 
-    document.addEventListener('mouseup', () => {
+    document.addEventListener('mouseup', (e) => {
+      // ROI measurement: complete drag
+      if (measureMode && measureDragStart && measureDragStart.axis === axis) {
+        const rect = canvas.getBoundingClientRect();
+        const endX = e.clientX - rect.left;
+        const endY = e.clientY - rect.top;
+        const dx = Math.abs(endX - measureDragStart.x);
+        const dy = Math.abs(endY - measureDragStart.y);
+        if (dx > 5 || dy > 5) {
+          const area = computeRoiArea(axis, measureDragStart.x, measureDragStart.y, endX, endY);
+          measurements.push({ type: 'roi', axis, x1: measureDragStart.x, y1: measureDragStart.y, x2: endX, y2: endY, area });
+          drawMeasurements();
+          a11yAnnounce(`ROI area: ${area.toFixed(2)} mm²`);
+        }
+        measureDragStart = null;
+        return;
+      }
       if (isDragging) {
         isDragging = false;
         canvas.style.cursor = 'crosshair';
@@ -4888,6 +5117,22 @@ function setupInteraction() {
       const rect = canvas.getBoundingClientRect();
       const clickX = e.clientX - rect.left;
       const clickY = e.clientY - rect.top;
+
+      // Measurement mode: line measurement (click two points)
+      if (measureMode && !measureDragStart) {
+        if (!measureClickPending) {
+          measureClickPending = { x: clickX, y: clickY, axis };
+        } else if (measureClickPending.axis === axis) {
+          const distance = computeLineDistance(axis, measureClickPending.x, measureClickPending.y, clickX, clickY);
+          measurements.push({ type: 'line', axis, x1: measureClickPending.x, y1: measureClickPending.y, x2: clickX, y2: clickY, distance });
+          measureClickPending = null;
+          drawMeasurements();
+          a11yAnnounce(`Line measurement: ${distance.toFixed(2)} mm`);
+        } else {
+          measureClickPending = { x: clickX, y: clickY, axis };
+        }
+        return;
+      }
 
       if (compareMode && compareLayout === 'sideBySide' && images.length >= 2) {
         const img0 = images[0];
@@ -5229,5 +5474,49 @@ function setupInteraction() {
       else if (e.key === 's') { e.preventDefault(); handleKeyboardAction('setViewSagittal'); }
       else if (e.key === 'r') { e.preventDefault(); handleKeyboardAction('resetView'); }
     }
+    // Accessibility: Escape exits measure mode
+    if (e.key === 'Escape' && measureMode) {
+      measureMode = false;
+      measureClickPending = null;
+      measureDragStart = null;
+      const btnM = document.getElementById('btn-measure') as HTMLButtonElement;
+      if (btnM) btnM.classList.remove('active');
+      a11yAnnounce('Measure mode disabled');
+    }
   });
+
+  // Accessibility: keyboard focus management for canvases
+  for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+    const canvas = canvases[axis];
+    canvas.addEventListener('focus', () => { focusedCanvas = axis; });
+    canvas.addEventListener('blur', () => { if (focusedCanvas === axis) focusedCanvas = null; });
+    canvas.addEventListener('keydown', (e) => {
+      if (!header) return;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        const delta = e.key === 'ArrowUp' ? -1 : 1;
+        const max = axis === 'axial' ? header.nz - 1 : axis === 'coronal' ? header.ny - 1 : header.nx - 1;
+        const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
+        if (newIdx !== sliceIdx[axis]) {
+          sliceIdx[axis] = newIdx;
+          if (volumeData) updateSingleView(axis);
+          else { void refreshSlices([axis], true); scheduleLODUpgrade(axis); }
+          a11yAnnounce(`${axis} slice ${newIdx + 1} of ${max + 1}`);
+        }
+      }
+    });
+    // WebGL context loss recovery
+    canvas.addEventListener('webglcontextlost', (e) => {
+      e.preventDefault();
+      handleWebGLContextLoss(canvas, axis);
+    });
+  }
+
+  // High contrast media query listener
+  try {
+    window.matchMedia('(prefers-contrast: more)').addEventListener('change', (e) => {
+      highContrastPreferred = e.matches;
+      renderAllViews();
+    });
+  } catch {}
 }

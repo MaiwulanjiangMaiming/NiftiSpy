@@ -10,6 +10,20 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [2.0.0] - 2026-06-08
+
+### Added
+- **Measurement Tools**: New 📏 toolbar button toggles measure mode. In measure mode, click two points to draw a line measurement (distance in mm using voxelToWorld), or click-and-drag to draw a rectangle ROI (area in mm²). Measurements persist until cleared with the 🗑️ button. Overlay drawn on per-axis measurement canvases.
+- **Accessibility - ARIA Labels**: Added `role="application"` on main container, `aria-label` on all canvases (e.g., "Axial slice viewer"), sliders ("Window width", "Window level"), buttons, and sidebar. Range inputs have `role="slider"` with `aria-valuemin`, `aria-valuemax`, `aria-valuenow`.
+- **Accessibility - Keyboard Navigation**: Tab key cycles through canvases (via `tabindex="0"`). Arrow keys scroll slices when a canvas has focus. Escape key exits measure mode.
+- **Accessibility - High Contrast**: Detects `prefers-contrast: more` media query. When active, uses thicker crosshair lines and larger text labels.
+- **Accessibility - Screen Reader**: `aria-live="polite"` region announces slice index changes, window/level changes, and measurement results.
+- **Input Validation**: Slice indices validated before rendering. Window/level values checked for finite and positive. Volume data dimensions validated against header.
+- **Error Recovery**: WebGL context loss triggers automatic renderer reinitialization. Worker crashes trigger automatic restart. Fetch failures retry with exponential backoff.
+- **Cleanup on Dispose**: `NiiEditorProvider.dispose()` terminates abort controllers, cancels queued loads, stops proxy server, and disposes all status bar items.
+
+---
+
 ## [1.10.1] - 2026-06-08
 
 ### Added
