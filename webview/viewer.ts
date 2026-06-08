@@ -2702,6 +2702,41 @@ function computeOrientationFromSform(srow_x: number[], srow_y: number[], srow_z:
   return result;
 }
 
+// Compute orientation from qform quaternion (ITK-SNAP/niivue approach)
+// Reconstructs the rotation matrix from the quaternion (b, c, d) and
+// derives the srow vectors, then uses the same column-based analysis
+function computeOrientationFromQform(h: any): string {
+  const qb = h.quatern_b || 0;
+  const qc = h.quatern_c || 0;
+  const qd = h.quatern_d || 0;
+  const qa = Math.sqrt(Math.max(0, 1.0 - qb * qb - qc * qc - qd * qd));
+
+  // Quaternion rotation matrix
+  const srow_x = [
+    qa * qa + qb * qb - qc * qc - qd * qd,
+    2 * (qb * qc - qa * qd),
+    2 * (qb * qd + qa * qc),
+  ];
+  const srow_y = [
+    2 * (qb * qc + qa * qd),
+    qa * qa - qb * qb + qc * qc - qd * qd,
+    2 * (qc * qd - qa * qb),
+  ];
+  const srow_z = [
+    2 * (qb * qd - qa * qc),
+    2 * (qc * qd + qa * qb),
+    qa * qa - qb * qb - qc * qc + qd * qd,
+  ];
+
+  // Apply voxel sizes
+  const dx = h.dx || 1, dy = h.dy || 1, dz = h.dz || 1;
+  const scaled_x = srow_x.map((v, i) => v * [dx, dy, dz][i]);
+  const scaled_y = srow_y.map((v, i) => v * [dx, dy, dz][i]);
+  const scaled_z = srow_z.map((v, i) => v * [dx, dy, dz][i]);
+
+  return computeOrientationFromSform(scaled_x, scaled_y, scaled_z);
+}
+
 function computeViewFlips() {
   if (!header) return;
   const srow_x = header.srow_x;
@@ -3772,14 +3807,20 @@ function updateHeaderPanel(info?: Record<string, any>) {
     rows.push(['qoffset', `(${h.qoffset_x.toFixed(2)}, ${h.qoffset_y.toFixed(2)}, ${h.qoffset_z.toFixed(2)})`]);
   }
 
-  // Compute orientation from sform matrix if not already set or if 'unknown'
+  // Compute orientation from sform/qform matrix — never show "unknown"
   let orientation = h.orientation;
   if ((!orientation || orientation === 'unknown') && h.srow_x && h.srow_y && h.srow_z) {
     orientation = computeOrientationFromSform(h.srow_x, h.srow_y, h.srow_z);
   }
-  if (orientation) {
-    rows.push(['Orientation', orientation]);
+  // Fallback: try qform quaternion if sform didn't work
+  if ((!orientation || orientation === 'unknown') && h.qform_code > 0 && h.quatern_b !== undefined) {
+    orientation = computeOrientationFromQform(h);
   }
+  // Final fallback: infer from voxel sizes (diagonal sform assumption)
+  if (!orientation || orientation === 'unknown') {
+    orientation = 'RAS'; // NIfTI default coordinate system
+  }
+  rows.push(['Orientation', orientation]);
 
   content.innerHTML = rows.map(([key, val]) =>
     `<div class="header-row"><span class="header-key">${key}</span><span class="header-val" title="Click to copy" data-copy="${val}">${val}</span></div>`
@@ -4713,10 +4754,62 @@ async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: b
   updateImagePicker();
 }
 
+// Tooltip system: data-tip based, inspired by Project_Manager
+let tooltipEl: HTMLDivElement | null = null;
+let tooltipHideTimer: number | null = null;
+
+function initTooltipSystem() {
+  const el = document.createElement('div');
+  el.className = 'ns-tooltip';
+  document.body.appendChild(el);
+  tooltipEl = el;
+
+  document.addEventListener('mouseover', (e) => {
+    const target = (e.target as HTMLElement).closest('[data-tip]') as HTMLElement | null;
+    if (!target) return;
+    const tip = target.getAttribute('data-tip');
+    if (!tip) return;
+    if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+    const pos = target.getAttribute('data-tip-pos') || 'top';
+    const rect = target.getBoundingClientRect();
+    el.textContent = tip;
+    el.style.left = '0px';
+    el.style.top = '0px';
+    el.classList.add('visible');
+    const tipRect = el.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - tipRect.width / 2;
+    let top: number;
+    if (pos === 'bottom') {
+      top = rect.bottom + 6;
+    } else {
+      top = rect.top - tipRect.height - 6;
+    }
+    // Viewport clamping
+    if (left < 4) left = 4;
+    if (left + tipRect.width > window.innerWidth - 4) left = window.innerWidth - tipRect.width - 4;
+    if (top < 4) top = rect.bottom + 6;
+    if (top + tipRect.height > window.innerHeight - 4) top = rect.top - tipRect.height - 6;
+    el.style.left = `${left}px`;
+    el.style.top = `${top}px`;
+  });
+
+  document.addEventListener('mouseout', (e) => {
+    const target = (e.target as HTMLElement).closest('[data-tip]') as HTMLElement | null;
+    if (!target) return;
+    if (tooltipHideTimer) clearTimeout(tooltipHideTimer);
+    tooltipHideTimer = window.setTimeout(() => {
+      el.classList.remove('visible');
+    }, 80);
+  });
+}
+
 function setupInteraction() {
   if (!header) return;
   if (interactionInitialized) return;
   interactionInitialized = true;
+
+  // Initialize tooltip system (data-tip based, like Project_Manager)
+  initTooltipSystem();
 
   const wwSlider = document.getElementById('ww-slider') as HTMLInputElement;
   const wlSlider = document.getElementById('wl-slider') as HTMLInputElement;

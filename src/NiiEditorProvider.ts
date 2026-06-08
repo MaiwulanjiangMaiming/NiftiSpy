@@ -346,7 +346,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       isGzip: false, bytesPerVoxel: Math.max(1, bitpix / 8),
       totalVoxels3D: nx * ny * nz, sliceSizeXY: nx * ny,
       volumeBytes: nx * ny * nz * Math.max(1, bitpix / 8),
-      descrip: '', xyzt_units: 0, orientation: 'unknown',
+      descrip: '', xyzt_units: 0, orientation: '',
     };
   }
 
@@ -903,9 +903,8 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
 .file-name{font-weight:600;color:var(--accent);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}
 .file-detail{display:flex;gap:4px;font-size:10px;color:var(--text2)}
 .file-detail span{background:rgba(233,69,96,.15);padding:2px 6px;border-radius:4px;white-space:nowrap;border:1px solid rgba(233,69,96,.3)}
-.btn{background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px;transition:all .1s;white-space:nowrap;position:relative}
+.btn{background:var(--bg3);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:4px;cursor:pointer;font-size:10px;transition:all .1s;white-space:nowrap}
 .btn:hover{background:var(--accent);border-color:var(--accent);color:#fff}
-.btn[title]:hover::after{content:attr(title);position:absolute;bottom:calc(100% + 4px);left:50%;transform:translateX(-50%);background:var(--bg);color:var(--text);padding:4px 8px;border-radius:4px;font-size:11px;white-space:nowrap;z-index:100;pointer-events:none;border:1px solid var(--border);box-shadow:0 2px 8px rgba(0,0,0,.3)}
 .btn.active{background:var(--accent);color:#fff}
 .btn-fit{background:rgba(0,217,255,.2);border:1px solid var(--success);color:var(--success)}
 .btn-fit:hover{background:var(--success);color:#000}
@@ -982,14 +981,16 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 .sbs-label{position:absolute;top:22px;font-size:8px;pointer-events:none;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:2px;display:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sbs-label-l{left:4px;color:var(--success)}
 .sbs-label-r{right:4px;color:var(--warning)}
-.header-row{display:flex;justify-content:space-between;align-items:flex-start;font-size:11px;padding:2px 0;border-bottom:1px solid rgba(42,63,95,.3)}
-.header-key{color:var(--text2);flex-shrink:0;margin-right:8px}
-.header-val{color:var(--success);font-family:monospace;cursor:pointer;padding:1px 4px;border-radius:2px;word-break:break-all;white-space:normal;text-align:right;flex:1;min-width:0}
+.header-row{display:flex;flex-direction:column;font-size:11px;padding:3px 0;border-bottom:1px solid rgba(42,63,95,.3)}
+.header-key{color:var(--text2);font-size:10px;margin-bottom:1px}
+.header-val{color:var(--success);font-family:monospace;cursor:pointer;padding:1px 4px;border-radius:2px;word-break:break-all;white-space:normal;line-height:1.3}
 .header-val:hover{background:rgba(0,217,255,.15)}
 .header-val.copied{background:var(--success);color:#000}
 #header-panel{max-height:300px;overflow-y:auto}
 #header-info-content{overflow-y:auto;max-height:240px}
 .format-badge{display:inline-block;background:rgba(233,69,96,.2);border:1px solid var(--accent);color:var(--accent);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.5px;vertical-align:middle;margin-left:4px}
+.ns-tooltip{position:fixed;padding:4px 10px;border-radius:4px;background:var(--bg,#1a1a2e);color:var(--text,#e0e0e0);border:1px solid var(--border,#2a3f5f);font-size:11px;font-weight:400;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .12s ease;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.25);max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.ns-tooltip.visible{opacity:1}
 .measure-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:6}
 @media(prefers-contrast:more){.crosshair-h{height:2px!important}.crosshair-v{width:2px!important}.vl{font-size:14px!important}.vi{font-size:12px!important}}
 </style>
@@ -1001,14 +1002,14 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
     <span class="file-name" id="file-name">Loading...</span><span class="format-badge" id="format-badge" style="display:none">ZARR</span>
     <div class="file-detail" id="file-detail"></div>
   </div>
-  <button class="btn btn-fit" id="btn-fit" title="Zoom to Fit" aria-label="Zoom to fit">Fit</button>
-  <button class="btn" id="btn-auto" title="Auto Contrast" aria-label="Auto contrast">Auto Contrast</button>
-  <button class="btn" id="btn-reset" title="Reset View" aria-label="Reset view">Reset</button>
-  <button class="btn" id="btn-crosshair" title="Toggle Crosshair" aria-label="Toggle crosshair">✛</button>
-  <button class="btn" id="btn-measure" title="Toggle Measure Mode" aria-label="Toggle measure mode">📏</button>
-  <button class="btn" id="btn-clear-measure" title="Clear Measurements" aria-label="Clear all measurements">🗑️</button>
-  <button class="btn" id="btn-export" title="Export Slice as PNG" aria-label="Export slice as PNG">📷</button>
-  <button class="btn" id="btn-header" title="Toggle Header Info" aria-label="Toggle header info">ℹ️</button>
+  <button class="btn btn-fit" id="btn-fit" data-tip="Zoom to Fit" aria-label="Zoom to fit">Fit</button>
+  <button class="btn" id="btn-auto" data-tip="Auto Contrast" aria-label="Auto contrast">Auto Contrast</button>
+  <button class="btn" id="btn-reset" data-tip="Reset View" aria-label="Reset view">Reset</button>
+  <button class="btn" id="btn-crosshair" data-tip="Toggle Crosshair" aria-label="Toggle crosshair">✛</button>
+  <button class="btn" id="btn-measure" data-tip="Toggle Measure Mode" aria-label="Toggle measure mode">📏</button>
+  <button class="btn" id="btn-clear-measure" data-tip="Clear Measurements" aria-label="Clear all measurements">🗑️</button>
+  <button class="btn" id="btn-export" data-tip="Export Slice as PNG" aria-label="Export slice as PNG">📷</button>
+  <button class="btn" id="btn-header" data-tip="Toggle Header Info" aria-label="Toggle header info">ℹ️</button>
   <div class="tg"><label>W</label><input id="ww-slider" type="range" min="1" max="200" value="100" role="slider" aria-label="Window width" aria-valuemin="1" aria-valuemax="200" aria-valuenow="100"></div>
   <div class="tg"><label>L</label><input id="wl-slider" type="range" min="0" max="100" value="50" role="slider" aria-label="Window level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"></div>
   <div class="tg"><label>Map</label><select id="colormap"><option value="gray">Gray</option><option value="hot">Hot</option><option value="cool">Cool</option><option value="jet">Jet</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option></select></div>
@@ -1060,7 +1061,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v2.0.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v2.0.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="a11y-announce" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)"></div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>

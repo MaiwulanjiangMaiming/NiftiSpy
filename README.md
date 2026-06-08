@@ -189,9 +189,7 @@ npm run package
 
 ## Version
 
-- Current release: `1.10.1`
-- Status: release build prepared for GitHub push
-- Focus: CI/CD pipeline, ESLint/Prettier, WebGPU MIP rendering, orientation label fix
+- Current release: `2.0.1`
 
 For release notes, see [CHANGELOG.md](CHANGELOG.md).
 

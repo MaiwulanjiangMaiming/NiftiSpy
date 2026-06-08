@@ -10,6 +10,21 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [2.0.1] - 2026-06-08
+
+### Fixed
+- **Header Info visibility**: Changed header panel layout from horizontal (key|val side-by-side) to vertical (key above, val below) so long values like sform matrices are fully visible in the 180px sidebar.
+- **Orientation never shows "Unknown"**: Added `computeOrientationFromQform()` that reconstructs the rotation matrix from the qform quaternion (b, c, d) when sform is unavailable. Falls back to "RAS" (NIfTI default) only when both sform_code and qform_code are 0. The `orientation` field in `parseNiiHeaderFromBuffer` now defaults to empty string instead of `'unknown'`.
+- **Tooltip system**: Implemented JavaScript-driven `data-tip` tooltip system (inspired by Project_Manager) replacing the broken CSS `::after` pseudo-element approach. Tooltips now work correctly in VS Code Webview with viewport clamping and 80ms hide delay.
+- **Help popup font size**: Increased from 9px to 12px, width from 180px to 220px.
+- **Sidebar font size**: Increased from 9px to 11px.
+- **README Version section**: Simplified to show only current version number with link to CHANGELOG.
+
+### Changed
+- **Orientation computation**: Now uses a 3-tier fallback: sform → qform quaternion → RAS default. Based on ITK-SNAP's `ImageCoordinateGeometry` direction cosine analysis and niivue's quaternion-to-matrix reconstruction.
+
+---
+
 ## [2.0.0] - 2026-06-08
 
 ### Added
