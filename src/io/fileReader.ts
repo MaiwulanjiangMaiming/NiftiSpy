@@ -2,6 +2,9 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as https from 'https';
 
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 6, timeout: 30000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 6, timeout: 30000 });
+
 export function readLocalFilePartial(fsPath: string, start: number, end: number): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -21,13 +24,16 @@ export function readLocalFilePartial(fsPath: string, start: number, end: number)
 export function readHttpPartial(urlStr: string, start: number, end: number, signal?: AbortSignal): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
-    const mod = url.protocol === 'https:' ? https : http;
+    const isHttps = url.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
     const options: http.RequestOptions = {
       hostname: url.hostname,
-      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      port: url.port || (isHttps ? 443 : 80),
       path: url.pathname + url.search,
       method: 'GET',
       headers: { Range: `bytes=${start}-${end}` },
+      agent,
     };
 
     const req = mod.request(options, (res) => {

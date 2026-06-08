@@ -10,6 +10,19 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.9.3] - 2026-06-08
+
+### Changed
+- **WebGL auto-detection**: `detectBestRenderBackend()` is now async and properly probes WebGPU via `navigator.gpu.requestAdapter()`, WebGL2 3D texture via `MAX_3D_TEXTURE_SIZE`, WebGL2 2D, and falls back to Canvas 2D. The `"auto"` config value triggers this detection; `"webgl"` and `"canvas"` still work as manual overrides.
+- **VolumeCache strict LRU eviction**: Replaced timestamp-based eviction with a proper doubly-linked list + Map LRU implementation for O(1) lookup and reordering. Added `maxEntries` limit (default 5 volumes) and `getCacheInfo()` method.
+
+### Added
+- **Slice loading AbortController**: Per-axis `AbortController` in the viewer cancels stale slice requests when a new slice is requested, preventing wasted bandwidth and memory from outdated fetches. Worker `fetchSlice()` now accepts and propagates an `AbortSignal`.
+- **Cache usage status bar**: New `$(database) NiftiSpy: X/Y vol, Z MB` status bar item showing current volume cache usage.
+- **HTTP connection pooling**: Persistent `http.Agent` and `https.Agent` with keep-alive enabled for all Range requests in `readHttpPartial()`, reducing TCP connection overhead for remote file access.
+
+---
+
 ## [1.9.2] - 2026-06-08
 
 ### Changed

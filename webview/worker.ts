@@ -246,7 +246,7 @@ function getPreferredChunkSize(url: string): number {
   return CHUNK_SIZE;
 }
 
-async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: number): Promise<CachedSlice> {
+async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: number, signal?: AbortSignal): Promise<CachedSlice> {
   const cached = getCachedSlice(url, axis, index, factor);
   if (cached) return cached;
   const cacheKey = getSliceCacheKey(url, axis, index, factor);
@@ -286,7 +286,8 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
 
     const startedAt = performance.now();
     recordL4Fetch();
-    const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor));
+    if (signal?.aborted) throw abortError();
+    const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor), undefined, MAX_RETRIES, signal);
     if (!resp.ok) {
       throw new Error(`Slice fetch failed: ${resp.status}`);
     }
@@ -337,6 +338,7 @@ async function handleFetchSlice(message: {
   factor?: number;
   prefetch?: number;
   maxIndex?: number;
+  signal?: AbortSignal;
 }): Promise<void> {
   const factor = Math.max(1, message.factor || 1);
 
@@ -391,7 +393,7 @@ async function handleFetchSlice(message: {
     return;
   }
 
-  const slice = await fetchSlice(message.url, message.axis, message.index, factor);
+  const slice = await fetchSlice(message.url, message.axis, message.index, factor, message.signal);
   const payload = new Float32Array(slice.data);
   self.postMessage({
     id: message.id,
@@ -412,7 +414,7 @@ async function handleFetchSlice(message: {
     for (const nextIndex of [message.index - delta, message.index + delta]) {
       if (nextIndex < 0 || nextIndex > maxIndex) continue;
       if (getCachedSlice(message.url, message.axis, nextIndex, factor)) continue;
-      void fetchSlice(message.url, message.axis, nextIndex, factor).catch(() => {});
+      void fetchSlice(message.url, message.axis, nextIndex, factor, message.signal).catch(() => {});
     }
   }
 }

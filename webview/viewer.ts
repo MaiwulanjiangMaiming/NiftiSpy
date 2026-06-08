@@ -36,7 +36,7 @@ interface SliceFrame {
 
 interface ViewerConfig {
   previewMode: 'binary' | 'json';
-  renderBackend: 'webgl' | 'canvas';
+  renderBackend: 'auto' | 'webgl' | 'canvas';
   fullVolumePolicy: 'manual' | 'debounced' | 'eager';
   nativeAcceleration: 'off' | 'auto' | 'force';
 }
@@ -156,6 +156,9 @@ const volumeWorkers = new Map<string, Worker>();
 let activeLoadDebounceTimer: number | null = null;
 let scheduledActiveIndex: number | null = null;
 
+// Per-axis AbortController for cancelling stale slice requests
+const sliceAbortControllers = new Map<Axis, AbortController>();
+
 const currentSlices: Record<Axis, SliceFrame | null> = {
   axial: null,
   coronal: null,
@@ -256,7 +259,7 @@ const fpsCounter = {
 
 const viewerConfig: ViewerConfig = {
   previewMode: 'binary',
-  renderBackend: 'canvas',
+  renderBackend: 'auto',
   fullVolumePolicy: 'debounced',
   nativeAcceleration: 'auto',
 };
@@ -345,15 +348,16 @@ let webgpuAvailable = false;
 let webgpuChecked = false;
 let renderBackend: RenderBackend = 'canvas2d';
 
-function detectBestRenderBackend(): RenderBackend {
-  // 1. Check WebGPU availability
-  if (WebGPURenderer && typeof WebGPURenderer.isAvailable === 'function') {
-    // WebGPU check is async; we do a synchronous heuristic first
-    if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
-      return 'webgpu'; // will be validated asynchronously in getOrCreateWebGPURenderer
+async function detectBestRenderBackend(): Promise<RenderBackend> {
+  // 1. Try WebGPU: request adapter
+  try {
+    if (typeof navigator !== 'undefined' && navigator.gpu) {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) return 'webgpu';
     }
-  }
-  // 2. Check WebGL2 3D texture support
+  } catch { }
+
+  // 2. Try WebGL2 3D texture
   try {
     const testCanvas = document.createElement('canvas');
     const gl2 = testCanvas.getContext('webgl2') as WebGL2RenderingContext | null;
@@ -366,11 +370,37 @@ function detectBestRenderBackend(): RenderBackend {
       return 'webgl2d';
     }
   } catch { }
+
   // 4. Fallback to Canvas 2D
   return 'canvas2d';
 }
 
-renderBackend = detectBestRenderBackend();
+function applyRenderBackend(configValue: string): void {
+  if (configValue === 'auto') {
+    detectBestRenderBackend().then((backend) => {
+      renderBackend = backend;
+    });
+  } else if (configValue === 'webgl') {
+    // Manual override: pick best WebGL variant
+    try {
+      const testCanvas = document.createElement('canvas');
+      const gl2 = testCanvas.getContext('webgl2') as WebGL2RenderingContext | null;
+      if (gl2) {
+        const max3D = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE) || 0;
+        renderBackend = max3D >= 256 ? 'webgl3d' : 'webgl2d';
+      } else {
+        renderBackend = 'canvas2d';
+      }
+    } catch {
+      renderBackend = 'canvas2d';
+    }
+  } else {
+    // 'canvas' manual override
+    renderBackend = 'canvas2d';
+  }
+}
+
+applyRenderBackend('auto');
 
 let volumeRaycaster: VolumeRaycaster | null = null;
 let renderMode: 'slice' | 'volume' = 'slice';
@@ -1733,27 +1763,41 @@ function getActiveDownsample(): number {
 
 async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
   if (!header) return;
+  // Abort any previous slice request for this axis
+  const prevController = sliceAbortControllers.get(axis);
+  if (prevController) prevController.abort();
+  const controller = new AbortController();
+  sliceAbortControllers.set(axis, controller);
+  const signal = controller.signal;
+
   const pool = await getSlicePool();
   const geometry = getAxisGeometry(axis);
-  const response = await pool.dispatch<{
-    type: 'slice';
-    axis: Axis;
-    index: number;
-    factor: number;
-    width: number;
-    height: number;
-    data: Float32Array;
-  }>({
-    type: 'fetchSlice',
-    url: fileUrl,
-    axis,
-    index: sliceIdx[axis],
-    factor,
-    prefetch: PRELOAD_RANGE,
-    maxIndex: geometry.maxIndex,
-  });
-  if (response.index !== sliceIdx[axis]) return;
-  setCurrentSlice(axis, response.data, response.width || geometry.width, response.height || geometry.height, response.factor);
+  try {
+    const response = await pool.dispatch<{
+      type: 'slice';
+      axis: Axis;
+      index: number;
+      factor: number;
+      width: number;
+      height: number;
+      data: Float32Array;
+    }>({
+      type: 'fetchSlice',
+      url: fileUrl,
+      axis,
+      index: sliceIdx[axis],
+      factor,
+      prefetch: PRELOAD_RANGE,
+      maxIndex: geometry.maxIndex,
+      signal,
+    });
+    if (signal.aborted) return;
+    if (response.index !== sliceIdx[axis]) return;
+    setCurrentSlice(axis, response.data, response.width || geometry.width, response.height || geometry.height, response.factor);
+  } catch (err: any) {
+    if (err?.name === 'AbortError') return;
+    throw err;
+  }
 }
 
 async function refreshSlices(axes: Axis[], interactive = false) {
@@ -3541,6 +3585,7 @@ window.addEventListener('message', async (e) => {
   isGzip = fileName.endsWith('.gz');
   isRemoteSource = !!msg.isRemote;
   viewerConfig.previewMode = msg.previewMode || viewerConfig.previewMode;
+  applyRenderBackend(msg.renderBackend || viewerConfig.renderBackend);
   viewerConfig.renderBackend = msg.renderBackend || viewerConfig.renderBackend;
   viewerConfig.fullVolumePolicy = msg.fullVolumePolicy || viewerConfig.fullVolumePolicy;
   viewerConfig.nativeAcceleration = msg.nativeAcceleration || viewerConfig.nativeAcceleration;

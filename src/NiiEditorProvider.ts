@@ -80,11 +80,22 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private gzipIndexStatusItems = new Map<string, vscode.Disposable>();
   private chunkProgressItem: vscode.StatusBarItem | null = null;
   private nativeStatusBarItem: vscode.StatusBarItem | null = null;
+  private cacheStatusBarItem: vscode.StatusBarItem | null = null;
   private nativeFallbackWarned = false;
 
   constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
     this.volumeCache = volumeCache;
     this.loadQueue = new LoadQueue();
+    this.cacheStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
+    this.updateCacheStatusBar();
+    this.cacheStatusBarItem.show();
+  }
+
+  private updateCacheStatusBar(): void {
+    if (!this.cacheStatusBarItem) return;
+    const info = this.volumeCache.getCacheInfo();
+    const mb = Math.round(info.totalBytes / (1024 * 1024));
+    this.cacheStatusBarItem.text = `$(database) NiftiSpy: ${info.entries}/${info.maxEntries} vol, ${mb} MB`;
   }
 
   async openCustomDocument(
@@ -437,6 +448,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             slope: header.scl_slope || 1,
             inter: header.scl_inter || 0,
           });
+          this.updateCacheStatusBar();
 
           // Build gzip index in background for .nii.gz files
           if (isGzip && !this.gzipIndexes.has(uriKey)) {
@@ -546,6 +558,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             slope: header.scl_slope || 1,
             inter: header.scl_inter || 0,
           });
+          this.updateCacheStatusBar();
 
           const voxelBuffer = voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
 
@@ -992,7 +1005,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.9.2 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.9.3 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
