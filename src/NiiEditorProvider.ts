@@ -960,9 +960,9 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 .sbs-label{position:absolute;top:22px;font-size:8px;pointer-events:none;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:2px;display:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sbs-label-l{left:4px;color:var(--success)}
 .sbs-label-r{right:4px;color:var(--warning)}
-.header-row{display:flex;justify-content:space-between;align-items:center;font-size:9px;padding:2px 0;border-bottom:1px solid rgba(42,63,95,.3)}
-.header-key{color:var(--text2);flex-shrink:0}
-.header-val{color:var(--success);font-family:monospace;cursor:pointer;padding:1px 4px;border-radius:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.header-row{display:flex;justify-content:space-between;align-items:flex-start;font-size:9px;padding:2px 0;border-bottom:1px solid rgba(42,63,95,.3)}
+.header-key{color:var(--text2);flex-shrink:0;margin-right:8px}
+.header-val{color:var(--success);font-family:monospace;cursor:pointer;padding:1px 4px;border-radius:2px;word-break:break-all;white-space:normal;text-align:right;flex:1;min-width:0}
 .header-val:hover{background:rgba(0,217,255,.15)}
 .header-val.copied{background:var(--success);color:#000}
 #header-panel{max-height:300px;overflow-y:auto}
