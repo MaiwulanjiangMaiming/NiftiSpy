@@ -21,7 +21,13 @@ Open `.nii`, `.nii.gz`, and `.hdr` volumes directly inside VS Code. The extensio
 - Axial, coronal, sagittal, and 3D MIP views
 - Remote-friendly loading through a local proxy
 - Debounced full-volume loading to avoid slowdowns during rapid switching
-- Canvas-first rendering for broad compatibility, with WebGL fast path when supported
+- Canvas-first rendering for broad compatibility, with WebGL and WebGPU fast paths
+- HTTP/2 multiplexed proxy for concurrent slice requests
+- IndexedDB disk cache for remote file slices
+- Progressive LOD loading for .nii.gz files
+- GZIP random-access index for on-demand slice extraction
+- Zarr v2 format support
+- Optional Rust native acceleration (mmap, fast decompress)
 - Window/level, zoom, pan, crosshair, orientation labels, and compare mode
 
 ## Supported Files
@@ -29,6 +35,7 @@ Open `.nii`, `.nii.gz`, and `.hdr` volumes directly inside VS Code. The extensio
 - `.nii`
 - `.nii.gz`
 - `.hdr`
+- `.zarr` (Zarr v2 format)
 
 ## Install
 
@@ -123,13 +130,13 @@ The extension contributes these settings:
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `niiFastView.proxyPort` | `0` | HTTP proxy port, `0` means auto-assign |
-| `niiFastView.defaultColormap` | `gray` | Initial colormap |
-| `niiFastView.enableLOD` | `true` | Enables preview / LOD flow for gzip volumes |
-| `niiFastView.previewMode` | `binary` | Preview transport format |
-| `niiFastView.renderBackend` | `canvas` | Slice renderer, `canvas` is the safest default |
-| `niiFastView.fullVolumePolicy` | `debounced` | When full-volume loading is triggered |
-| `niiFastView.nativeAcceleration` | `auto` | Native module policy |
+| `niftispy.proxyPort` | `0` | HTTP proxy port, `0` means auto-assign |
+| `niftispy.defaultColormap` | `gray` | Initial colormap |
+| `niftispy.enableLOD` | `true` | Enables preview / LOD flow for gzip volumes |
+| `niftispy.previewMode` | `binary` | Preview transport format |
+| `niftispy.renderBackend` | `auto` | Slice renderer, `auto` selects best available |
+| `niftispy.fullVolumePolicy` | `debounced` | When full-volume loading is triggered |
+| `niftispy.nativeAcceleration` | `auto` | Native module policy |
 
 ## Development
 
@@ -173,11 +180,67 @@ npm run package
 
 ## Version
 
-- Current release: `1.3.2`
+- Current release: `1.9.2`
 - Status: release build prepared for GitHub push
-- Focus: ITK-Snap compatible orientation, multi-Worker parallelism, streaming memory optimization
+- Focus: Config namespace migration, HTTP port conflict handling, native acceleration status bar
 
 ## Release Notes
+
+### 1.9.2
+
+- Migrates configuration namespace from `niiFastView.*` to `niftispy.*` with automatic migration of existing settings
+- Adds `auto` option to `renderBackend` (now the default) for automatic best-backend selection
+- Adds native acceleration status bar indicator (`$(bolt) NiftiSpy: Native` or `$(code) NiftiSpy: JS`)
+- Adds HTTP proxy port conflict handling with automatic retry on EADDRINUSE
+- Reads `niftispy.proxyPort` configuration for initial port selection
+- Shows one-time information message when falling back to JavaScript
+
+### 1.9.1
+
+- VolumeProvider abstract class with standardized chunked volume access API
+- ChunkLRUCache extracted into a reusable class
+- ZarrVolumeProvider for read-only Zarr v2 format support (zlib/gzip, blosc, lz4 compressors)
+- Zarr file type registration and custom editor integration
+- Chunk loading progress status bar for large volumes
+
+### 1.9.0
+
+- WebGPU persistent uniform buffers eliminating per-frame GPU allocation overhead
+- WebGPU colormap and flip support in vertex shader
+- VolumeRaycaster `setConfig()` and `getTransferFunction()` methods
+- Arcball rotation for gimbal-lock-free 3D interaction
+- Rendering fallback fix when volume3D texture not yet ready
+
+### 1.5.3
+
+- Rendering backend auto-selection (WebGPU → WebGL2 3D → WebGL2 2D → Canvas 2D)
+- Performance profile detection with MAX_3D_TEXTURE_SIZE probing
+- Smart volume upload skipping 3D texture for volumes exceeding 1GB
+
+### 1.5.1
+
+- Overlay display fix using pre-registered data1 parameter
+- SBS registration with unified physical extent for consistent anatomical scale
+- Auto Contrast on load now defaults to [0, 1]; users must click "Auto Contrast"
+
+### 1.5.0
+
+- Volume Ray Marching renderer with GPU-based 3D rendering using WebGL2
+- Front-to-back compositing with early ray termination
+- Phong shading with on-the-fly gradient computation
+- Transfer function with piecewise linear interpolation
+- Interactive 3D viewing mode with mouse drag rotation and scroll zoom
+
+### 1.4.1
+
+- Rust mmap memory-mapped file I/O for zero-copy file access
+- Rust fast GZIP decompression using flate2
+- Native bridge extensions for mmap and decompression bindings
+
+### 1.4.0
+
+- Chunked Volume data model with 64³ chunk-based access and LRU eviction
+- LOD Pyramid with progressive loading (LOD2 ~50ms, LOD1 ~200ms, LOD0 ~1000ms)
 
 ### 1.3.2
 

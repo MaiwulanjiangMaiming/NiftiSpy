@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",
@@ -103,14 +103,14 @@
       }
     ],
     "configuration": {
-      "title": "NIfTI Fast View",
+      "title": "NiftiSpy",
       "properties": {
-        "niiFastView.proxyPort": {
+        "niftispy.proxyPort": {
           "type": "number",
           "default": 0,
           "description": "HTTP proxy port (0 = auto assign)"
         },
-        "niiFastView.defaultColormap": {
+        "niftispy.defaultColormap": {
           "type": "string",
           "default": "gray",
           "enum": [
@@ -123,12 +123,12 @@
           ],
           "description": "Default colormap"
         },
-        "niiFastView.enableLOD": {
+        "niftispy.enableLOD": {
           "type": "boolean",
           "default": true,
           "description": "Enable progressive LOD loading for .nii.gz"
         },
-        "niiFastView.previewMode": {
+        "niftispy.previewMode": {
           "type": "string",
           "default": "binary",
           "enum": [
@@ -137,16 +137,17 @@
           ],
           "description": "Preview transport format"
         },
-        "niiFastView.renderBackend": {
+        "niftispy.renderBackend": {
           "type": "string",
-          "default": "canvas",
+          "default": "auto",
           "enum": [
+            "auto",
             "webgl",
             "canvas"
           ],
           "description": "Slice rendering backend"
         },
-        "niiFastView.fullVolumePolicy": {
+        "niftispy.fullVolumePolicy": {
           "type": "string",
           "default": "debounced",
           "enum": [
@@ -156,7 +157,7 @@
           ],
           "description": "When to trigger full-volume loading"
         },
-        "niiFastView.nativeAcceleration": {
+        "niftispy.nativeAcceleration": {
           "type": "string",
           "default": "auto",
           "enum": [

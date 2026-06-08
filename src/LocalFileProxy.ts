@@ -79,28 +79,60 @@ export class LocalFileProxy {
   }
 
   async start(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    const maxRetries = 3;
+    const configuredPort = vscode.workspace.getConfiguration('niftispy').get<number>('proxyPort', 0);
+    let tryPort = configuredPort;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       try {
-        const h2Server = http2.createServer();
-        h2Server.on('stream', (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
-          this.handleHttp2Stream(stream, headers);
+        const server = await new Promise<http2.Http2Server | http.Server>((resolve, reject) => {
+          let createdServer: http2.Http2Server | http.Server;
+          try {
+            const h2Server = http2.createServer();
+            h2Server.on('stream', (stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders) => {
+              this.handleHttp2Stream(stream, headers);
+            });
+            createdServer = h2Server;
+            this.useHttp2 = true;
+            this.stats.protocol = 'h2';
+          } catch {
+            createdServer = http.createServer(this.handleRequest.bind(this) as any);
+            this.useHttp2 = false;
+            this.stats.protocol = 'http/1.1';
+          }
+
+          createdServer.on('error', (err: any) => {
+            if (err.code === 'EADDRINUSE' && tryPort !== 0) {
+              reject(err);
+            } else {
+              reject(err);
+            }
+          });
+
+          createdServer.listen(tryPort, '127.0.0.1', () => {
+            resolve(createdServer);
+          });
         });
-        this.server = h2Server;
-        this.useHttp2 = true;
-        this.stats.protocol = 'h2';
-      } catch {
-        this.server = http.createServer(this.handleRequest.bind(this) as any);
-        this.useHttp2 = false;
-        this.stats.protocol = 'http/1.1';
-      }
-      this.server.listen(0, '127.0.0.1', () => {
-        const addr = this.server!.address() as { port: number };
+
+        this.server = server;
+        const addr = this.server.address() as { port: number };
         this.port = addr.port;
+        this.server.on('error', (err: Error) => {
+          console.error('LocalFileProxy server error:', err);
+        });
         this.startCleanup();
-        resolve();
-      });
-      this.server.on('error', reject);
-    });
+        return;
+      } catch (err: any) {
+        if (err.code === 'EADDRINUSE' && tryPort !== 0 && attempt < maxRetries) {
+          tryPort = tryPort + 1;
+          continue;
+        }
+        if (tryPort !== 0 && attempt >= maxRetries) {
+          throw new Error(`NiftiSpy: Failed to start HTTP proxy after ${maxRetries} retries. Port ${configuredPort}–${tryPort} are all in use. Set niftispy.proxyPort to 0 for auto-assign.`);
+        }
+        throw err;
+      }
+    }
   }
 
   private startCleanup(): void {

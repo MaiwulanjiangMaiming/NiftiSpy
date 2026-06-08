@@ -79,6 +79,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private gzipIndexes = new Map<string, GzipIndex>();
   private gzipIndexStatusItems = new Map<string, vscode.Disposable>();
   private chunkProgressItem: vscode.StatusBarItem | null = null;
+  private nativeStatusBarItem: vscode.StatusBarItem | null = null;
+  private nativeFallbackWarned = false;
 
   constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
     this.volumeCache = volumeCache;
@@ -148,7 +150,26 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
     webview.onDidReceiveMessage(async (msg) => {
       if (msg.type === 'ready') {
-        const config = vscode.workspace.getConfiguration('niiFastView');
+        const config = vscode.workspace.getConfiguration('niftispy');
+
+        // Update native acceleration status bar
+        const native = getNativeBindings();
+        if (!this.nativeStatusBarItem) {
+          this.nativeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
+        }
+        if (native) {
+          this.nativeStatusBarItem.text = '$(bolt) NiftiSpy: Native';
+          this.nativeStatusBarItem.color = new vscode.ThemeColor('statusBar.foreground');
+          this.nativeStatusBarItem.show();
+        } else {
+          this.nativeStatusBarItem.text = '$(code) NiftiSpy: JS';
+          this.nativeStatusBarItem.color = new vscode.ThemeColor('notificationsWarningIcon.foreground');
+          this.nativeStatusBarItem.show();
+          if (!this.nativeFallbackWarned) {
+            this.nativeFallbackWarned = true;
+            vscode.window.showInformationMessage('NiftiSpy: Native acceleration unavailable, using JavaScript fallback. Performance may be reduced.');
+          }
+        }
 
         // Compute validation token and file size for cache invalidation
         let fileSize = 0;
@@ -971,7 +992,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.9.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.9.2 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>

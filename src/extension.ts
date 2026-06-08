@@ -20,7 +20,23 @@ function isZarrDirectory(uri: vscode.Uri): boolean {
   return false;
 }
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
+  // Migrate old niiFastView.* settings to niftispy.*
+  const oldConfig = vscode.workspace.getConfiguration('niiFastView');
+  const newConfig = vscode.workspace.getConfiguration('niftispy');
+  const migrationKeys = ['proxyPort', 'defaultColormap', 'enableLOD', 'previewMode', 'renderBackend', 'fullVolumePolicy', 'nativeAcceleration'];
+  for (const key of migrationKeys) {
+    const oldVal = oldConfig.inspect(key);
+    if (oldVal?.globalValue !== undefined) {
+      await newConfig.update(key, oldVal.globalValue, vscode.ConfigurationTarget.Global);
+      await oldConfig.update(key, undefined, vscode.ConfigurationTarget.Global);
+    }
+    if (oldVal?.workspaceValue !== undefined) {
+      await newConfig.update(key, oldVal.workspaceValue, vscode.ConfigurationTarget.Workspace);
+      await oldConfig.update(key, undefined, vscode.ConfigurationTarget.Workspace);
+    }
+  }
+
   const volumeCache = new VolumeCache();
   const provider = new NiiEditorProvider(context, volumeCache);
 
@@ -92,7 +108,7 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
 <div class="container">
   <h1>Zarr Volume</h1>
   <div class="info">${zarrInfo}</div>
-  <div class="version">NiftiSpy v1.9.1</div>
+  <div class="version">NiftiSpy v1.9.2</div>
 </div>
 </body>
 </html>`;

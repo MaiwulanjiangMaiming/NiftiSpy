@@ -10,6 +10,25 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.9.2] - 2026-06-08
+
+### Changed
+- **Config namespace migration**: All configuration keys renamed from `niiFastView.*` to `niftispy.*`. Existing settings are automatically migrated on activation (global and workspace scopes).
+- **Configuration title**: Changed from "NIfTI Fast View" to "NiftiSpy".
+- **`renderBackend` default**: Changed from `"canvas"` to `"auto"`. New `"auto"` enum value selects the best available backend automatically.
+
+### Added
+- **Native acceleration status bar**: Shows `$(bolt) NiftiSpy: Native` (green) when native module is loaded, or `$(code) NiftiSpy: JS` (yellow) when using JavaScript fallback.
+- **One-time fallback notification**: Shows an information message on first silent fallback to JavaScript: "NiftiSpy: Native acceleration unavailable, using JavaScript fallback. Performance may be reduced."
+- **HTTP proxy port conflict handling**: `LocalFileProxy.start()` now retries up to 3 times with incrementing port numbers when the configured port is already in use (EADDRINUSE).
+- **`niftispy.proxyPort` configuration**: The proxy port setting is now actually read and used as the initial port for the HTTP proxy server.
+- **Server error logging**: Added `onError` handler to the proxy server that logs errors.
+
+### Fixed
+- Port 0 (auto-assign) now works correctly with the retry logic (no retries needed for auto-assign).
+
+---
+
 ## [1.5.3] - 2026-06-03
 
 ### Added
@@ -22,7 +41,36 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
-## [1.5.2] - 2026-06-03
+## [1.9.1] - 2026-06-03
+
+### Added
+- **VolumeProvider abstract class v1.9.1 API**: New public methods on the `VolumeProvider` abstract class for standardized chunked volume access:
+  - `getDimensions()`: Returns `{ nx, ny, nz }` of the volume.
+  - `getVoxelSize()`: Returns `{ dx, dy, dz }` voxel spacing.
+  - `getChunkSize()`: Returns `{ cx, cy, cz }` chunk dimensions (default 64³).
+  - `getChunk(chunkX, chunkY, chunkZ)`: Load and return a single chunk's data as `Float32Array`.
+  - `getChunksForSlice(axis, sliceIndex)`: Return chunk keys needed for a given slice.
+  - `extractSlice(axis, sliceIndex)`: Assemble a full slice from loaded chunks.
+  - `isChunkLoaded(chunkX, chunkY, chunkZ)`: Check if a chunk is in the LRU cache.
+  - `getLoadedChunksCount()`: Number of currently loaded chunks.
+  - `getTotalChunksCount()`: Total number of chunks in the volume.
+  - `evictChunk(chunkX, chunkY, chunkZ)`: Evict a specific chunk from the cache.
+- **ChunkLRUCache**: Extracted the LRU chunk cache into a reusable `ChunkLRUCache` class with `has()`, `touch()`, `setPending()`, `deletePending()` methods. Shared by all provider implementations.
+- **NiftiVolumeProvider**: Renamed from `LocalVolumeProvider` (backward-compatible alias preserved). Wraps existing NIfTI loading with 64³ chunk-based access and LRU cache (max 512 chunks). On first access to a chunk, loads it from the full volume data. Supports both local files and mmap-based access.
+- **ZarrVolumeProvider**: New `ZarrVolumeProvider` for read-only Zarr v2 format support:
+  - Reads `.zarray` metadata file to get dimensions, dtype, chunk shape, and compressor.
+  - Supports zlib/gzip, blosc, and lz4 compressors.
+  - Each chunk is stored as a separate file: `data/0.0.0`, `data/0.0.1`, etc.
+  - Loads chunks on demand via HTTP or local file system.
+  - Same LRU cache as `NiftiVolumeProvider`.
+  - Maps Zarr chunk grid to the internal 64³ chunk grid for uniform access.
+- **Zarr file type registration**: New custom editor `niftispy.zarr` registered in `package.json` for `.zarr` directories. Zarr language definition added with icon support.
+- **Chunk loading progress**: Status bar item showing chunk loading progress for large volumes (e.g., "Chunks: 128/256 (50%)").
+- **Zarr editor integration**: `extension.ts` registers a `niftispy.zarr` custom editor provider that reads Zarr metadata and displays volume info.
+
+---
+
+## [1.9.0] - 2026-06-03
 
 ### Changed
 - **WebGPU persistent uniform buffers**: `renderSlice3D()` and `computeHistogram()` no longer create and destroy a uniform buffer every frame. Persistent buffers are created during pipeline setup and updated via `device.queue.writeBuffer()`, eliminating per-frame GPU allocation overhead.
