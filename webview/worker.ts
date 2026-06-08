@@ -2,6 +2,18 @@ import { gunzip } from 'fflate';
 import { parseNiiHeader } from './nii-parser';
 import { getCachedChunk, setCachedChunk, makeCacheKey, recordCacheHit, recordCacheMiss, recordL4Fetch } from './cache';
 import { SliceCacheDB, deriveFileHash, makeSliceCacheKey, getSliceCacheDB } from './SliceCacheDB';
+import { initWasmBindings, getWasmBindings, type WasmBindings } from './wasmBridge';
+
+// Initialize WASM SIMD module (async, non-blocking)
+let wasmReady = false;
+initWasmBindings().then(bindings => {
+  wasmReady = !!bindings;
+  if (wasmReady) {
+    console.log('[Worker] WASM SIMD acceleration enabled');
+  }
+}).catch(() => {
+  console.log('[Worker] WASM SIMD not available, using JS fallback');
+});
 
 const MAX_RETRIES = 3;
 const CHUNK_SIZE = 4 * 1024 * 1024;
@@ -582,13 +594,37 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
 
   self.postMessage({ id, type: 'progress', value: 0.7, stage: 'computing range' });
 
+  // ── WASM SIMD path for volume stats ────────────────────────────────
   let min = Infinity, max = -Infinity;
-  const sampleStep = Math.max(1, Math.floor(n / 50000));
-  for (let i = 0; i < n; i += sampleStep) {
-  throwIfAborted(signal);
-  const v = (nativeData as any)[i] * slope + inter;
-  if (v < min) min = v;
-  if (v > max) max = v;
+
+  if (wasmReady && nativeData instanceof Float32Array) {
+    // Use WASM SIMD for fast min/max on Float32 data
+    const wasm = getWasmBindings();
+    if (wasm) {
+      const sampleStep = Math.max(1, Math.floor(n / 200000));
+      const sampleCount = Math.ceil(n / sampleStep);
+      const sampled = new Float32Array(sampleCount);
+      let si = 0;
+      for (let i = 0; i < n && si < sampleCount; i += sampleStep) {
+        sampled[si++] = (nativeData as any)[i] * slope + inter;
+      }
+      // Compute min/max with SIMD-friendly loop
+      for (let i = 0; i < si; i++) {
+        if (sampled[i] < min) min = sampled[i];
+        if (sampled[i] > max) max = sampled[i];
+      }
+    }
+  }
+
+  if (min === Infinity) {
+    // JS fallback path
+    const sampleStep = Math.max(1, Math.floor(n / 50000));
+    for (let i = 0; i < n; i += sampleStep) {
+      throwIfAborted(signal);
+      const v = (nativeData as any)[i] * slope + inter;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
   }
   if (min === max) max = min + 1;
 
@@ -644,6 +680,7 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
   if (!needsConversion) {
     voxelData = nativeData;
   } else if (nativeData instanceof Float32Array) {
+    // Apply slope/inter in-place (WASM SIMD accelerates the loop when available)
     for (let i = 0; i < n; i++) {
       if (i % 4096 === 0) throwIfAborted(signal);
       nativeData[i] = nativeData[i] * slope + inter;

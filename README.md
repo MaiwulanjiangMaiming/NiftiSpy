@@ -189,7 +189,7 @@ npm run package
 
 ## Version
 
-- Current release: `2.0.1`
+- Current release: `2.1.0`
 
 For release notes, see [CHANGELOG.md](CHANGELOG.md).
 

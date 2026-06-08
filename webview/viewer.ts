@@ -2,6 +2,7 @@ import { NiiHeader, DATATYPE_NAMES } from './nii-parser';
 import { WebGPURenderer } from './webgpuRenderer';
 import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
 import { deriveFileHash } from './SliceCacheDB';
+import { initWasmBindings, getWasmBindings } from './wasmBridge';
 
 declare function acquireVsCodeApi(): any;
 const vscode = acquireVsCodeApi();
@@ -2200,12 +2201,17 @@ class PrefetchPriorityQueue {
         const dataRange = globalMax - globalMin || 1;
         const n = w * h;
 
-        // Apply window/level normalization to Uint8 (mirrors fast_apply_window_level in native)
+        // Apply window/level normalization to Uint8
         const normalized = new Uint8Array(n);
-        for (let i = 0; i < n; i++) {
-          const norm = (slice[i] - globalMin) / dataRange;
-          const t = Math.max(0, Math.min(1, (norm - lo) / range));
-          normalized[i] = (t * 255 + 0.5) | 0;
+        const wasm = getWasmBindings();
+        if (wasm && slice instanceof Float32Array) {
+          normalized.set(wasm.applyWindowLevel(slice, lo, range, globalMin, globalMax));
+        } else {
+          for (let i = 0; i < n; i++) {
+            const norm = (slice[i] - globalMin) / dataRange;
+            const t = Math.max(0, Math.min(1, (norm - lo) / range));
+            normalized[i] = (t * 255 + 0.5) | 0;
+          }
         }
 
         // Apply colormap to normalized values
@@ -2605,12 +2611,18 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   const dataRange = globalMax - globalMin || 1;
   const n = w * h;
 
-  // Apply window/level normalization to Uint8 (mirrors fast_apply_window_level in native)
+  // Apply window/level normalization to Uint8
+  // Try WASM SIMD path first (4x parallel f32 processing)
   const normalized = new Uint8Array(n);
-  for (let i = 0; i < n; i++) {
-    const norm = (data[i] - globalMin) / dataRange;
-    const t = Math.max(0, Math.min(1, (norm - lo) / range));
-    normalized[i] = (t * 255 + 0.5) | 0;
+  const wasm = getWasmBindings();
+  if (wasm && data instanceof Float32Array) {
+    normalized.set(wasm.applyWindowLevel(data, lo, range, globalMin, globalMax));
+  } else {
+    for (let i = 0; i < n; i++) {
+      const norm = (data[i] - globalMin) / dataRange;
+      const t = Math.max(0, Math.min(1, (norm - lo) / range));
+      normalized[i] = (t * 255 + 0.5) | 0;
+    }
   }
 
   // Apply colormap to normalized values
@@ -4810,6 +4822,15 @@ function setupInteraction() {
 
   // Initialize tooltip system (data-tip based, like Project_Manager)
   initTooltipSystem();
+
+  // Initialize WASM SIMD acceleration (async, non-blocking)
+  initWasmBindings().then(bindings => {
+    if (bindings?.hasSimd()) {
+      console.log('[NiftiSpy] WASM SIMD128 acceleration active');
+    }
+  }).catch(() => {
+    console.log('[NiftiSpy] WASM SIMD not available');
+  });
 
   const wwSlider = document.getElementById('ww-slider') as HTMLInputElement;
   const wlSlider = document.getElementById('wl-slider') as HTMLInputElement;

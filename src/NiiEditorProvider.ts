@@ -190,16 +190,16 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.nativeStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
         }
         if (native) {
-          this.nativeStatusBarItem.text = '$(bolt) NiftiSpy: Native';
+          this.nativeStatusBarItem.text = '$(bolt) NiftiSpy: Native+WASM';
           this.nativeStatusBarItem.color = new vscode.ThemeColor('statusBar.foreground');
           this.nativeStatusBarItem.show();
         } else {
-          this.nativeStatusBarItem.text = '$(code) NiftiSpy: JS';
+          this.nativeStatusBarItem.text = '$(code) NiftiSpy: WASM+JS';
           this.nativeStatusBarItem.color = new vscode.ThemeColor('notificationsWarningIcon.foreground');
           this.nativeStatusBarItem.show();
           if (!this.nativeFallbackWarned) {
             this.nativeFallbackWarned = true;
-            vscode.window.showInformationMessage('NiftiSpy: Native acceleration unavailable, using JavaScript fallback. Performance may be reduced.');
+            vscode.window.showInformationMessage('NiftiSpy: Native acceleration unavailable, using WASM SIMD + JavaScript fallback.');
           }
         }
 
@@ -1061,7 +1061,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v2.0.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v2.1.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="a11y-announce" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)"></div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>

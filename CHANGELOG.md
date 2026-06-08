@@ -10,6 +10,34 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [2.1.0] - 2026-06-08
+
+### Added
+- **WASM SIMD acceleration path**: New `native-wasm` Rust crate compiled to `wasm32-unknown-unknown` with `wasm-bindgen`. Provides browser-side SIMD128 acceleration for:
+  - Header parsing (`wasm_parse_header`)
+  - Slice extraction (`wasm_extract_slice`) with SIMD-optimized Float32 fast path
+  - Preview generation (`wasm_extract_preview`)
+  - Window/Level normalization (`wasm_apply_window_level`) — 4x parallel f32 processing
+  - Bilinear resampling (`wasm_resample_slice`)
+  - Volume statistics (`wasm_get_volume_stats`) — Welford's online algorithm + histogram
+  - SIMD feature detection (`wasm_has_simd`)
+- **WASM bridge** (`webview/wasmBridge.ts`): JavaScript bridge layer that loads the WASM module inside Web Workers and provides the same API surface as `nativeBridge.ts`.
+- **WASM build script**: `npm run build:wasm` — compiles Rust to WASM with `wasm-pack --target web` and outputs to `webview/wasm/`.
+- **3-tier acceleration priority**: Native (Node.js, mmap) → WASM SIMD (browser Worker) → Pure JS fallback.
+- **WASM-accelerated window/level**: Both `paintCanvas2d` and `SliceRenderWorker` now use `wasm.applyWindowLevel()` for SIMD128-parallel Float32→Uint8 normalization when WASM is available.
+
+### Changed
+- **Status bar labels**: Updated to reflect new acceleration paths — "Native+WASM" (when native available) or "WASM+JS" (native unavailable).
+- **Fallback message**: Changed from "using JavaScript fallback" to "using WASM SIMD + JavaScript fallback".
+
+### Architecture
+- **Acceleration hierarchy**:
+  1. **Native** (`napi-rs`, Node.js side): mmap, batch slice extraction, volume stats — fastest, requires compiled `.node` binary
+  2. **WASM SIMD** (`wasm-bindgen`, browser Worker): header parsing, slice extraction, window/level, resampling — fast, SIMD128 auto-vectorized, no native binary needed
+  3. **Pure JS**: TypedArray loops — always available as fallback
+
+---
+
 ## [2.0.1] - 2026-06-08
 
 ### Fixed
