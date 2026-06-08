@@ -965,6 +965,8 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 .header-val{color:var(--success);font-family:monospace;cursor:pointer;padding:1px 4px;border-radius:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .header-val:hover{background:rgba(0,217,255,.15)}
 .header-val.copied{background:var(--success);color:#000}
+#header-panel{max-height:300px;overflow-y:auto}
+#header-info-content{overflow-y:auto;max-height:240px}
 .format-badge{display:inline-block;background:rgba(233,69,96,.2);border:1px solid var(--accent);color:var(--accent);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.5px;vertical-align:middle;margin-left:4px}
 </style>
 </head>
@@ -1032,7 +1034,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.10.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.10.1 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>

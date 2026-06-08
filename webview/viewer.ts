@@ -2480,6 +2480,44 @@ function getAnatomicalAxisDir(srow: number[]): { axis: number, dir: number } {
   return { axis: domIdx, dir };
 }
 
+// Compute orientation string from sform matrix (ITK-SNAP approach)
+// Analyzes the direction cosines from the sform matrix to determine
+// anatomical orientation (L/R, A/P, S/I) for each axis
+function computeOrientationFromSform(srow_x: number[], srow_y: number[], srow_z: number[]): string {
+  // RAI codes: positive directions are R, A, S; negative are L, P, I
+  const raiPositive = ['R', 'A', 'S'];
+  const raiNegative = ['L', 'P', 'I'];
+
+  // Build direction matrix (columns are the srow vectors)
+  const directionMatrix = [
+    [srow_x[0], srow_y[0], srow_z[0]],
+    [srow_x[1], srow_y[1], srow_z[1]],
+    [srow_x[2], srow_y[2], srow_z[2]],
+  ];
+
+  let result = '';
+  for (let i = 0; i < 3; i++) {
+    // Get the direction of the i-th voxel coordinate (column i)
+    const dirI = [directionMatrix[0][i], directionMatrix[1][i], directionMatrix[2][i]];
+    const absDir = [Math.abs(dirI[0]), Math.abs(dirI[1]), Math.abs(dirI[2])];
+    const maxAbs = Math.max(absDir[0], absDir[1], absDir[2]);
+
+    // ITK-SNAP trick: visit (i,i) first for tie-breaking
+    let found = false;
+    for (let off = 0; off < 3; off++) {
+      const j = (i + off) % 3;
+      if (Math.abs(dirI[j]) === maxAbs) {
+        result += dirI[j] > 0 ? raiPositive[j] : raiNegative[j];
+        found = true;
+        break;
+      }
+    }
+    if (!found) result += '?';
+  }
+
+  return result;
+}
+
 function computeViewFlips() {
   if (!header) return;
   const srow_x = header.srow_x;
@@ -2510,15 +2548,92 @@ function computeViewFlips() {
 // direction 0 = negative (L/P/I), direction 1 = positive (R/A/S)
 const letters: string[][] = [["L", "R"], ["P", "A"], ["I", "S"]];
 
-// Get orientation labels based on view axis, srow vectors, and how we draw the slice
+// Compute orientation labels from sform matrix (ITK-SNAP approach)
+// Analyzes direction cosines to determine anatomical orientation for each view axis
 function getCoordLabelX(axis: string): { left: string; right: string } {
-  if (axis === 'sagittal') return { left: 'A', right: 'P' };
-  return { left: 'R', right: 'L' };
+  if (!header || !header.srow_x || !header.srow_y || !header.srow_z) {
+    // Fallback to hardcoded defaults
+    if (axis === 'sagittal') return { left: 'A', right: 'P' };
+    return { left: 'R', right: 'L' };
+  }
+
+  // Determine which srow vector corresponds to the screen X axis
+  let srow: number[];
+  if (axis === 'axial') {
+    srow = header.srow_x; // X axis on axial = voxel X
+  } else if (axis === 'coronal') {
+    srow = header.srow_x; // X axis on coronal = voxel X
+  } else {
+    srow = header.srow_y; // X axis on sagittal = voxel Y
+  }
+
+  const dirInfo = getAnatomicalAxisDir(srow);
+  const flips = viewFlips[axis] || { flipX: false, flipY: false };
+
+  // The label depends on the dominant anatomical direction and whether we flip
+  // dirInfo.dir > 0 means the voxel axis goes in the positive anatomical direction (R/A/S)
+  // When flipX is true, we reverse the display, so left/right swap
+  const positiveLabel = letters[dirInfo.axis][1]; // R, A, or S
+  const negativeLabel = letters[dirInfo.axis][0]; // L, P, or I
+
+  if (dirInfo.dir > 0) {
+    // Voxel axis goes positive (R/A/S direction)
+    // Without flip: left=negative, right=positive
+    // With flip: left=positive, right=negative
+    return flips.flipX
+      ? { left: positiveLabel, right: negativeLabel }
+      : { left: negativeLabel, right: positiveLabel };
+  } else {
+    // Voxel axis goes negative (L/P/I direction)
+    // Without flip: left=positive, right=negative
+    // With flip: left=negative, right=positive
+    return flips.flipX
+      ? { left: negativeLabel, right: positiveLabel }
+      : { left: positiveLabel, right: negativeLabel };
+  }
 }
 
 function getCoordLabelY(axis: string): { top: string; bottom: string } {
-  if (axis === 'axial') return { top: 'A', bottom: 'P' };
-  return { top: 'S', bottom: 'I' };
+  if (!header || !header.srow_x || !header.srow_y || !header.srow_z) {
+    // Fallback to hardcoded defaults
+    if (axis === 'axial') return { top: 'A', bottom: 'P' };
+    return { top: 'S', bottom: 'I' };
+  }
+
+  // Determine which srow vector corresponds to the screen Y axis
+  let srow: number[];
+  if (axis === 'axial') {
+    srow = header.srow_y; // Y axis on axial = voxel Y
+  } else if (axis === 'coronal') {
+    srow = header.srow_z; // Y axis on coronal = voxel Z
+  } else {
+    srow = header.srow_z; // Y axis on sagittal = voxel Z
+  }
+
+  const dirInfo = getAnatomicalAxisDir(srow);
+  const flips = viewFlips[axis] || { flipX: false, flipY: false };
+
+  const positiveLabel = letters[dirInfo.axis][1]; // R, A, or S
+  const negativeLabel = letters[dirInfo.axis][0]; // L, P, or I
+
+  // Screen Y: top is lower pixel index, bottom is higher
+  // dirInfo.dir > 0 means voxel axis goes positive anatomical direction
+  // flipY reverses the display vertically
+  if (dirInfo.dir > 0) {
+    // Voxel axis goes positive (R/A/S)
+    // Without flip: top=positive, bottom=negative (image row 0 = top = positive end)
+    // With flip: top=negative, bottom=positive
+    return flips.flipY
+      ? { top: negativeLabel, bottom: positiveLabel }
+      : { top: positiveLabel, bottom: negativeLabel };
+  } else {
+    // Voxel axis goes negative (L/P/I)
+    // Without flip: top=negative, bottom=positive
+    // With flip: top=positive, bottom=negative
+    return flips.flipY
+      ? { top: positiveLabel, bottom: negativeLabel }
+      : { top: negativeLabel, bottom: positiveLabel };
+  }
 }
 
 function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, cw: number, ch: number) {
@@ -3472,8 +3587,13 @@ function updateHeaderPanel(info?: Record<string, any>) {
     rows.push(['qoffset', `(${h.qoffset_x.toFixed(2)}, ${h.qoffset_y.toFixed(2)}, ${h.qoffset_z.toFixed(2)})`]);
   }
 
-  if (h.orientation) {
-    rows.push(['Orientation', h.orientation]);
+  // Compute orientation from sform matrix if not already set or if 'unknown'
+  let orientation = h.orientation;
+  if ((!orientation || orientation === 'unknown') && h.srow_x && h.srow_y && h.srow_z) {
+    orientation = computeOrientationFromSform(h.srow_x, h.srow_y, h.srow_z);
+  }
+  if (orientation) {
+    rows.push(['Orientation', orientation]);
   }
 
   content.innerHTML = rows.map(([key, val]) =>

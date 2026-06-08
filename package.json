@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "1.10.0",
+  "version": "1.10.1",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",
@@ -189,14 +189,21 @@
     "test": "node --test tests/*.test.js",
     "bench:load": "node benchmarks/load-benchmark.js",
     "bench:multi": "node benchmarks/multi-load-benchmark.js",
-    "bench:remote": "node benchmarks/remote-sim-benchmark.js"
+    "bench:remote": "node benchmarks/remote-sim-benchmark.js",
+    "lint": "eslint src/**/*.ts webview/**/*.ts",
+    "format": "prettier --write 'src/**/*.ts' 'webview/**/*.ts'",
+    "format:check": "prettier --check 'src/**/*.ts' 'webview/**/*.ts'"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
     "@webgpu/types": "^0.1.70",
     "concurrently": "^8.2.0",
     "esbuild": "^0.20.0",
+    "eslint": "^8.56.0",
+    "prettier": "^3.2.0",
     "typescript": "^5.3.0"
   },
   "dependencies": {

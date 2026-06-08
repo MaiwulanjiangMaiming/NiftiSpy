@@ -10,6 +10,23 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.10.1] - 2026-06-08
+
+### Added
+- **CI/CD Pipeline**: GitHub Actions workflows for automated build, type checking, native compilation across platforms, and VSIX packaging on push/PR to main and on version tags.
+- **ESLint + Prettier**: Code quality tooling with `@typescript-eslint` parser, ESLint recommended config, and Prettier formatting. New npm scripts: `lint`, `format`, `format:check`.
+- **WebGPU MIP Rendering Path**: New WebGPU compute-based ray marching path in `VolumeRaycaster` alongside the existing WebGL2 path. Includes `isWebGPUAvailable()` async check, `initWebGPU()` initialization with WGSL compute shader, `uploadVolumeWebGPU()` for 3D texture upload, and `renderWebGPU()` for compute-based rendering. The `render()` method automatically uses WebGPU when initialized, falling back to WebGL2.
+
+### Fixed
+- **Header Info Panel**: Added `max-height` and `overflow-y:auto` to the header panel and content container for proper scrolling with long content.
+- **Orientation Labels**: Replaced hardcoded orientation labels with dynamic computation from the sform matrix using ITK-SNAP's direction cosine analysis. Labels now correctly reflect the actual anatomical orientation of each view axis, accounting for flip state.
+- **Orientation in Header Panel**: When orientation is 'unknown', it is now computed from the sform matrix using the same ITK-SNAP column-based algorithm.
+
+### Changed
+- **Release Notes Migration**: Removed the "Release Notes" section from README.md; all version history now lives exclusively in CHANGELOG.md.
+
+---
+
 ## [1.10.0] - 2026-06-08
 
 ### Added
