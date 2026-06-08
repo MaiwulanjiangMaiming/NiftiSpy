@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "1.9.3",
+  "version": "1.10.0",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",
@@ -101,6 +101,14 @@
         "label": "NiftiSpy File Icons",
         "path": "./dist/niftispy-icon-theme.json"
       }
+    ],
+    "keybindings": [
+      { "key": "alt+up", "command": "niftispy.scrollSliceUp", "when": "activeCustomEditorId == 'niftispy.nifti'" },
+      { "key": "alt+down", "command": "niftispy.scrollSliceDown", "when": "activeCustomEditorId == 'niftispy.nifti'" },
+      { "key": "alt+a", "command": "niftispy.setViewAxial", "when": "activeCustomEditorId == 'niftispy.nifti'" },
+      { "key": "alt+c", "command": "niftispy.setViewCoronal", "when": "activeCustomEditorId == 'niftispy.nifti'" },
+      { "key": "alt+s", "command": "niftispy.setViewSagittal", "when": "activeCustomEditorId == 'niftispy.nifti'" },
+      { "key": "alt+r", "command": "niftispy.resetView", "when": "activeCustomEditorId == 'niftispy.nifti'" }
     ],
     "configuration": {
       "title": "NiftiSpy",

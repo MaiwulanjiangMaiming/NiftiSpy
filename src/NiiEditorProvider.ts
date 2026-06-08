@@ -257,6 +257,20 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal);
           }
         }
+      } else if (msg.type === 'exportSlice') {
+        const { axis, sliceIndex, data } = msg;
+        const baseName = path.basename(uri.fsPath ?? uri.toString()).replace(/\.nii(\.gz)?$/, '');
+        const defaultName = `${baseName}_${axis}_${sliceIndex}.png`;
+        const saveUri = await vscode.window.showSaveDialog({
+          defaultUri: vscode.Uri.file(defaultName),
+          filters: { 'PNG Images': ['png'] },
+          title: 'Export Slice as PNG',
+        });
+        if (saveUri && data) {
+          const pngData = new Uint8Array(data);
+          await vscode.workspace.fs.writeFile(saveUri, pngData);
+          vscode.window.showInformationMessage(`Slice exported to ${saveUri.fsPath}`);
+        }
       }
     });
   }
@@ -946,22 +960,31 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 .sbs-label{position:absolute;top:22px;font-size:8px;pointer-events:none;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.8);z-index:5;background:rgba(0,0,0,.6);padding:1px 5px;border-radius:2px;display:none;max-width:45%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sbs-label-l{left:4px;color:var(--success)}
 .sbs-label-r{right:4px;color:var(--warning)}
+.header-row{display:flex;justify-content:space-between;align-items:center;font-size:9px;padding:2px 0;border-bottom:1px solid rgba(42,63,95,.3)}
+.header-key{color:var(--text2);flex-shrink:0}
+.header-val{color:var(--success);font-family:monospace;cursor:pointer;padding:1px 4px;border-radius:2px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.header-val:hover{background:rgba(0,217,255,.15)}
+.header-val.copied{background:var(--success);color:#000}
+.format-badge{display:inline-block;background:rgba(233,69,96,.2);border:1px solid var(--accent);color:var(--accent);font-size:8px;font-weight:700;padding:1px 5px;border-radius:3px;letter-spacing:.5px;vertical-align:middle;margin-left:4px}
 </style>
 </head>
 <body>
 <div id="progress-bar"></div>
 <div id="toolbar">
   <div id="file-info">
-    <span class="file-name" id="file-name">Loading...</span>
+    <span class="file-name" id="file-name">Loading...</span><span class="format-badge" id="format-badge" style="display:none">ZARR</span>
     <div class="file-detail" id="file-detail"></div>
   </div>
   <button class="btn btn-fit" id="btn-fit" title="Zoom to Fit">Fit</button>
   <button class="btn" id="btn-auto" title="Auto Contrast">Auto Contrast</button>
   <button class="btn" id="btn-reset" title="Reset View">Reset</button>
   <button class="btn" id="btn-crosshair" title="Toggle Crosshair">✛</button>
+  <button class="btn" id="btn-export" title="Export Slice as PNG">📷</button>
+  <button class="btn" id="btn-header" title="Toggle Header Info">ℹ️</button>
   <div class="tg"><label>W</label><input id="ww-slider" type="range" min="1" max="200" value="100"></div>
   <div class="tg"><label>L</label><input id="wl-slider" type="range" min="0" max="100" value="50"></div>
   <div class="tg"><label>Map</label><select id="colormap"><option value="gray">Gray</option><option value="hot">Hot</option><option value="cool">Cool</option><option value="jet">Jet</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option></select></div>
+  <canvas id="colormap-preview" width="200" height="20" style="height:14px;border-radius:3px;border:1px solid var(--border);cursor:pointer"></canvas>
 </div>
 <div id="main">
   <div id="views">
@@ -992,6 +1015,10 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
       <h3>Pointer Info</h3>
       <div id="coord-info">Hover over image</div>
     </div>
+    <div class="ss" id="header-panel" style="display:none">
+      <h3>Header Info</h3>
+      <div id="header-info-content"></div>
+    </div>
   </div>
   <div id="sidebar-toggle">◀</div>
 </div>
@@ -1005,7 +1032,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v1.9.3 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v1.10.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>

@@ -37,6 +37,15 @@ Open `.nii`, `.nii.gz`, and `.hdr` volumes directly inside VS Code. The extensio
 - `.hdr`
 - `.zarr` (Zarr v2 format)
 
+## Zarr Support
+
+NiftiSpy supports reading Zarr v2 directories for volumetric image data.
+
+- **Supported formats**: Zarr v2 directories (`.zarr`)
+- **Supported compressors**: zlib/gzip, blosc, lz4
+- **How to open**: Double-click a `.zarr` directory in the VS Code file explorer
+- **Limitations**: Read-only — no write support for Zarr volumes
+
 ## Install
 
 ### Marketplace
@@ -180,7 +189,7 @@ npm run package
 
 ## Version
 
-- Current release: `1.9.2`
+- Current release: `1.10.0`
 - Status: release build prepared for GitHub push
 - Focus: Config namespace migration, HTTP port conflict handling, native acceleration status bar
 

@@ -10,6 +10,22 @@ All notable changes to NiftiSpy will be documented in this file.
 
 ---
 
+## [1.10.0] - 2026-06-08
+
+### Added
+- **Keyboard Shortcuts System**: New keybindings for common actions when the NiftiSpy editor is active:
+  - `Alt+Up` / `Alt+Down`: Scroll slice up/down
+  - `Alt+A` / `Alt+C` / `Alt+S`: Switch to Axial / Coronal / Sagittal view
+  - `Alt+R`: Reset view (window/level and zoom)
+  - Shortcuts work both from VS Code command system and directly in the webview
+- **Slice Export PNG**: New 📷 button in the toolbar exports the current slice as a PNG image. The extension host shows a save dialog with the default filename `{originalName}_{axis}_{sliceIndex}.png`.
+- **Header Metadata Panel**: New collapsible "Header Info" panel in the sidebar showing NIfTI header metadata (dimensions, voxel size, data type, scl_slope/scl_inter, qform/sform codes, sform matrix, qoffset, orientation). Each field supports click-to-copy. Toggle with the ℹ️ toolbar button.
+- **Colormap Preview Strip**: Small gradient canvas (200×20) next to the colormap dropdown showing the current colormap gradient. Updates when colormap or window/level changes.
+- **Zarr format indicator badge**: "ZARR" badge shown in the viewer header when a Zarr file is loaded.
+- **Zarr Support documentation**: New "Zarr Support" section in README documenting supported formats, compressors, and limitations.
+
+---
+
 ## [1.9.3] - 2026-06-08
 
 ### Changed

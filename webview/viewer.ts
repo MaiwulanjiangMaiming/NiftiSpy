@@ -3327,8 +3327,10 @@ function updateFileInfo() {
 
   const fileNameEl = document.getElementById('file-name') as HTMLSpanElement;
   const fileDetailEl = document.getElementById('file-detail') as HTMLDivElement;
+  const formatBadge = document.getElementById('format-badge') as HTMLSpanElement;
 
   if (fileNameEl) fileNameEl.textContent = fileName;
+  if (formatBadge) formatBadge.style.display = fileName.endsWith('.zarr') ? 'inline-block' : 'none';
   if (fileDetailEl) {
     fileDetailEl.innerHTML = `
       <span>${nx}×${ny}×${nz}${nt > 1 ? `×${nt}` : ''}</span>
@@ -3392,6 +3394,104 @@ function resetViews() {
   renderAllViews();
 }
 
+function handleKeyboardAction(action: string) {
+  if (!header) return;
+  if (action === 'scrollSliceUp' || action === 'scrollSliceDown') {
+    const delta = action === 'scrollSliceUp' ? -1 : 1;
+    // Scroll the currently maximized view, or all views
+    const axes: Axis[] = maximizedView ? [maximizedView as Axis] : ['axial', 'coronal', 'sagittal'];
+    for (const axis of axes) {
+      const max = axis === 'axial' ? header.nz - 1 : axis === 'coronal' ? header.ny - 1 : header.nx - 1;
+      const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
+      if (newIdx !== sliceIdx[axis]) {
+        sliceIdx[axis] = newIdx;
+        if (volumeData) updateSingleView(axis);
+        else void refreshSlices([axis], true);
+      }
+    }
+  } else if (action === 'setViewAxial') {
+    toggleMaximize('axial');
+  } else if (action === 'setViewCoronal') {
+    toggleMaximize('coronal');
+  } else if (action === 'setViewSagittal') {
+    toggleMaximize('sagittal');
+  } else if (action === 'resetView') {
+    resetViews();
+  }
+}
+
+let headerPanelVisible = false;
+
+function renderColormapPreview() {
+  const canvas = document.getElementById('colormap-preview') as HTMLCanvasElement;
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const w = canvas.width;
+  const h = canvas.height;
+  const cmapFn = COLORMAPS[colormap];
+  if (!cmapFn) return;
+  const imgData = ctx.createImageData(w, h);
+  for (let x = 0; x < w; x++) {
+    const t = x / (w - 1);
+    const [r, g, b] = cmapFn(t);
+    for (let y = 0; y < h; y++) {
+      const idx = (y * w + x) * 4;
+      imgData.data[idx] = r;
+      imgData.data[idx + 1] = g;
+      imgData.data[idx + 2] = b;
+      imgData.data[idx + 3] = 255;
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+}
+
+function updateHeaderPanel(info?: Record<string, any>) {
+  const h = info ? info : header;
+  if (!h) return;
+  const content = document.getElementById('header-info-content');
+  if (!content) return;
+
+  const rows: [string, string][] = [
+    ['Dimensions', `${h.nx} × ${h.ny} × ${h.nz}`],
+    ['Voxel Size', `${(h.dx || 0).toFixed(4)} × ${(h.dy || 0).toFixed(4)} × ${(h.dz || 0).toFixed(4)} mm`],
+    ['Data Type', DATATYPE_NAMES[h.datatype] ?? `dt=${h.datatype}`],
+    ['scl_slope', String(h.scl_slope ?? 1)],
+    ['scl_inter', String(h.scl_inter ?? 0)],
+    ['qform_code', String(h.qform_code ?? 0)],
+    ['sform_code', String(h.sform_code ?? 0)],
+  ];
+
+  if (h.srow_x && h.srow_y && h.srow_z) {
+    rows.push(['sform R', `[${h.srow_x.map((v: number) => v.toFixed(2)).join(', ')}]`]);
+    rows.push(['sform A', `[${h.srow_y.map((v: number) => v.toFixed(2)).join(', ')}]`]);
+    rows.push(['sform S', `[${h.srow_z.map((v: number) => v.toFixed(2)).join(', ')}]`]);
+  }
+
+  if (h.qoffset_x !== undefined) {
+    rows.push(['qoffset', `(${h.qoffset_x.toFixed(2)}, ${h.qoffset_y.toFixed(2)}, ${h.qoffset_z.toFixed(2)})`]);
+  }
+
+  if (h.orientation) {
+    rows.push(['Orientation', h.orientation]);
+  }
+
+  content.innerHTML = rows.map(([key, val]) =>
+    `<div class="header-row"><span class="header-key">${key}</span><span class="header-val" title="Click to copy" data-copy="${val}">${val}</span></div>`
+  ).join('');
+
+  // Add click-to-copy handlers
+  content.querySelectorAll('.header-val').forEach((el) => {
+    el.addEventListener('click', () => {
+      const text = (el as HTMLElement).getAttribute('data-copy') || el.textContent || '';
+      navigator.clipboard.writeText(text).then(() => {
+        el.classList.add('copied');
+        setTimeout(() => el.classList.remove('copied'), 800);
+      }).catch(() => {});
+    });
+  });
+}
+
 function toggleMaximize(view: string) {
   if (compareMode && compareLayout === 'sideBySide') return;
   const viewsContainer = document.getElementById('views') as HTMLDivElement;
@@ -3435,6 +3535,8 @@ function applyPreviewData(previewData: any) {
   windowWidth = 1.0;
   initialWindowWidth = windowWidth;
   initialWindowLevel = windowLevel;
+
+  if (headerPanelVisible) updateHeaderPanel();
 }
 
 function setPrimaryImageFromPreview(previewData: any) {
@@ -3577,6 +3679,16 @@ window.addEventListener('message', async (e) => {
     return;
   }
 
+  if (msg.type === 'keyboard') {
+    handleKeyboardAction(msg.action);
+    return;
+  }
+
+  if (msg.type === 'headerInfo') {
+    updateHeaderPanel(msg.headerInfo);
+    return;
+  }
+
   if (msg.type !== 'config') return;
 
   broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
@@ -3623,6 +3735,7 @@ window.addEventListener('message', async (e) => {
 
   const cmapSelect = document.getElementById('colormap') as HTMLSelectElement;
   if (cmapSelect && msg.defaultColormap) cmapSelect.value = msg.defaultColormap;
+  renderColormapPreview();
 
   directPreviewReceived = false;
   directPreviewTimer = window.setTimeout(() => {
@@ -3822,6 +3935,8 @@ function handleCachedVolume(msg: any): void {
   loading.style.display = 'none';
   updateProgress(1.0);
   setupInteraction();
+
+  if (headerPanelVisible) updateHeaderPanel();
 
   if (!volumeData) {
     scheduleActiveImageLoad(0);
@@ -4317,7 +4432,7 @@ function setupInteraction() {
 
   wwSlider?.addEventListener('input', () => { windowWidth = Number(wwSlider.value) / 100; scheduleRender(); });
   wlSlider?.addEventListener('input', () => { windowLevel = Number(wlSlider.value) / 100; scheduleRender(); });
-  cmapSelect?.addEventListener('change', () => { colormap = cmapSelect.value; sliceRenderCache.clear(); scheduleRender(); });
+  cmapSelect?.addEventListener('change', () => { colormap = cmapSelect.value; sliceRenderCache.clear(); renderColormapPreview(); scheduleRender(); });
   btnAuto?.addEventListener('click', autoContrast);
   btnReset?.addEventListener('click', resetViews);
 
@@ -4400,6 +4515,38 @@ function setupInteraction() {
     renderAllViews();
   });
   if (crosshairVisible) btnCrosshair?.classList.add('active');
+
+  const btnExport = document.getElementById('btn-export') as HTMLButtonElement;
+  btnExport?.addEventListener('click', () => {
+    if (!header) return;
+    // Determine which axis to export (maximized or axial default)
+    const exportAxis: Axis = (maximizedView as Axis) || 'axial';
+    const canvas = canvases[exportAxis];
+    if (!canvas) return;
+    canvas.toBlob((blob) => {
+      if (!blob) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const arrayBuffer = reader.result as ArrayBuffer;
+        vscode.postMessage({
+          type: 'exportSlice',
+          axis: exportAxis,
+          sliceIndex: sliceIdx[exportAxis],
+          data: Array.from(new Uint8Array(arrayBuffer)),
+        });
+      };
+      reader.readAsArrayBuffer(blob);
+    }, 'image/png');
+  });
+
+  const btnHeader = document.getElementById('btn-header') as HTMLButtonElement;
+  btnHeader?.addEventListener('click', () => {
+    headerPanelVisible = !headerPanelVisible;
+    const panel = document.getElementById('header-panel');
+    if (panel) panel.style.display = headerPanelVisible ? 'block' : 'none';
+    btnHeader.classList.toggle('active', headerPanelVisible);
+    if (headerPanelVisible && header) updateHeaderPanel();
+  });
 
   helpBtn?.addEventListener('click', () => helpPopup.classList.toggle('show'));
   document.addEventListener('click', (e) => {
@@ -4950,5 +5097,17 @@ function setupInteraction() {
   window.addEventListener('resize', () => {
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => renderAllViews(), 150);
+  });
+
+  // Direct keyboard shortcuts in webview
+  document.addEventListener('keydown', (e) => {
+    if (e.altKey) {
+      if (e.key === 'ArrowUp') { e.preventDefault(); handleKeyboardAction('scrollSliceUp'); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); handleKeyboardAction('scrollSliceDown'); }
+      else if (e.key === 'a') { e.preventDefault(); handleKeyboardAction('setViewAxial'); }
+      else if (e.key === 'c') { e.preventDefault(); handleKeyboardAction('setViewCoronal'); }
+      else if (e.key === 's') { e.preventDefault(); handleKeyboardAction('setViewSagittal'); }
+      else if (e.key === 'r') { e.preventDefault(); handleKeyboardAction('resetView'); }
+    }
   });
 }

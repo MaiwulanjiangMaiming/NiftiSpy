@@ -40,6 +40,25 @@ export async function activate(context: vscode.ExtensionContext) {
   const volumeCache = new VolumeCache();
   const provider = new NiiEditorProvider(context, volumeCache);
 
+  // Register keyboard shortcut commands
+  const postToActiveWebview = (msg: Record<string, any>) => {
+    for (const [, entry] of (provider as any).activeWebviews ?? []) {
+      if (entry.panel.active) {
+        entry.panel.webview.postMessage(msg);
+        break;
+      }
+    }
+  };
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('niftispy.scrollSliceUp', () => postToActiveWebview({ type: 'keyboard', action: 'scrollSliceUp' })),
+    vscode.commands.registerCommand('niftispy.scrollSliceDown', () => postToActiveWebview({ type: 'keyboard', action: 'scrollSliceDown' })),
+    vscode.commands.registerCommand('niftispy.setViewAxial', () => postToActiveWebview({ type: 'keyboard', action: 'setViewAxial' })),
+    vscode.commands.registerCommand('niftispy.setViewCoronal', () => postToActiveWebview({ type: 'keyboard', action: 'setViewCoronal' })),
+    vscode.commands.registerCommand('niftispy.setViewSagittal', () => postToActiveWebview({ type: 'keyboard', action: 'setViewSagittal' })),
+    vscode.commands.registerCommand('niftispy.resetView', () => postToActiveWebview({ type: 'keyboard', action: 'resetView' })),
+  );
+
   // Register NIfTI editor
   context.subscriptions.push(
     vscode.window.registerCustomEditorProvider(
@@ -108,7 +127,7 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
 <div class="container">
   <h1>Zarr Volume</h1>
   <div class="info">${zarrInfo}</div>
-  <div class="version">NiftiSpy v1.9.2</div>
+  <div class="version">NiftiSpy v1.10.0</div>
 </div>
 </body>
 </html>`;
