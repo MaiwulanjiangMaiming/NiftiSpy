@@ -13,6 +13,17 @@ native/target/**
 native/Cargo.lock
 native/Cargo.toml
 native/build.rs
+native-wasm/target/**
+native-wasm/Cargo.lock
+native-wasm/Cargo.toml
+**/*.wasm
+**/*.rmeta
+**/*.rlib
+**/*.dylib
+**/flycheck1/**
+**/incremental/**
+**/CACHEDIR.TAG
+**/*.map
 *.ts
 tsconfig.json
 .gitignore
