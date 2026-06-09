@@ -18,9 +18,19 @@ export function compressResponse(data: Buffer, req: http.IncomingMessage, res: h
   };
 
   if (shouldCompress(req)) {
-    headers['Content-Encoding'] = 'gzip';
-    res.writeHead(200, headers);
-    stream.Readable.from(data).pipe(zlib.createGzip({ level: 1 })).pipe(res);
+    if (data.length < 1024 * 1024) {
+      // Small data: use synchronous gzip for lower latency
+      const compressed = zlib.gzipSync(data, { level: 1 });
+      headers['Content-Encoding'] = 'gzip';
+      headers['Content-Length'] = String(compressed.length);
+      res.writeHead(200, headers);
+      res.end(compressed);
+    } else {
+      // Large data: stream to avoid blocking
+      headers['Content-Encoding'] = 'gzip';
+      res.writeHead(200, headers);
+      stream.Readable.from(data, { highWaterMark: 1024 * 1024 }).pipe(zlib.createGzip({ level: 1 })).pipe(res);
+    }
   } else {
     headers['Content-Length'] = String(data.length);
     res.writeHead(200, headers);
@@ -39,14 +49,14 @@ export function gunzipAsync(data: Uint8Array, signal?: AbortSignal): Promise<Uin
   });
 }
 
-export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
+export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array; coronalSlice?: Float32Array; sagittalSlice?: Float32Array }> {
   return new Promise((resolve, reject) => {
     const gunzip = zlib.createGunzip();
     const chunks: Buffer[] = [];
     let totalSize = 0;
     let resolved = false;
     let header: any = null;
-    let axialNeeded = Infinity;
+    let firstSliceNeeded = Infinity;   // z=0 slice — instant preview
 
     const fileStream = fs.createReadStream(fsPath);
     fileStream.pipe(gunzip);
@@ -73,20 +83,21 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
         const buf = Buffer.concat(chunks);
         header = parseNiiHeaderQuick(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
         if (header) {
-          const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-          axialNeeded = voxOffset + (Math.floor(nz / 2) + 1) * nx * ny * bytesPerVoxel;
+          const { nx, ny, voxOffset, bytesPerVoxel } = header;
+          // z=0 slice: right after header — available almost instantly
+          firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
         }
       }
 
-      if (header && totalSize >= axialNeeded && !resolved) {
+      // Send z=0 slice as instant preview
+      if (header && totalSize >= firstSliceNeeded && !resolved) {
         const buf = Buffer.concat(chunks);
-        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-        const axMid = Math.floor(nz / 2);
-        const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
-        const sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
+        const { nx, ny, voxOffset, bytesPerVoxel } = header;
+        const sliceEnd = voxOffset + nx * ny * bytesPerVoxel;
         if (buf.length >= sliceEnd) {
-          const sliceBytes = new Uint8Array(buf.buffer, buf.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
+          const sliceBytes = new Uint8Array(buf.buffer, buf.byteOffset + voxOffset, nx * ny * bytesPerVoxel);
           const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
+          // Resolve immediately with z=0 for instant display
           resolved = true;
           resolve({ header, axialSlice });
         }
@@ -103,9 +114,15 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
         }
         if (header) {
           const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+          // Try center slice first, fall back to z=0
           const axMid = Math.floor(nz / 2);
-          const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
-          const sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
+          let sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
+          let sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
+          if (rawData.length < sliceEnd) {
+            // Fall back to z=0
+            sliceStart = voxOffset;
+            sliceEnd = voxOffset + nx * ny * bytesPerVoxel;
+          }
           let axialSlice: Float32Array;
           if (rawData.length >= sliceEnd) {
             const sliceBytes = new Uint8Array(rawData.buffer, rawData.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
@@ -147,7 +164,7 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
     let totalSize = 0;
     let resolved = false;
     let header: any = null;
-    let axialNeeded = Infinity;
+    let firstSliceNeeded = Infinity;   // z=0 slice — instant preview
 
     const options: http.RequestOptions = {
       hostname: url.hostname,
@@ -183,22 +200,21 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
           const buf = Buffer.concat(chunks);
           header = parseNiiHeaderQuick(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
           if (header) {
-            const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-            axialNeeded = voxOffset + (Math.floor(nz / 2) + 1) * nx * ny * bytesPerVoxel;
+            const { nx, ny, voxOffset, bytesPerVoxel } = header;
+            // z=0 slice: right after header — available almost instantly
+            firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
           }
         }
 
-        if (header && totalSize >= axialNeeded && !resolved) {
+        // Send z=0 slice as instant preview
+        if (header && totalSize >= firstSliceNeeded && !resolved) {
           resolved = true;
           const buf = Buffer.concat(chunks);
           const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
-          const { nx, ny, nz, voxOffset } = header;
-          const axMid = Math.floor(nz / 2);
-          const bpv = Math.max(1, header.bitpix / 8);
-          const sliceStart = voxOffset + axMid * nx * ny * bpv;
-          const sliceEnd = sliceStart + nx * ny * bpv;
+          const { nx, ny, voxOffset, bytesPerVoxel } = header;
+          const sliceEnd = voxOffset + nx * ny * bytesPerVoxel;
           if (rawData.length >= sliceEnd) {
-            const sliceBytes = rawData.slice(sliceStart, sliceEnd);
+            const sliceBytes = rawData.slice(voxOffset, sliceEnd);
             const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
             req.destroy();
             gunzip.destroy();
@@ -212,11 +228,15 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
           if (header) {
             const buf = Buffer.concat(chunks);
             const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
-            const { nx, ny, nz, voxOffset } = header;
+            const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+            // Try center slice first, fall back to z=0
             const axMid = Math.floor(nz / 2);
-            const bpv = Math.max(1, header.bitpix / 8);
-            const sliceStart = voxOffset + axMid * nx * ny * bpv;
-            const sliceEnd = sliceStart + nx * ny * bpv;
+            let sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
+            let sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
+            if (rawData.length < sliceEnd) {
+              sliceStart = voxOffset;
+              sliceEnd = voxOffset + nx * ny * bytesPerVoxel;
+            }
             if (rawData.length >= sliceEnd) {
               const sliceBytes = rawData.slice(sliceStart, sliceEnd);
               const axialSlice = extractAxialSliceFromRange(sliceBytes, header);

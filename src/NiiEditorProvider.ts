@@ -440,6 +440,41 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const fsPath = uri.fsPath;
           const isGzip = fsPath.endsWith('.gz');
 
+          // ── Phase 1: Fast preview for .nii.gz only ──
+          // .nii files are fast to read entirely (SSD < 0.5s for 500MB), so skip
+          // the partial-read preview and go straight to full load. .nii.gz needs
+          // streaming decompression which is slow, so we send a quick z=0 preview
+          // first while the full decompress runs in background.
+          let previewSent = false;
+          if (isGzip) {
+            try {
+              const entryId = this.proxy!.getEntryIdByUri(uri);
+              if (entryId) {
+                const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
+                if (preview && !signal.aborted) {
+                  const { header, slices, globalMin, globalMax, slope, inter, sliceIdx } = preview;
+                  webview.postMessage({
+                    type: 'preview',
+                    header,
+                    globalMin, globalMax,
+                    slope, inter,
+                    sliceIdx,
+                    axialSlice: slices.axial,
+                    coronalSlice: slices.coronal,
+                    sagittalSlice: slices.sagittal,
+                    partialPreview: true,
+                  });
+                  previewSent = true;
+                }
+              }
+            } catch {
+              // Preview failed — fall through to full load
+            }
+          }
+
+          if (signal.aborted) return;
+
+          // ── Phase 2: Full volume load ──
           let rawData: Uint8Array;
           if (isGzip) {
             rawData = await new Promise<Uint8Array>((resolve, reject) => {
@@ -574,6 +609,30 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         try {
           this.volumeCache.setActive(uriKey, webviewId);
 
+          // For remote files: use lightweight preview (header + 3 middle slices)
+          // instead of downloading the entire volume on the Extension Host.
+          // The webview Worker will load the full volume via the proxy's /file/{id} endpoint.
+          if (isRemote) {
+            const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
+            if (!preview || signal.aborted) return;
+
+            const { header, slices, globalMin, globalMax, slope, inter, sliceIdx } = preview;
+
+            webview.postMessage({
+              type: 'preview',
+              header,
+              globalMin, globalMax,
+              slope, inter,
+              sliceIdx,
+              axialSlice: slices.axial,
+              coronalSlice: slices.coronal,
+              sagittalSlice: slices.sagittal,
+              partialPreview: true,
+            });
+            return;
+          }
+
+          // Local file path: load full volume and send as cachedVolume
           const entry = this.proxy!.getEntry(entryId);
           if (!entry) return;
 
@@ -736,16 +795,30 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       }
 
       if (axialSliceLod2 && !signal.aborted) {
+        // Convert Float32Array to ArrayBuffer for efficient transfer
+        const axialBuf = axialSliceLod2.data.buffer.slice(
+          axialSliceLod2.data.byteOffset,
+          axialSliceLod2.data.byteOffset + axialSliceLod2.data.byteLength
+        );
+        const coronalBuf = coronalSliceLod2 ? coronalSliceLod2.data.buffer.slice(
+          coronalSliceLod2.data.byteOffset,
+          coronalSliceLod2.data.byteOffset + coronalSliceLod2.data.byteLength
+        ) : null;
+        const sagittalBuf = sagittalSliceLod2 ? sagittalSliceLod2.data.buffer.slice(
+          sagittalSliceLod2.data.byteOffset,
+          sagittalSliceLod2.data.byteOffset + sagittalSliceLod2.data.byteLength
+        ) : null;
+
         webview.postMessage({
           type: 'lodData',
           level: 2,
-          axial: Array.from(axialSliceLod2.data),
+          axial: axialBuf,
           axialW: axialSliceLod2.w,
           axialH: axialSliceLod2.h,
-          coronal: coronalSliceLod2 ? Array.from(coronalSliceLod2.data) : [],
+          coronal: coronalBuf,
           coronalW: coronalSliceLod2?.w ?? 0,
           coronalH: coronalSliceLod2?.h ?? 0,
-          sagittal: sagittalSliceLod2 ? Array.from(sagittalSliceLod2.data) : [],
+          sagittal: sagittalBuf,
           sagittalW: sagittalSliceLod2?.w ?? 0,
           sagittalH: sagittalSliceLod2?.h ?? 0,
         });
@@ -760,16 +833,30 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       const coronalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2), 2);
       const sagittalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2), 2);
       if (axialSliceLod1 && !signal.aborted) {
+        // Convert Float32Array to ArrayBuffer for efficient transfer
+        const axialBuf = axialSliceLod1.data.buffer.slice(
+          axialSliceLod1.data.byteOffset,
+          axialSliceLod1.data.byteOffset + axialSliceLod1.data.byteLength
+        );
+        const coronalBuf = coronalSliceLod1 ? coronalSliceLod1.data.buffer.slice(
+          coronalSliceLod1.data.byteOffset,
+          coronalSliceLod1.data.byteOffset + coronalSliceLod1.data.byteLength
+        ) : null;
+        const sagittalBuf = sagittalSliceLod1 ? sagittalSliceLod1.data.buffer.slice(
+          sagittalSliceLod1.data.byteOffset,
+          sagittalSliceLod1.data.byteOffset + sagittalSliceLod1.data.byteLength
+        ) : null;
+
         webview.postMessage({
           type: 'lodData',
           level: 1,
-          axial: Array.from(axialSliceLod1.data),
+          axial: axialBuf,
           axialW: axialSliceLod1.w,
           axialH: axialSliceLod1.h,
-          coronal: coronalSliceLod1 ? Array.from(coronalSliceLod1.data) : [],
+          coronal: coronalBuf,
           coronalW: coronalSliceLod1?.w ?? 0,
           coronalH: coronalSliceLod1?.h ?? 0,
-          sagittal: sagittalSliceLod1 ? Array.from(sagittalSliceLod1.data) : [],
+          sagittal: sagittalBuf,
           sagittalW: sagittalSliceLod1?.w ?? 0,
           sagittalH: sagittalSliceLod1?.h ?? 0,
         });

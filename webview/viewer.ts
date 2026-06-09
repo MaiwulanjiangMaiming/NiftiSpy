@@ -4161,6 +4161,7 @@ function handleDirectPreview(msg: any): void {
 }
 
 function handleCachedVolume(msg: any): void {
+  const wasPartialPreview = sliceIdx.axial === 0 && header && header.nz > 1;
   header = msg.header;
   computeViewFlips();
   globalMin = msg.globalMin;
@@ -4170,6 +4171,13 @@ function handleCachedVolume(msg: any): void {
   sliceIdx.axial = msg.sliceIdx.axial;
   sliceIdx.coronal = msg.sliceIdx.coronal;
   sliceIdx.sagittal = msg.sliceIdx.sagittal;
+
+  // If we were showing z=0 preview, navigate to center slice now
+  if (wasPartialPreview && header) {
+    sliceIdx.axial = Math.floor(header.nz / 2);
+    sliceIdx.coronal = Math.floor(header.ny / 2);
+    sliceIdx.sagittal = Math.floor(header.nx / 2);
+  }
 
   const datatype = msg.datatype || 16;
   let voxelBuffer: ArrayBuffer | null = null;
@@ -4325,13 +4333,28 @@ function handleLODData(msg: any): void {
   const ld = lodData[level];
 
   if (msg.axial && msg.axialW && msg.axialH) {
-    ld.axial = { data: new Float32Array(msg.axial), w: msg.axialW, h: msg.axialH };
+    ld.axial = {
+      data: msg.axial instanceof ArrayBuffer ? new Float32Array(msg.axial)
+        : Array.isArray(msg.axial) ? new Float32Array(msg.axial)
+        : new Float32Array(0),
+      w: msg.axialW, h: msg.axialH
+    };
   }
   if (msg.coronal && msg.coronalW && msg.coronalH) {
-    ld.coronal = { data: new Float32Array(msg.coronal), w: msg.coronalW, h: msg.coronalH };
+    ld.coronal = {
+      data: msg.coronal instanceof ArrayBuffer ? new Float32Array(msg.coronal)
+        : Array.isArray(msg.coronal) ? new Float32Array(msg.coronal)
+        : new Float32Array(0),
+      w: msg.coronalW, h: msg.coronalH
+    };
   }
   if (msg.sagittal && msg.sagittalW && msg.sagittalH) {
-    ld.sagittal = { data: new Float32Array(msg.sagittal), w: msg.sagittalW, h: msg.sagittalH };
+    ld.sagittal = {
+      data: msg.sagittal instanceof ArrayBuffer ? new Float32Array(msg.sagittal)
+        : Array.isArray(msg.sagittal) ? new Float32Array(msg.sagittal)
+        : new Float32Array(0),
+      w: msg.sagittalW, h: msg.sagittalH
+    };
   }
 
   // If volumeData is not yet loaded, show LOD data immediately

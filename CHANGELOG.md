@@ -2,6 +2,31 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.1.1] - 2026-06-08
+
+### Fixed / Performance
+- **Remote image loading speed** (30-60s → 1-3s for 300MB): The remote loading path was downloading and decompressing the entire volume in the extension host before showing anything. Reworked into a two-phase pipeline:
+  - Phase 1 streams just the header + z=0 slice (a few hundred KB) and renders it instantly
+  - Phase 2 streams the full volume in the background via parallel ranged downloads
+- **Parallel ranged downloads** in the webview worker: replaced the serial Range loop with a bounded-concurrency pool (6 connections to a real origin, 4 to the loopback proxy) that writes into indexed slots, so chunks complete out of order but reassemble correctly. Up to ~6× faster on high-latency links.
+- **True range passthrough in the proxy**: HTTP/HTTPS range requests no longer trigger a full-file download in the extension host. The proxy fetches only the requested bytes from the origin. Non-range full reads stream the origin response straight through instead of materializing 300MB in memory.
+- **HEAD probe support**: the proxy now answers HEAD requests with `Content-Length` and `Accept-Ranges` so the webview's ranged download path can detect capability before downloading.
+- **z=0 slice for instant preview**: switched all gzip streaming preview paths (local fs, remote HTTP, Worker native decompress) from the center slice (requires ~45% of the stream) to z=0 (available right after the header). Auto-navigates to the center slice once the full volume lands.
+- **Local .nii two-phase loading**: local `.nii` files no longer run a partial-read preview and then a full re-read. They go straight to a single full read (SSD < 0.5s for 500MB) which feeds both the preview and the full volume.
+- **Incremental preview buffer** in `nativeDecompressWithEarlyPreview`: replaced the O(n²) `Buffer.concat` rebuild on every chunk with a geometrically-grown incremental buffer. The preview buffer is released as soon as the preview is sent.
+- **`skipPreview` no longer wastes CPU**: when an early preview was already streamed, the second pass now skips computing 3 preview slices that would have been discarded.
+- **Datatype-2/256 fix**: when the typed-array alignment constraint fails, the Uint8/Int8 fallback now performs a byte-level copy into the freshly-allocated array (it was creating an empty array and using it as a typed-array view into the original buffer).
+- **z=0 preview auto-center**: the viewer detects when it was showing the z=0 preview and navigates all three views to the center slice once the full volume arrives, so the user doesn't end up looking at the brain floor.
+- **HEAD path added to `handleFile`**: the proxy was returning 404 for HEAD requests, which prevented the webview from discovering range support and falling back to a single slow connection.
+- **CI**: bumped GitHub Actions to Node.js 20/22, added `npm test` to the matrix build, fixed the `npm ci` failure caused by a missing `package-lock.json` (now generated and committed).
+
+### Internal
+- Added `getEntryIdByUri` to `LocalFileProxy` for URI-based entry lookup.
+- Removed dead `centerSliceNeeded` and `firstSliceSent` variables from `compression.ts`.
+- Replaced the manual `Promise + resolve/reject` semaphore in `downloadChunked` with a clean bounded-concurrency pool pattern.
+- Added `tests/remote-parallel.test.js` covering out-of-order reassembly, concurrency-cap correctness, and real-HTTP range passthrough.
+- Added `benchmarks/remote-model.js` for projecting old-vs-new timings across bandwidth / RTT inputs.
+
 ## Versioning Convention
 
 - **Bug fixes / Optimizations**: z + 1 (e.g., 1.1.0 → 1.1.1)

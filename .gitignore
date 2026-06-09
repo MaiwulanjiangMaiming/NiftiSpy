@@ -13,3 +13,6 @@ Thumbs.db
 *.map
 native/target/
 native/index.node
+native-wasm/target/
+*.wasm
+.niftispy-index
