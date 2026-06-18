@@ -219,7 +219,7 @@ void main() {
     return shader;
   }
 
-  uploadVolume(data: Float32Array, nx: number, ny: number, nz: number): boolean {
+  uploadVolume(data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array, nx: number, ny: number, nz: number): boolean {
     const gl = this.gl;
     if (!gl) return false;
 
@@ -231,7 +231,18 @@ void main() {
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R32F, nx, ny, nz, 0, gl.RED, gl.FLOAT, data);
+
+    // Use R32F internal format — WebGL2 auto-converts integer types to float
+    let glType: number;
+    if (data instanceof Uint8Array) glType = gl.UNSIGNED_BYTE;
+    else if (data instanceof Int8Array) glType = gl.BYTE;
+    else if (data instanceof Int16Array) glType = gl.SHORT;
+    else if (data instanceof Uint16Array) glType = gl.UNSIGNED_SHORT;
+    else if (data instanceof Int32Array) glType = gl.INT;
+    else if (data instanceof Uint32Array) glType = gl.UNSIGNED_INT;
+    else glType = gl.FLOAT;
+
+    gl.texImage3D(gl.TEXTURE_3D, 0, gl.R32F, nx, ny, nz, 0, gl.RED, glType, data);
     gl.bindTexture(gl.TEXTURE_3D, null);
 
     this.volumeSize = { nx, ny, nz };

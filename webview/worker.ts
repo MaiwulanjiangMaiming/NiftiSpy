@@ -19,9 +19,13 @@ const MAX_RETRIES = 3;
 const CHUNK_SIZE = 16 * 1024 * 1024;
 const RETRY_DELAY_BASE = 500;
 const MAX_SLICE_CACHE = 96;
+const LOCALHOST_CHUNK_SIZE = 128 * 1024 * 1024;  // 128MB for loopback (no network latency)
+const LOCALHOST_MAX_CONCURRENT = 16;
+const REMOTE_MAX_CONCURRENT = 12;
 type SliceAxis = 'axial' | 'coronal' | 'sagittal';
 const volumeControllers = new Map<number, AbortController>();
 const pendingSliceFetches = new Map<string, Promise<CachedSlice>>();
+const headCache = new Map<string, { totalSize: number; acceptRanges: boolean }>();
 // Track which volume IDs have already received an early preview
 const earlyPreviewSent = new Set<number>();
 
@@ -51,7 +55,7 @@ function setFileHashForCache(fileName: string, fileSize: number): void {
   currentFileHash = deriveFileHash(fileName, fileSize);
 }
 
-let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; ready: Int32Array } | null = null;
+let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; datatype: number } | null = null;
 
 // OffscreenCanvas rendering state
 const offscreenCanvases = new Map<string, { canvas: OffscreenCanvas; gl: WebGL2RenderingContext | null }>();
@@ -68,7 +72,6 @@ self.onmessage = async (e: MessageEvent) => {
     } else if (type === 'fetchSlice') {
       await handleFetchSlice(e.data);
     } else if (type === 'sharedVolume') {
-      const readyFlag = new Int32Array(e.data.buffer as SharedArrayBuffer, 0, 1);
       sharedVolume = {
         buffer: e.data.buffer as SharedArrayBuffer,
         nx: e.data.nx,
@@ -76,11 +79,8 @@ self.onmessage = async (e: MessageEvent) => {
         nz: e.data.nz,
         slope: e.data.slope ?? 1,
         inter: e.data.inter ?? 0,
-        ready: readyFlag,
+        datatype: e.data.datatype ?? 16,
       };
-      // Signal that shared volume data is ready for reading
-      Atomics.store(readyFlag, 0, 1);
-      Atomics.notify(readyFlag, 0);
     } else if (type === 'initOffscreenCanvas') {
       handleInitOffscreenCanvas(e.data);
     } else if (type === 'renderRequest') {
@@ -167,18 +167,9 @@ async function handleInvalidateCache(data: { fileName?: string; fileSize?: numbe
 
 function handleRenderRequest(data: { axis: string; sliceIndex: number; windowLevel: number; windowWidth: number; colormap: string; flipX: boolean; flipY: boolean }): void {
   const { axis } = data;
-  const entry = offscreenCanvases.get(axis);
-  if (!entry || !entry.gl) {
-    // No OffscreenCanvas for this axis; post renderComplete to clear pending
-    self.postMessage({ type: 'renderComplete', axis });
-    return;
-  }
-  // The actual WebGL rendering on the OffscreenCanvas would go here.
-  // For now, we acknowledge the render request so the main thread can proceed.
-  // Full WebGL2 3D texture rendering in the worker requires the volume data
-  // and shader programs to be set up in the worker context, which is a
-  // larger refactor. This stub enables the async render pipeline.
-  self.postMessage({ type: 'renderComplete', axis });
+  // OffscreenCanvas rendering not yet implemented — signal failure
+  // so main thread falls back to direct rendering
+  self.postMessage({ type: 'renderComplete', axis, fallback: true });
 }
 
 function abortError(): Error {
@@ -195,6 +186,23 @@ function cancelVolumeLoad(id: number): void {
   const controller = volumeControllers.get(id);
   controller?.abort();
   volumeControllers.delete(id);
+}
+
+const VOLUME_BUFFER_HEADER_BYTES = 8;
+
+function createVolumeView(buffer: SharedArrayBuffer, datatype: number, length: number): Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array {
+  const byteOffset = VOLUME_BUFFER_HEADER_BYTES;
+  switch (datatype) {
+    case 2: return new Uint8Array(buffer, byteOffset, length);
+    case 4: return new Int16Array(buffer, byteOffset, length);
+    case 8: return new Int32Array(buffer, byteOffset, length);
+    case 16: return new Float32Array(buffer, byteOffset, length);
+    case 64: return new Float64Array(buffer, byteOffset, length);
+    case 256: return new Int8Array(buffer, byteOffset, length);
+    case 512: return new Uint16Array(buffer, byteOffset, length);
+    case 768: return new Uint32Array(buffer, byteOffset, length);
+    default: return new Float32Array(buffer, byteOffset, length);
+  }
 }
 
 async function fetchWithRetry(url: string, options?: RequestInit, retries: number = MAX_RETRIES, signal?: AbortSignal): Promise<Response> {
@@ -256,8 +264,13 @@ function buildSliceUrl(url: string, axis: SliceAxis, index: number, factor: numb
 }
 
 function getPreferredChunkSize(url: string): number {
-  if (url.includes('127.0.0.1')) return 16 * 1024 * 1024;
+  if (url.includes('127.0.0.1')) return LOCALHOST_CHUNK_SIZE;
   return CHUNK_SIZE;
+}
+
+function getPreferredConcurrency(url: string): number {
+  if (url.includes('127.0.0.1')) return LOCALHOST_MAX_CONCURRENT;
+  return REMOTE_MAX_CONCURRENT;
 }
 
 async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: number, signal?: AbortSignal): Promise<CachedSlice> {
@@ -357,12 +370,8 @@ async function handleFetchSlice(message: {
   const factor = Math.max(1, message.factor || 1);
 
   if (sharedVolume && factor === 1) {
-    // Wait for shared volume data to be ready using Atomics
-    if (sharedVolume.ready && Atomics.load(sharedVolume.ready, 0) !== 1) {
-      Atomics.wait(sharedVolume.ready, 0, 0, 5000); // wait up to 5s
-    }
-    const { buffer, nx, ny, nz, slope, inter } = sharedVolume;
-    const data = new Float32Array(buffer);
+    const { buffer, nx, ny, nz, slope, inter, datatype } = sharedVolume;
+    const data = createVolumeView(buffer, datatype, nx * ny * nz);
     const idx = message.index;
     let sliceData: Float32Array;
     let w: number, h: number;
@@ -492,19 +501,19 @@ async function nativeDecompressWithEarlyPreview(
       if (!previewBuf) {
         previewBuf = new Uint8Array(Math.max(chunk.byteLength * 4, 1 << 20));
       }
-      while (previewBufLen + chunk.byteLength > previewBuf.length) {
-        const grown = new Uint8Array(previewBuf.length * 2);
-        grown.set(previewBuf.subarray(0, previewBufLen), 0);
+      while (previewBufLen + chunk.byteLength > previewBuf!.length) {
+        const grown: Uint8Array = new Uint8Array(previewBuf!.length * 2);
+        grown.set(previewBuf!.subarray(0, previewBufLen), 0);
         previewBuf = grown;
       }
-      previewBuf.set(chunk, previewBufLen);
+      previewBuf!.set(chunk, previewBufLen);
       previewBufLen += chunk.byteLength;
     }
 
     // ── Early preview: try once we have enough decompressed data ──
     if (!previewSent && previewBufLen >= 544) {
       try {
-        const buf = previewBuf.subarray(0, previewBufLen);
+        const buf = previewBuf!.subarray(0, previewBufLen);
 
         const header = parseNiiHeader(buf.buffer as ArrayBuffer, isGzip);
         const { nx, ny, nz, voxOffset, bytesPerVoxel, scl_slope, scl_inter, littleEndian, datatype } = header;
@@ -564,11 +573,12 @@ async function nativeDecompressWithEarlyPreview(
 
           self.postMessage({
             id, type: 'preview',
+            partialPreview: true,
             header,
             slices: {
               axial: axialSlice,
-              coronal: new Float32Array(nx * nz),
-              sagittal: new Float32Array(ny * nz),
+              coronal: new Float32Array(0),  // placeholder — GPU will render
+              sagittal: new Float32Array(0), // placeholder — GPU will render
             },
             globalMin: min, globalMax: max,
             sliceIdx: { axial: 0, coronal: coMid, sagittal: saMid },
@@ -659,20 +669,27 @@ async function nativeDecompress(resp: Response, signal?: AbortSignal): Promise<U
 
 async function downloadChunked(url: string, id: number, isGzip: boolean, signal?: AbortSignal): Promise<Uint8Array> {
   const chunkSize = getPreferredChunkSize(url);
-  // Browsers cap connections per host at ~6; the local proxy multiplexes
-  // onto the origin. Loopback has effectively no latency so fewer, larger
-  // chunks are better there. Real origins benefit from more connections.
-  const MAX_CONCURRENT = url.includes('127.0.0.1') ? 4 : 6;
+  const MAX_CONCURRENT = getPreferredConcurrency(url);
   let totalSize = 0;
   let acceptRanges = false;
-  try {
-    const headResp = await fetchWithRetry(url, { method: 'HEAD' }, MAX_RETRIES, signal);
-    if (headResp.ok) {
-      totalSize = Number(headResp.headers.get('Content-Length') || 0);
-      acceptRanges = headResp.headers.get('Accept-Ranges') === 'bytes';
+  const cached = headCache.get(url);
+  if (cached) {
+    totalSize = cached.totalSize;
+    acceptRanges = cached.acceptRanges;
+  } else {
+    try {
+      // For localhost proxy, HEAD is fast (no remote round-trip).
+      // For remote URLs, HEAD may fail or be slow — skip if it times out.
+      const headResp = await fetchWithRetry(url, { method: 'HEAD' }, MAX_RETRIES, signal);
+      if (headResp.ok) {
+        totalSize = Number(headResp.headers.get('Content-Length') || 0);
+        acceptRanges = headResp.headers.get('Accept-Ranges') === 'bytes';
+        headCache.set(url, { totalSize, acceptRanges });
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw err;
+      // HEAD failed — will fall through to single GET
     }
-  } catch (err: any) {
-    if (err?.name === 'AbortError') throw err;
   }
 
   if (totalSize > 0 && acceptRanges && totalSize > chunkSize) {
@@ -702,35 +719,26 @@ async function downloadChunked(url: string, id: number, isGzip: boolean, signal?
           running++;
 
           (async () => {
-            let chunkData: Uint8Array | null = null;
-            for (let retry = 0; retry < MAX_RETRIES; retry++) {
+            try {
               throwIfAborted(signal);
-              if (poolError) break;
-              try {
-                const resp = await fetchWithRetry(url, {
-                  headers: { Range: `bytes=${off}-${end}` },
-                }, MAX_RETRIES, signal);
-                if (resp.status === 206 || resp.status === 200) {
-                  chunkData = new Uint8Array(await resp.arrayBuffer());
-                  break;
-                }
-              } catch (err: any) {
-                if (err?.name === 'AbortError') { poolError = err; break; }
-                if (retry === MAX_RETRIES - 1) { poolError = err; break; }
-                await sleep(RETRY_DELAY_BASE * Math.pow(2, retry));
+              const resp = await fetchWithRetry(url, {
+                headers: { Range: `bytes=${off}-${end}` },
+              }, MAX_RETRIES, signal);
+              if (resp.status === 206 || resp.status === 200) {
+                const chunkData = new Uint8Array(await resp.arrayBuffer());
+                result.set(chunkData, off);
+                received += chunkData.byteLength;
+                const progressBase = 0.02;
+                const progressRange = isGzip ? 0.3 : 0.7;
+                self.postMessage({
+                  id, type: 'progress',
+                  value: progressBase + (received / totalSize) * progressRange,
+                  stage: 'downloading',
+                });
               }
-            }
-
-            if (chunkData && !poolError) {
-              result.set(chunkData, off);
-              received += chunkData.byteLength;
-              const progressBase = 0.02;
-              const progressRange = isGzip ? 0.3 : 0.7;
-              self.postMessage({
-                id, type: 'progress',
-                value: progressBase + (received / totalSize) * progressRange,
-                stage: 'downloading',
-              });
+            } catch (err: any) {
+              if (err?.name === 'AbortError') { poolError = err; }
+              else { poolError = err; }
             }
 
             running--;
@@ -839,45 +847,28 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
 
   self.postMessage({ id, type: 'progress', value: 0.7, stage: 'computing range' });
 
-  // ── Efficient min/max with larger batch sampling ─────────────────────
+  // ── Efficient min/max with direct sampling ─────────────────────────
+  // Sample up to ~100k voxels for fast min/max estimation.
+  // Direct iteration avoids creating intermediate sampled arrays.
   let min = Infinity, max = -Infinity;
+  const sampleStep = Math.max(1, Math.floor(n / 100000));
+  const needsConversion = slope !== 1 || inter !== 0;
 
-  if (wasmReady && nativeData instanceof Float32Array) {
-    // Use WASM SIMD for fast min/max on Float32 data
-    const wasm = getWasmBindings();
-    if (wasm) {
-      const sampleStep = Math.max(1, Math.floor(n / 200000));
-      const sampleCount = Math.ceil(n / sampleStep);
-      const sampled = new Float32Array(sampleCount);
-      let si = 0;
-      for (let i = 0; i < n && si < sampleCount; i += sampleStep) {
-        sampled[si++] = (nativeData as any)[i] * slope + inter;
-      }
-      // Compute min/max with SIMD-friendly loop
-      for (let i = 0; i < si; i++) {
-        if (sampled[i] < min) min = sampled[i];
-        if (sampled[i] > max) max = sampled[i];
-      }
+  if (!needsConversion) {
+    // Fast path: no slope/inter conversion needed
+    for (let i = 0; i < n; i += sampleStep) {
+      const v = (nativeData as any)[i];
+      if (v < min) min = v;
+      if (v > max) max = v;
     }
-  }
-
-  if (min === Infinity) {
-    // JS fallback path — process in larger batches for better throughput
-    const BATCH = 8192;
-    const sampleStep = Math.max(1, Math.floor(n / 100000));
-    for (let batchStart = 0; batchStart < n; batchStart += BATCH * sampleStep) {
-      throwIfAborted(signal);
-      const batchEnd = Math.min(batchStart + BATCH * sampleStep, n);
-      for (let i = batchStart; i < batchEnd; i += sampleStep) {
-        const v = (nativeData as any)[i] * slope + inter;
-        if (v < min) min = v;
-        if (v > max) max = v;
-      }
+  } else {
+    for (let i = 0; i < n; i += sampleStep) {
+      const v = (nativeData as any)[i] * slope + inter;
+      if (v < min) min = v;
+      if (v > max) max = v;
     }
   }
   if (min === max) max = min + 1;
-
-  const needsConversion = slope !== 1 || inter !== 0;
 
   // Skip preview if already sent via early streaming decompress — avoid
   // wasting CPU computing 3 slices that will be discarded.
@@ -893,8 +884,8 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
 
   const previewSlices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array } = {
   axial: new Float32Array(nx * ny),
-  coronal: new Float32Array(nx * nz),
-  sagittal: new Float32Array(ny * nz),
+  coronal: new Float32Array(0),  // placeholder — GPU will render
+  sagittal: new Float32Array(0), // placeholder — GPU will render
   };
 
   {
@@ -913,20 +904,6 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
     for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i]; }
   }
   }
-  {
-  if (needsConversion) {
-    for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x] * slope + inter; }
-  } else {
-    for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx + coMid * nx; for (let x = 0; x < nx; x++) previewSlices.coronal[z * nx + x] = (nativeData as any)[base + x]; }
-  }
-  }
-  {
-  if (needsConversion) {
-    for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid] * slope + inter; }
-  } else {
-    for (let z = 0; z < nz; z++) { if (z % 16 === 0) throwIfAborted(signal); const base = z * ny * nx; for (let y = 0; y < ny; y++) previewSlices.sagittal[z * ny + y] = (nativeData as any)[base + y * nx + saMid]; }
-  }
-  }
 
   self.postMessage({
   id, type: 'preview',
@@ -940,51 +917,10 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
 
   self.postMessage({ id, type: 'progress', value: 0.85, stage: 'transferring volume' });
 
+  // Always send native data — GPU shader handles slope/inter
   let voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
-  if (!needsConversion) {
-    voxelData = nativeData;
-  } else if (nativeData instanceof Float32Array) {
-    // Bulk slope/inter conversion on Float32Array
-    // Use set + multiply approach for better throughput
-    const f32 = nativeData as Float32Array;
-    if (slope !== 1 && inter === 0) {
-      // Only multiply
-      for (let i = 0; i < n; i++) {
-        if (i % 8192 === 0) throwIfAborted(signal);
-        f32[i] = f32[i] * slope;
-      }
-    } else if (slope === 1 && inter !== 0) {
-      // Only add
-      for (let i = 0; i < n; i++) {
-        if (i % 8192 === 0) throwIfAborted(signal);
-        f32[i] = f32[i] + inter;
-      }
-    } else {
-      for (let i = 0; i < n; i++) {
-        if (i % 8192 === 0) throwIfAborted(signal);
-        f32[i] = f32[i] * slope + inter;
-      }
-    }
-    voxelData = f32;
-  } else {
-    rawData = null as any;
-    voxelData = new Float32Array(n);
-    // Bulk copy native data into voxelData first, then apply slope/inter
-    if (nativeData instanceof Float64Array) {
-      const src = nativeData as Float64Array;
-      const dst = voxelData as Float32Array;
-      for (let i = 0; i < n; i++) {
-        if (i % 8192 === 0) throwIfAborted(signal);
-        dst[i] = src[i] * slope + inter;
-      }
-    } else {
-      for (let i = 0; i < n; i++) {
-        if (i % 8192 === 0) throwIfAborted(signal);
-        (voxelData as Float32Array)[i] = (nativeData as any)[i] * slope + inter;
-      }
-    }
-    nativeData = null as any;
-  }
+  voxelData = nativeData;
+  nativeData = null as any; // release reference for GC
 
   self.postMessage({ id, type: 'progress', value: 1.0, stage: 'done' });
 
@@ -1016,44 +952,49 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
     let rawData: Uint8Array;
 
     if (isGzip && hasNativeDecompress) {
-      const resp = await fetchWithRetry(url, undefined, MAX_RETRIES, signal);
-      if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
-
-      if (resp.body) {
-        self.postMessage({ id, type: 'progress', value: 0.1, stage: 'decompressing (native)' });
-        // Use streaming decompress with early preview — sends preview
-        // as soon as the middle axial slice is available, then continues
-        // decompressing the rest of the volume in the background.
-        rawData = await nativeDecompressWithEarlyPreview(resp, id, signal, isGzip);
-        self.postMessage({ id, type: 'progress', value: 0.7, stage: 'parsing' });
-      } else {
-        const compressedData = new Uint8Array(await resp.arrayBuffer());
+      // ── Streaming path: overlap download + decompress + early preview ──
+      // This is the fast path for .nii.gz: a single streaming GET is piped
+      // through DecompressionStream. Preview is emitted as soon as the first
+      // axial slice is available (typically <2% of data), and the rest of
+      // the volume streams in concurrently. This cuts time-to-preview from
+      // "full download + full decompress" to "header + first slice".
+      try {
+        rawData = await streamingGzipLoadWithEarlyPreview(url, id, signal);
         throwIfAborted(signal);
-        rawData = await new Promise<Uint8Array>((resolve, reject) => {
-          gunzip(compressedData, (err, data) => {
-            if (err) reject(err);
-            else resolve(data);
-          });
-        });
-        throwIfAborted(signal);
-        self.postMessage({ id, type: 'progress', value: 0.6, stage: 'parsing' });
-      }
-    } else {
-      const compressedData = await downloadChunked(url, id, isGzip, signal);
-
-      if (isGzip) {
+        self.postMessage({ id, type: 'progress', value: 0.85, stage: 'processing' });
+      } catch (err: any) {
+        if (err?.name === 'AbortError') throw err;
+        // Fall back to parallel chunked download + buffer decompress
+        const compressedData = await downloadChunked(url, id, isGzip, signal);
         self.postMessage({ id, type: 'progress', value: 0.35, stage: 'decompressing' });
         throwIfAborted(signal);
-        rawData = await new Promise<Uint8Array>((resolve, reject) => {
-          gunzip(compressedData, (err, data) => {
-            if (err) reject(err);
-            else resolve(data);
-          });
-        });
+        rawData = await nativeDecompressFromBuffer(compressedData, signal);
         throwIfAborted(signal);
-        self.postMessage({ id, type: 'progress', value: 0.6, stage: 'parsing' });
-      } else {
-        rawData = compressedData;
+        self.postMessage({ id, type: 'progress', value: 0.7, stage: 'parsing' });
+      }
+    } else if (isGzip) {
+      // No DecompressionStream — must use fflate
+      const compressedData = await downloadChunked(url, id, isGzip, signal);
+      self.postMessage({ id, type: 'progress', value: 0.35, stage: 'decompressing' });
+      throwIfAborted(signal);
+      rawData = await new Promise<Uint8Array>((resolve, reject) => {
+        gunzip(compressedData, (err, data) => {
+          if (err) reject(err);
+          else resolve(data);
+        });
+      });
+      throwIfAborted(signal);
+      self.postMessage({ id, type: 'progress', value: 0.7, stage: 'parsing' });
+    } else {
+      // Uncompressed .nii — try streaming with early preview first
+      try {
+        rawData = await streamingNiiLoadWithEarlyPreview(url, id, signal);
+        throwIfAborted(signal);
+        self.postMessage({ id, type: 'progress', value: 0.85, stage: 'processing' });
+      } catch (err: any) {
+        if (err?.name === 'AbortError') throw err;
+        // Fall back to parallel chunked download
+        rawData = await downloadChunked(url, id, isGzip, signal);
         self.postMessage({ id, type: 'progress', value: 0.7, stage: 'parsing' });
       }
     }
@@ -1062,6 +1003,344 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean) {
   } finally {
     volumeControllers.delete(id);
   }
+}
+
+/**
+ * Streaming gzip loader: fetches the URL with a single GET, pipes the
+ * response body through DecompressionStream, and emits an early preview
+ * as soon as the header + first axial slice are available. The rest of
+ * the volume is collected into a pre-allocated buffer.
+ *
+ * This overlaps network I/O with decompression and cuts time-to-preview
+ * to the time needed for ~1-2% of the compressed data.
+ */
+async function streamingGzipLoadWithEarlyPreview(url: string, id: number, signal: AbortSignal): Promise<Uint8Array> {
+  const resp = await fetchWithRetry(url, undefined, MAX_RETRIES, signal);
+  if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
+  if (!resp.body) throw new Error('No response body for streaming');
+
+  const ds = new (self as any).DecompressionStream('gzip');
+  const decompressedStream = resp.body.pipeThrough(ds);
+  const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+
+  // Pre-allocate a growable buffer — avoids O(n) chunk concatenation
+  const INITIAL_CAP = 16 * 1024 * 1024;  // 16MB initial
+  let result = new Uint8Array(INITIAL_CAP);
+  let writeOffset = 0;
+
+  // Parse preview directly from result buffer — no separate previewBuf needed
+  let previewSent = false;
+  let header: any = null;
+  let firstSliceNeeded = Infinity;
+
+  const contentLength = Number(resp.headers.get('Content-Length') || 0);
+
+  while (true) {
+    throwIfAborted(signal);
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = value!;
+
+    // Grow result buffer if needed (geometric growth, like std::vector)
+    if (writeOffset + chunk.byteLength > result.length) {
+      let newCap = result.length;
+      while (newCap < writeOffset + chunk.byteLength) newCap *= 2;
+      const grown = new Uint8Array(newCap);
+      grown.set(result.subarray(0, writeOffset), 0);
+      result = grown;
+    }
+    result.set(chunk, writeOffset);
+    writeOffset += chunk.byteLength;
+
+    // ── Early preview: parse directly from result buffer ──
+    // No separate previewBuf needed — result[0..writeOffset] is contiguous
+    if (!previewSent && writeOffset >= 544) {
+      try {
+        const buf = result.subarray(0, writeOffset);
+        header = parseNiiHeader(buf.buffer as ArrayBuffer, true);
+        if (header) {
+          const { nx, ny, voxOffset, bytesPerVoxel, scl_slope, scl_inter, littleEndian, datatype } = header;
+          firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
+
+          if (writeOffset >= firstSliceNeeded) {
+            const slope = scl_slope || 1;
+            const inter = scl_inter || 0;
+            const le = littleEndian;
+            const needsConversion = slope !== 1 || inter !== 0;
+            const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
+
+            const sliceStart = voxOffset;
+            const axialSlice = new Float32Array(nx * ny);
+            const sliceView = new DataView(buf.buffer, buf.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
+            const byteOff = buf.byteOffset + sliceStart;
+            const canUseTA = (byteOff % elemSize === 0) && le;
+
+            if (canUseTA && datatype === 16 && !needsConversion) {
+              axialSlice.set(new Float32Array(buf.buffer, byteOff, nx * ny));
+            } else if (canUseTA && datatype === 16 && needsConversion) {
+              const src = new Float32Array(buf.buffer, byteOff, nx * ny);
+              for (let i = 0; i < nx * ny; i++) axialSlice[i] = src[i] * slope + inter;
+            } else {
+              for (let i = 0; i < nx * ny; i++) {
+                let val: number;
+                switch (datatype) {
+                  case 2: val = buf[buf.byteOffset + sliceStart + i]; break;
+                  case 4: val = sliceView.getInt16(i * 2, le); break;
+                  case 8: val = sliceView.getInt32(i * 4, le); break;
+                  case 16: val = sliceView.getFloat32(i * 4, le); break;
+                  case 64: val = sliceView.getFloat64(i * 8, le); break;
+                  case 256: val = (buf[buf.byteOffset + sliceStart + i] << 24) >> 24; break;
+                  case 512: val = sliceView.getUint16(i * 2, le); break;
+                  case 768: val = sliceView.getUint32(i * 4, le); break;
+                  default: val = 0;
+                }
+                axialSlice[i] = val * slope + inter;
+              }
+            }
+
+            let min = Infinity, max = -Infinity;
+            for (let i = 0; i < axialSlice.length; i++) {
+              if (axialSlice[i] < min) min = axialSlice[i];
+              if (axialSlice[i] > max) max = axialSlice[i];
+            }
+            if (min === max) max = min + 1;
+
+            const coMid = Math.floor(ny / 2);
+            const saMid = Math.floor(nx / 2);
+
+            self.postMessage({
+              id, type: 'preview',
+              partialPreview: true,
+              header,
+              slices: {
+                axial: axialSlice,
+                coronal: new Float32Array(0),
+                sagittal: new Float32Array(0),
+              },
+              globalMin: min, globalMax: max,
+              sliceIdx: { axial: 0, coronal: coMid, sagittal: saMid },
+              slope, inter,
+            }, [axialSlice.buffer]);
+
+            previewSent = true;
+            earlyPreviewSent.add(id);
+            self.postMessage({ id, type: 'progress', value: 0.5, stage: 'decompressing (stream)' });
+          }
+        }
+      } catch {
+        // Header not parseable yet — continue streaming
+      }
+    }
+
+    // Progress updates
+    if (!previewSent) {
+      self.postMessage({ id, type: 'progress', value: 0.1 + (writeOffset / (contentLength * 4 || writeOffset * 2)) * 0.2, stage: 'downloading (stream)' });
+    } else {
+      self.postMessage({ id, type: 'progress', value: 0.5 + (writeOffset / (contentLength * 4 || writeOffset * 2)) * 0.3, stage: 'decompressing (stream)' });
+    }
+  }
+
+  return result.subarray(0, writeOffset);
+}
+
+/**
+ * Streaming uncompressed .nii loader: fetches the URL with a single GET,
+ * emits an early preview as soon as the header + first axial slice are
+ * available, and collects the rest into a pre-allocated buffer.
+ */
+async function streamingNiiLoadWithEarlyPreview(url: string, id: number, signal: AbortSignal): Promise<Uint8Array> {
+  const resp = await fetchWithRetry(url, undefined, MAX_RETRIES, signal);
+  if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
+  if (!resp.body) throw new Error('No response body for streaming');
+
+  const reader = resp.body.getReader();
+  const contentLength = Number(resp.headers.get('Content-Length') || 0);
+
+  // Pre-allocate if Content-Length is known
+  let result: Uint8Array | null = contentLength > 0 ? new Uint8Array(contentLength) : null;
+  const chunks: Uint8Array[] = [];
+  let writeOffset = 0;
+  let totalSize = 0;
+
+  // Parse preview directly from result buffer — no separate previewBuf
+  let previewSent = false;
+
+  while (true) {
+    throwIfAborted(signal);
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = value!;
+
+    if (result) {
+      if (writeOffset + chunk.byteLength <= result.length) {
+        result.set(chunk, writeOffset);
+      } else {
+        // Overflow — fall back to chunk collection
+        chunks.push(result.subarray(0, writeOffset));
+        chunks.push(chunk);
+        result = null;
+      }
+    } else {
+      chunks.push(chunk);
+    }
+    writeOffset += chunk.byteLength;
+    totalSize += chunk.byteLength;
+
+    // Early preview — parse directly from result buffer
+    if (!previewSent && writeOffset >= 544) {
+      try {
+        const buf = result ? result.subarray(0, writeOffset) : (() => {
+          // Assemble from chunks for preview parsing
+          const tmp = new Uint8Array(writeOffset);
+          let off = 0;
+          for (const c of chunks) { tmp.set(c, off); off += c.byteLength; }
+          return tmp;
+        })();
+        const header = parseNiiHeader(buf.buffer as ArrayBuffer, false);
+        if (header) {
+          const { nx, ny, voxOffset, bytesPerVoxel, scl_slope, scl_inter, littleEndian, datatype } = header;
+          const firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
+
+          if (writeOffset >= firstSliceNeeded) {
+            const slope = scl_slope || 1;
+            const inter = scl_inter || 0;
+            const le = littleEndian;
+            const needsConversion = slope !== 1 || inter !== 0;
+            const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
+
+            const sliceStart = voxOffset;
+            const axialSlice = new Float32Array(nx * ny);
+            const sliceView = new DataView(buf.buffer, buf.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
+            const byteOff = buf.byteOffset + sliceStart;
+            const canUseTA = (byteOff % elemSize === 0) && le;
+
+            if (canUseTA && datatype === 16 && !needsConversion) {
+              axialSlice.set(new Float32Array(buf.buffer, byteOff, nx * ny));
+            } else if (canUseTA && datatype === 16 && needsConversion) {
+              const src = new Float32Array(buf.buffer, byteOff, nx * ny);
+              for (let i = 0; i < nx * ny; i++) axialSlice[i] = src[i] * slope + inter;
+            } else {
+              for (let i = 0; i < nx * ny; i++) {
+                let val: number;
+                switch (datatype) {
+                  case 2: val = buf[buf.byteOffset + sliceStart + i]; break;
+                  case 4: val = sliceView.getInt16(i * 2, le); break;
+                  case 8: val = sliceView.getInt32(i * 4, le); break;
+                  case 16: val = sliceView.getFloat32(i * 4, le); break;
+                  case 64: val = sliceView.getFloat64(i * 8, le); break;
+                  case 256: val = (buf[buf.byteOffset + sliceStart + i] << 24) >> 24; break;
+                  case 512: val = sliceView.getUint16(i * 2, le); break;
+                  case 768: val = sliceView.getUint32(i * 4, le); break;
+                  default: val = 0;
+                }
+                axialSlice[i] = val * slope + inter;
+              }
+            }
+
+            let min = Infinity, max = -Infinity;
+            for (let i = 0; i < axialSlice.length; i++) {
+              if (axialSlice[i] < min) min = axialSlice[i];
+              if (axialSlice[i] > max) max = axialSlice[i];
+            }
+            if (min === max) max = min + 1;
+
+            const coMid = Math.floor(ny / 2);
+            const saMid = Math.floor(nx / 2);
+
+            self.postMessage({
+              id, type: 'preview',
+              partialPreview: true,
+              header,
+              slices: {
+                axial: axialSlice,
+                coronal: new Float32Array(0),
+                sagittal: new Float32Array(0),
+              },
+              globalMin: min, globalMax: max,
+              sliceIdx: { axial: 0, coronal: coMid, sagittal: saMid },
+              slope, inter,
+            }, [axialSlice.buffer]);
+
+            previewSent = true;
+            earlyPreviewSent.add(id);
+            self.postMessage({ id, type: 'progress', value: 0.5, stage: 'downloading (stream)' });
+          }
+        }
+      } catch {
+        // Header not parseable yet
+      }
+    }
+
+    // Progress
+    if (contentLength > 0) {
+      const pct = writeOffset / contentLength;
+      if (!previewSent) {
+        self.postMessage({ id, type: 'progress', value: 0.02 + pct * 0.5, stage: 'downloading (stream)' });
+      } else {
+        self.postMessage({ id, type: 'progress', value: 0.5 + pct * 0.35, stage: 'downloading (stream)' });
+      }
+    }
+  }
+
+  // Assemble final result
+  if (result) {
+    if (writeOffset !== contentLength && contentLength > 0) {
+      return result.subarray(0, writeOffset);
+    }
+    return result;
+  }
+
+  const final = new Uint8Array(totalSize);
+  let offset = 0;
+  for (const chunk of chunks) {
+    final.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return final;
+}
+
+async function nativeDecompressFromBuffer(compressed: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
+  const ds = new (self as any).DecompressionStream('gzip');
+  const writer = ds.writable.getWriter();
+  // Write in reasonably-sized chunks to avoid back-pressure on the writable stream.
+  const CHUNK = 4 * 1024 * 1024;
+  let off = 0;
+  while (off < compressed.length) {
+    throwIfAborted(signal);
+    const end = Math.min(off + CHUNK, compressed.length);
+    await writer.write(compressed.subarray(off, end));
+    off = end;
+  }
+  await writer.close();
+
+  const reader = ds.readable.getReader() as ReadableStreamDefaultReader<Uint8Array>;
+
+  // Pre-allocate a growable buffer — typical gzip ratio is 3-5x,
+  // so start with 4x the compressed size to avoid reallocations.
+  const estimatedSize = compressed.length * 4;
+  let result = new Uint8Array(Math.max(estimatedSize, 16 * 1024 * 1024));
+  let writeOffset = 0;
+
+  while (true) {
+    throwIfAborted(signal);
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    // Grow buffer if needed (geometric growth)
+    if (writeOffset + value.byteLength > result.length) {
+      let newCap = result.length;
+      while (newCap < writeOffset + value.byteLength) newCap *= 2;
+      const grown = new Uint8Array(newCap);
+      grown.set(result.subarray(0, writeOffset), 0);
+      result = grown;
+    }
+    result.set(value, writeOffset);
+    writeOffset += value.byteLength;
+  }
+
+  return result.subarray(0, writeOffset);
 }
 
 async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuffer; isGzip?: boolean }): Promise<void> {

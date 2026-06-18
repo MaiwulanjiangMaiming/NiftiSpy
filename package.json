@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",
@@ -93,13 +93,6 @@
           "light": "./File-Icons-clean.png",
           "dark": "./File-Icons-clean.png"
         }
-      }
-    ],
-    "iconThemes": [
-      {
-        "id": "niftispy-icons",
-        "label": "NiftiSpy File Icons",
-        "path": "./dist/niftispy-icon-theme.json"
       }
     ],
     "keybindings": [

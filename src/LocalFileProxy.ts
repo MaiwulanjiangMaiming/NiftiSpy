@@ -1,4 +1,5 @@
 import * as http from 'http';
+import * as https from 'https';
 import * as http2 from 'http2';
 import * as fs from 'fs';
 import * as zlib from 'zlib';
@@ -14,7 +15,7 @@ import {
   downsampleSlice,
 } from './nifti/sliceExtractor';
 import { computeSliceMinMax, encodePreviewBinary } from './nifti/previewEncoder';
-import { readLocalFilePartial, readHttpPartial } from './io/fileReader';
+import { readLocalFilePartial, readHttpPartial, getAgentForUrl } from './io/fileReader';
 import {
   compressResponse,
   gunzipAsync,
@@ -71,7 +72,6 @@ export class LocalFileProxy {
   private stats: ConnectionStats = { protocol: 'http/1.1', activeStreams: 0, totalRequests: 0, pushedSlices: 0 };
   private recentSliceRequests = new Map<string, number>(); // key -> timestamp
   private priorityQueue: PrioritizedRequest[] = [];
-  private priorityProcessing = false;
   private activeStreamCount = 0;
 
   constructor(volumeCache?: VolumeCache) {
@@ -187,6 +187,9 @@ export class LocalFileProxy {
     return undefined;
   }
 
+  private readonly maxConcurrentRequests = 32;
+  private activeRequests = 0;
+
   private enqueueRequest(priority: number, execute: () => Promise<void>): void {
     this.priorityQueue.push({ priority, execute });
     this.priorityQueue.sort((a, b) => b.priority - a.priority);
@@ -194,17 +197,14 @@ export class LocalFileProxy {
   }
 
   private processPriorityQueue(): void {
-    if (this.priorityProcessing) return;
-    this.priorityProcessing = true;
-    const next = () => {
-      if (this.priorityQueue.length === 0) {
-        this.priorityProcessing = false;
-        return;
-      }
+    while (this.activeRequests < this.maxConcurrentRequests && this.priorityQueue.length > 0) {
       const job = this.priorityQueue.shift()!;
-      job.execute().then(next).catch(next);
-    };
-    next();
+      this.activeRequests++;
+      job.execute().finally(() => {
+        this.activeRequests--;
+        this.processPriorityQueue();
+      });
+    }
   }
 
   private handleHttp2Stream(stream: http2.ServerHttp2Stream, headers: http2.IncomingHttpHeaders): void {
@@ -276,7 +276,7 @@ export class LocalFileProxy {
       'cross-origin-embedder-policy': 'require-corp',
     };
 
-    const fakeReq = { headers: { 'accept-encoding': (headers['accept-encoding'] as string) || '', 'range': (headers['range'] as string) || '' }, method, url: path } as any as http.IncomingMessage;
+    const fakeReq = { headers: { 'accept-encoding': (headers['accept-encoding'] as string) || '', 'range': (headers['range'] as string) || '', 'host': (headers[':authority'] as string) || (headers['host'] as string) || '127.0.0.1' }, method, url: path } as any as http.IncomingMessage;
     const h2Response = new Http2ResponseAdapter(stream, h2Headers);
 
     this.enqueueRequest(priority, async () => {
@@ -443,6 +443,17 @@ export class LocalFileProxy {
 
   private async handleFile(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+    const method = (req.method || 'GET').toUpperCase();
+    const rangeHeader = req.headers['range'];
+
+    // ── Fast path: full-file GET on a remote URL ──
+    // Stream directly from the remote without probing size first.
+    // This eliminates a HEAD round-trip and lets the first byte reach
+    // the webview as soon as the remote responds.
+    if (isHttpRemote && method === 'GET' && !rangeHeader) {
+      await this.streamHttpToResponse(entry.uri.toString(), res);
+      return;
+    }
 
     if (!entry.size) {
       if (isHttpRemote) {
@@ -462,7 +473,7 @@ export class LocalFileProxy {
 
     // HEAD: the webview probes Content-Length + Accept-Ranges to decide whether
     // to use the parallel ranged download. Answer with headers only.
-    if ((req.method || 'GET').toUpperCase() === 'HEAD') {
+    if (method === 'HEAD') {
       res.writeHead(200, {
         'Content-Length': totalSize,
         'Accept-Ranges': 'bytes',
@@ -472,7 +483,6 @@ export class LocalFileProxy {
       return;
     }
 
-    const rangeHeader = req.headers['range'];
     if (rangeHeader) {
       const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
       if (!m) {
@@ -492,7 +502,7 @@ export class LocalFileProxy {
           'Accept-Ranges': 'bytes',
           'Content-Type': 'application/octet-stream',
         });
-        fs.createReadStream(fsPath, { start, end }).pipe(res);
+        fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 }).pipe(res);
       } else if (isHttpRemote) {
         // Stream HTTP Range request directly from remote to client
         await this.streamHttpRangeToResponse(entry.uri.toString(), start, end, res);
@@ -519,7 +529,7 @@ export class LocalFileProxy {
           'Accept-Ranges': 'bytes',
           'Content-Type': 'application/octet-stream',
         });
-        fs.createReadStream(fsPath).pipe(res);
+        fs.createReadStream(fsPath, { highWaterMark: 4 * 1024 * 1024 }).pipe(res);
       } else if (fsPath && shouldCompress) {
         res.writeHead(200, {
           'Content-Encoding': 'gzip',
@@ -540,7 +550,12 @@ export class LocalFileProxy {
     }
   }
 
+  private remoteSizeCache = new Map<string, number>();
+
   private getHttpRemoteSize(url: string): Promise<number> {
+    const cached = this.remoteSizeCache.get(url);
+    if (cached !== undefined) return Promise.resolve(cached);
+
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const options = {
@@ -548,26 +563,19 @@ export class LocalFileProxy {
         port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method: 'HEAD',
+        agent: getAgentForUrl(url),
       };
-      const request = parsed.protocol === 'https:'
-        ? require('https').request(options, (response: any) => {
-            const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-            if (contentLength > 0) {
-              resolve(contentLength);
-            } else {
-              reject(new Error('Content-Length not available'));
-            }
-            response.resume(); // drain the response
-          })
-        : require('http').request(options, (response: any) => {
-            const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-            if (contentLength > 0) {
-              resolve(contentLength);
-            } else {
-              reject(new Error('Content-Length not available'));
-            }
-            response.resume();
-          });
+      const mod = parsed.protocol === 'https:' ? https : http;
+      const request = mod.request(options, (response: any) => {
+        const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+        if (contentLength > 0) {
+          this.remoteSizeCache.set(url, contentLength);
+          resolve(contentLength);
+        } else {
+          reject(new Error('Content-Length not available'));
+        }
+        response.resume(); // drain the response
+      });
       request.on('error', reject);
       request.setTimeout(5000, () => { request.destroy(); reject(new Error('HEAD request timeout')); });
       request.end();
@@ -583,54 +591,32 @@ export class LocalFileProxy {
         path: parsed.pathname + parsed.search,
         method: 'GET',
         headers: { Range: `bytes=${start}-${end}` },
+        agent: getAgentForUrl(url),
       };
-      const request = parsed.protocol === 'https:'
-        ? require('https').request(options, (response: any) => {
-            if (response.statusCode === 206 || response.statusCode === 200) {
-              const contentRange = response.headers['content-range'];
-              const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-              const headers: Record<string, string | number> = {
-                'Accept-Ranges': 'bytes',
-                'Content-Type': 'application/octet-stream',
-              };
-              if (contentRange) {
-                headers['Content-Range'] = contentRange;
-              }
-              if (contentLength) {
-                headers['Content-Length'] = contentLength;
-              }
-              res.writeHead(response.statusCode, headers);
-              response.pipe(res, { end: true });
-              response.on('end', resolve);
-              response.on('error', reject);
-            } else {
-              reject(new Error(`Remote responded with ${response.statusCode}`));
-              response.resume();
-            }
-          })
-        : require('http').request(options, (response: any) => {
-            if (response.statusCode === 206 || response.statusCode === 200) {
-              const contentRange = response.headers['content-range'];
-              const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-              const headers: Record<string, string | number> = {
-                'Accept-Ranges': 'bytes',
-                'Content-Type': 'application/octet-stream',
-              };
-              if (contentRange) {
-                headers['Content-Range'] = contentRange;
-              }
-              if (contentLength) {
-                headers['Content-Length'] = contentLength;
-              }
-              res.writeHead(response.statusCode, headers);
-              response.pipe(res, { end: true });
-              response.on('end', resolve);
-              response.on('error', reject);
-            } else {
-              reject(new Error(`Remote responded with ${response.statusCode}`));
-              response.resume();
-            }
-          });
+      const mod = parsed.protocol === 'https:' ? https : http;
+      const request = mod.request(options, (response: any) => {
+        if (response.statusCode === 206 || response.statusCode === 200) {
+          const contentRange = response.headers['content-range'];
+          const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+          const headers: Record<string, string | number> = {
+            'Accept-Ranges': 'bytes',
+            'Content-Type': 'application/octet-stream',
+          };
+          if (contentRange) {
+            headers['Content-Range'] = contentRange;
+          }
+          if (contentLength) {
+            headers['Content-Length'] = contentLength;
+          }
+          res.writeHead(response.statusCode, headers);
+          response.pipe(res, { end: true });
+          response.on('end', resolve);
+          response.on('error', reject);
+        } else {
+          reject(new Error(`Remote responded with ${response.statusCode}`));
+          response.resume();
+        }
+      });
       request.on('error', reject);
       request.setTimeout(30000, () => { request.destroy(); reject(new Error('Range request timeout')); });
       request.end();
@@ -645,49 +631,91 @@ export class LocalFileProxy {
         port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method: 'GET',
+        agent: getAgentForUrl(url),
       };
-      const request = parsed.protocol === 'https:'
-        ? require('https').request(options, (response: any) => {
-            if (response.statusCode === 200) {
-              const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-              const headers: Record<string, string | number> = {
-                'Accept-Ranges': 'bytes',
-                'Content-Type': 'application/octet-stream',
-              };
-              if (contentLength) {
-                headers['Content-Length'] = contentLength;
-              }
-              res.writeHead(200, headers);
-              response.pipe(res, { end: true });
-              response.on('end', resolve);
-              response.on('error', reject);
-            } else {
-              reject(new Error(`Remote responded with ${response.statusCode}`));
-              response.resume();
-            }
-          })
-        : require('http').request(options, (response: any) => {
-            if (response.statusCode === 200) {
-              const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-              const headers: Record<string, string | number> = {
-                'Accept-Ranges': 'bytes',
-                'Content-Type': 'application/octet-stream',
-              };
-              if (contentLength) {
-                headers['Content-Length'] = contentLength;
-              }
-              res.writeHead(200, headers);
-              response.pipe(res, { end: true });
-              response.on('end', resolve);
-              response.on('error', reject);
-            } else {
-              reject(new Error(`Remote responded with ${response.statusCode}`));
-              response.resume();
-            }
-          });
+      const mod = parsed.protocol === 'https:' ? https : http;
+      const request = mod.request(options, (response: any) => {
+        if (response.statusCode === 200) {
+          const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+          const headers: Record<string, string | number> = {
+            'Accept-Ranges': 'bytes',
+            'Content-Type': 'application/octet-stream',
+          };
+          if (contentLength) {
+            headers['Content-Length'] = contentLength;
+          }
+          res.writeHead(200, headers);
+          response.pipe(res, { end: true });
+          response.on('end', resolve);
+          response.on('error', reject);
+        } else {
+          reject(new Error(`Remote responded with ${response.statusCode}`));
+          response.resume();
+        }
+      });
       request.on('error', reject);
       request.setTimeout(60000, () => { request.destroy(); reject(new Error('Full file request timeout')); });
       request.end();
+    });
+  }
+
+  /**
+   * Download a remote HTTP file using parallel byte-range requests.
+   * This saturates high-bandwidth links and avoids the latency of many
+   * sequential small requests, which is critical for large uncompressed
+   * NIfTI volumes.
+   */
+  private async downloadHttpFileInChunks(url: string, totalSize: number, signal?: AbortSignal): Promise<Uint8Array> {
+    const CHUNK_SIZE = 32 * 1024 * 1024; // 32 MB — larger chunks = fewer requests, better throughput
+    const MAX_CONCURRENT = 32;            // match agent maxSockets for full utilization
+
+    if (totalSize <= CHUNK_SIZE) {
+      return readHttpPartial(url, 0, totalSize - 1, signal);
+    }
+
+    const ranges: { start: number; end: number }[] = [];
+    for (let start = 0; start < totalSize; start += CHUNK_SIZE) {
+      const end = Math.min(start + CHUNK_SIZE - 1, totalSize - 1);
+      ranges.push({ start, end });
+    }
+
+    const result = Buffer.alloc(totalSize);
+    let running = 0;
+    let nextIdx = 0;
+    let poolError: Error | null = null;
+
+    return new Promise((resolve, reject) => {
+      const tryLaunch = (): void => {
+        while (running < MAX_CONCURRENT && nextIdx < ranges.length && !poolError) {
+          const idx = nextIdx++;
+          const { start, end } = ranges[idx];
+          running++;
+          readHttpPartial(url, start, end, signal)
+            .then(chunk => {
+              if (poolError) return;
+              result.set(chunk, start);
+            })
+            .catch(err => {
+              if (!poolError) poolError = err;
+            })
+            .finally(() => {
+              running--;
+              if (poolError) {
+                reject(poolError);
+                return;
+              }
+              if (nextIdx >= ranges.length && running === 0) {
+                resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
+              } else {
+                tryLaunch();
+              }
+            });
+        }
+        if (ranges.length === 0) {
+          resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
+        }
+      };
+      tryLaunch();
     });
   }
 
@@ -1161,79 +1189,22 @@ export class LocalFileProxy {
             entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
             compressResponse(buf, req, res, 'application/octet-stream');
             return;
-          } else if (axis === 'coronal') {
-            const rowSize = nx * bytesPerVoxel;
-            const promises: Promise<{ rowBytes: Uint8Array; z: number }>[] = [];
-            for (let z = 0; z < header.nz; z++) {
-              const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bytesPerVoxel;
-              promises.push(readHttpPartial(uriStr, rowOffset, rowOffset + rowSize - 1).then(rowBytes => ({ rowBytes, z })));
-            }
-            const rows = await Promise.all(promises);
-            const slice = new Float32Array(nx * header.nz);
-            const bpv = Math.max(1, header.bitpix / 8);
-            const le = header.littleEndian;
-            const slope = header.scl_slope || 1;
-            const inter = header.scl_inter || 0;
-            for (const { rowBytes, z } of rows) {
-              const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
-              for (let x = 0; x < nx; x++) {
-                const off = x * bpv;
-                let val: number;
-                switch (header.datatype) {
-                  case 2: val = rowBytes[off]; break;
-                  case 4: val = view.getInt16(off, le); break;
-                  case 8: val = view.getInt32(off, le); break;
-                  case 16: val = view.getFloat32(off, le); break;
-                  case 64: val = view.getFloat64(off, le); break;
-                  case 256: val = (rowBytes[off] << 24) >> 24; break;
-                  case 512: val = view.getUint16(off, le); break;
-                  case 768: val = view.getUint32(off, le); break;
-                  default: val = 0;
-                }
-                slice[z * nx + x] = val * slope + inter;
-              }
-            }
-            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-            compressResponse(buf, req, res, 'application/octet-stream');
-            return;
-          } else {
-            const axialSize = nx * ny * bytesPerVoxel;
-            const promises: Promise<{ axialBytes: Uint8Array; z: number }>[] = [];
-            for (let z = 0; z < header.nz; z++) {
-              const axialOffset = voxOffset + z * nx * ny * bytesPerVoxel;
-              promises.push(readHttpPartial(uriStr, axialOffset, axialOffset + axialSize - 1).then(axialBytes => ({ axialBytes, z })));
-            }
-            const axialSlices = await Promise.all(promises);
-            const slice = new Float32Array(ny * header.nz);
-            const bpv = Math.max(1, header.bitpix / 8);
-            const le = header.littleEndian;
-            const slope = header.scl_slope || 1;
-            const inter = header.scl_inter || 0;
-            for (const { axialBytes, z } of axialSlices) {
-              const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
-              for (let y = 0; y < ny; y++) {
-                const off = (y * nx + idx) * bpv;
-                let val: number;
-                switch (header.datatype) {
-                  case 2: val = axialBytes[off]; break;
-                  case 4: val = view.getInt16(off, le); break;
-                  case 8: val = view.getInt32(off, le); break;
-                  case 16: val = view.getFloat32(off, le); break;
-                  case 64: val = view.getFloat64(off, le); break;
-                  case 256: val = (axialBytes[off] << 24) >> 24; break;
-                  case 512: val = view.getUint16(off, le); break;
-                  case 768: val = view.getUint32(off, le); break;
-                  default: val = 0;
-                }
-                slice[z * ny + y] = val * slope + inter;
-              }
-            }
-            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-            compressResponse(buf, req, res, 'application/octet-stream');
-            return;
           }
+
+          // Coronal/sagittal slices access scattered voxels across many axial
+          // slices. Serving them with one tiny Range request per z-row causes
+          // massive round-trip overhead on remote files. Instead, fetch the
+          // full volume once using parallel chunked ranges and extract locally.
+          // Subsequent slice requests are then served from entry.dataCache.
+          const { rawData } = await this.loadFileData(entry);
+          const slice = extractSingleSlice(rawData, header, axis, idx);
+          if (!slice) {
+            res.writeHead(404); res.end('Slice not found'); return;
+          }
+          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+          compressResponse(buf, req, res, 'application/octet-stream');
+          return;
         } catch {
           res.writeHead(500); res.end('Failed to fetch slice via HTTP Range'); return;
         }
@@ -1317,6 +1288,7 @@ export class LocalFileProxy {
     const fsPath = entry.uri.fsPath;
     const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
     const isLocal = !!fsPath;
+    const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
 
     entry.pendingLoad = (async () => {
       try {
@@ -1345,12 +1317,45 @@ export class LocalFileProxy {
           }
           header = entry.headerCache || parseNiiHeaderQuick(rawData);
         } else if (isGzip) {
-          const fullData = await vscode.workspace.fs.readFile(entry.uri);
-          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-          const decompressed = await gunzipAsync(fullData, signal);
-          rawData = decompressed;
-          header = parseNiiHeaderQuick(rawData);
-          entry.dataCache = rawData;
+          // Remote gzip files benefit from parallel compressed download followed
+          // by local decompression, which is faster than a single HTTP stream on
+          // high-bandwidth or high-latency links.
+          if (entry.dataCache) {
+            rawData = entry.dataCache;
+          } else {
+            let compressed: Uint8Array;
+            if (isHttpRemote) {
+              let compressedSize = entry.size;
+              if (!compressedSize) {
+                compressedSize = await this.getHttpRemoteSize(entry.uri.toString());
+                entry.size = compressedSize;
+              }
+              compressed = await this.downloadHttpFileInChunks(entry.uri.toString(), compressedSize, signal);
+            } else {
+              const fullData = await vscode.workspace.fs.readFile(entry.uri);
+              compressed = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
+            }
+            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            const decompressed = await gunzipAsync(compressed, signal);
+            rawData = decompressed;
+            entry.dataCache = rawData;
+          }
+          header = entry.headerCache || parseNiiHeaderQuick(rawData);
+        } else if (isHttpRemote) {
+          // Remote uncompressed HTTP(S) file: use parallel Range requests
+          // to saturate bandwidth instead of a single sequential read.
+          if (entry.dataCache) {
+            rawData = entry.dataCache;
+          } else {
+            let totalSize = entry.size;
+            if (!totalSize) {
+              totalSize = await this.getHttpRemoteSize(entry.uri.toString());
+              entry.size = totalSize;
+            }
+            rawData = await this.downloadHttpFileInChunks(entry.uri.toString(), totalSize, signal);
+            entry.dataCache = rawData;
+          }
+          header = entry.headerCache || parseNiiHeaderQuick(rawData);
         } else {
           const fullData = await vscode.workspace.fs.readFile(entry.uri);
           if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');

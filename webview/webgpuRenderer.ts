@@ -254,22 +254,48 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     return this.ready;
   }
 
-  uploadVolume3D(data: Float32Array, nx: number, ny: number, nz: number): boolean {
+  uploadVolume3D(data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array, nx: number, ny: number, nz: number): boolean {
     if (!this.device || !this.pipeline) return false;
 
     this.volumeState?.texture.destroy();
 
+    // Map TypedArray to GPU texture format
+    let format: GPUTextureFormat;
+    let bytesPerRow: number;
+    if (data instanceof Int16Array) {
+      format = 'r16sint';
+      bytesPerRow = nx * 2;
+    } else if (data instanceof Uint16Array) {
+      format = 'r16uint';
+      bytesPerRow = nx * 2;
+    } else if (data instanceof Int8Array) {
+      format = 'r8sint';
+      bytesPerRow = nx;
+    } else if (data instanceof Uint8Array) {
+      format = 'r8uint';
+      bytesPerRow = nx;
+    } else if (data instanceof Int32Array) {
+      format = 'r32sint';
+      bytesPerRow = nx * 4;
+    } else if (data instanceof Uint32Array) {
+      format = 'r32uint';
+      bytesPerRow = nx * 4;
+    } else {
+      format = 'r32float';
+      bytesPerRow = nx * 4;
+    }
+
     const texture = this.device.createTexture({
       size: { width: nx, height: ny, depthOrArrayLayers: nz },
-      format: 'r32float',
+      format,
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
       dimension: '3d',
     });
 
     this.device.queue.writeTexture(
       { texture },
-      data as Float32Array<ArrayBuffer>,
-      { bytesPerRow: nx * 4, rowsPerImage: ny },
+      data as ArrayBufferView,
+      { bytesPerRow, rowsPerImage: ny },
       { width: nx, height: ny, depthOrArrayLayers: nz }
     );
 

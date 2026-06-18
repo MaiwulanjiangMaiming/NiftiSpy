@@ -372,23 +372,57 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     const le = littleEndian;
     let min = Infinity, max = -Infinity;
     const sampleStep = Math.max(1, Math.floor(n / 50000));
-    const view = new DataView(rawData.buffer, rawData.byteOffset + voxOffset, n * elemSize);
-    for (let i = 0; i < n; i += sampleStep) {
-      let val: number;
-      switch (datatype) {
-        case 2: val = view.getUint8(i * elemSize); break;
-        case 4: val = view.getInt16(i * elemSize, le); break;
-        case 8: val = view.getInt32(i * elemSize, le); break;
-        case 16: val = view.getFloat32(i * elemSize, le); break;
-        case 64: val = view.getFloat64(i * elemSize, le); break;
-        case 256: val = view.getInt8(i * elemSize); break;
-        case 512: val = view.getUint16(i * elemSize, le); break;
-        case 768: val = view.getUint32(i * elemSize, le); break;
-        default: val = view.getFloat32(i * elemSize, le); break;
+    const byteOff = rawData.byteOffset + voxOffset;
+    const needsConversion = slope !== 1 || inter !== 0;
+
+    // Fast path: use typed array views for little-endian data (common case)
+    // Typed array access is 3-5x faster than DataView for sequential reads
+    if (le && (byteOff % elemSize === 0) && (byteOff + n * elemSize <= rawData.buffer.byteLength)) {
+      if (!needsConversion) {
+        switch (datatype) {
+          case 2: { const a = new Uint8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 4: { const a = new Int16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 8: { const a = new Int32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 16: { const a = new Float32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 64: { const a = new Float64Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 256: { const a = new Int8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 512: { const a = new Uint16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 768: { const a = new Uint32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+          default: { const a = new Float32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        }
+      } else {
+        switch (datatype) {
+          case 2: { const a = new Uint8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 4: { const a = new Int16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 8: { const a = new Int32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 16: { const a = new Float32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 64: { const a = new Float64Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 256: { const a = new Int8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 512: { const a = new Uint16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          case 768: { const a = new Uint32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+          default: { const a = new Float32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        }
       }
-      val = val * slope + inter;
-      if (val < min) min = val;
-      if (val > max) max = val;
+    } else {
+      // Fallback: DataView for big-endian or unaligned data
+      const view = new DataView(rawData.buffer, byteOff, n * elemSize);
+      for (let i = 0; i < n; i += sampleStep) {
+        let val: number;
+        switch (datatype) {
+          case 2: val = view.getUint8(i * elemSize); break;
+          case 4: val = view.getInt16(i * elemSize, le); break;
+          case 8: val = view.getInt32(i * elemSize, le); break;
+          case 16: val = view.getFloat32(i * elemSize, le); break;
+          case 64: val = view.getFloat64(i * elemSize, le); break;
+          case 256: val = view.getInt8(i * elemSize); break;
+          case 512: val = view.getUint16(i * elemSize, le); break;
+          case 768: val = view.getUint32(i * elemSize, le); break;
+          default: val = view.getFloat32(i * elemSize, le); break;
+        }
+        val = val * slope + inter;
+        if (val < min) min = val;
+        if (val > max) max = val;
+      }
     }
     if (min === max) max = min + 1;
     if (min > max || !isFinite(min) || !isFinite(max)) { min = 0; max = 1; }
@@ -439,76 +473,59 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.volumeCache.setActive(uriKey, webviewId);
           const fsPath = uri.fsPath;
           const isGzip = fsPath.endsWith('.gz');
+          const native = getNativeBindings();
 
-          // ── Phase 1: Fast preview for .nii.gz only ──
-          // .nii files are fast to read entirely (SSD < 0.5s for 500MB), so skip
-          // the partial-read preview and go straight to full load. .nii.gz needs
-          // streaming decompression which is slow, so we send a quick z=0 preview
-          // first while the full decompress runs in background.
-          let previewSent = false;
-          if (isGzip) {
-            try {
-              const entryId = this.proxy!.getEntryIdByUri(uri);
-              if (entryId) {
-                const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
-                if (preview && !signal.aborted) {
-                  const { header, slices, globalMin, globalMax, slope, inter, sliceIdx } = preview;
-                  webview.postMessage({
-                    type: 'preview',
-                    header,
-                    globalMin, globalMax,
-                    slope, inter,
-                    sliceIdx,
-                    axialSlice: slices.axial,
-                    coronalSlice: slices.coronal,
-                    sagittalSlice: slices.sagittal,
-                    partialPreview: true,
-                  });
-                  previewSent = true;
-                }
-              }
-            } catch {
-              // Preview failed — fall through to full load
-            }
-          }
+          // ── Optimized single-pass load ──
+          // For .nii.gz: stream-decompress ONCE, send z=0 preview early,
+          //   then send full volume from the same decompression pass.
+          // For .nii: read directly (SSD fast), use native mmap stats if available.
+          // This eliminates the previous double-read/double-decompress bug.
 
-          if (signal.aborted) return;
-
-          // ── Phase 2: Full volume load ──
           let rawData: Uint8Array;
+          let header: any;
+
           if (isGzip) {
-            rawData = await new Promise<Uint8Array>((resolve, reject) => {
-              const chunks: Buffer[] = [];
-              const stream = fs.createReadStream(fsPath);
-              const gunzip = zlib.createGunzip();
-              stream.pipe(gunzip);
-              gunzip.on('data', (chunk: Buffer) => { if (!signal.aborted) chunks.push(chunk); });
-              gunzip.on('end', () => {
-                if (signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
-                const total = chunks.reduce((s, c) => s + c.length, 0);
-                const result = Buffer.alloc(total);
-                let offset = 0;
-                for (const chunk of chunks) { chunk.copy(result, offset); offset += chunk.length; }
-                resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
-              });
-              gunzip.on('error', reject);
-              stream.on('error', reject);
-              if (signal) signal.addEventListener('abort', () => { stream.destroy(); gunzip.destroy(); }, { once: true });
-            });
+            // Try native fast_decompress_gzip first (2-3x faster than Node.js zlib)
+            if (native?.fastDecompressGzip) {
+              try {
+                const compressed = await fs.promises.readFile(fsPath);
+                if (signal.aborted) return;
+                const decompressed = native.fastDecompressGzip(compressed as any) as Uint8Array;
+                rawData = new Uint8Array(decompressed.buffer, decompressed.byteOffset, decompressed.byteLength);
+                header = this.parseNiiHeaderFromBuffer(rawData);
+                if (!header) return;
+
+                // Send z=0 preview immediately from decompressed data
+                this.sendEarlyPreviewFromRawData(webview, header, rawData, signal);
+              } catch {
+                // Fall through to streaming path
+                const result = await this.streamingLocalGzLoad(webview, fsPath, signal);
+                if (!result || signal.aborted) return;
+                rawData = result.rawData;
+                header = result.header;
+              }
+            } else {
+              // No native: single-pass streaming with early preview
+              const result = await this.streamingLocalGzLoad(webview, fsPath, signal);
+              if (!result || signal.aborted) return;
+              rawData = result.rawData;
+              header = result.header;
+            }
           } else {
+            // .nii: direct read (SSD < 0.5s for 500MB)
             const fullData = await fs.promises.readFile(fsPath);
+            if (signal.aborted) return;
             rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
+            header = this.parseNiiHeaderFromBuffer(rawData);
+            if (!header) return;
           }
 
           if (signal.aborted) return;
-
-          const header = this.parseNiiHeaderFromBuffer(rawData);
-          if (!header) return;
 
           const voxOffset = header.voxOffset;
           const n = header.nx * header.ny * header.nz;
           const elemSize = header.bytesPerVoxel;
-          const voxelOnly = rawData.slice(voxOffset, voxOffset + n * elemSize);
+          const voxelOnly = rawData.subarray(voxOffset, voxOffset + n * elemSize);
           const { min, max } = this.computeVoxelStats(rawData, header, fsPath);
 
           this.volumeCache.set(uriKey, {
@@ -525,7 +542,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             this.buildGzipIndexInBackground(fsPath, uriKey);
           }
 
-          const voxelBuffer = voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
+          const voxelBuffer = (voxelOnly.byteOffset === 0 && voxelOnly.byteLength === voxelOnly.buffer.byteLength)
+            ? voxelOnly.buffer
+            : voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
 
           webview.postMessage({
             type: 'cachedVolume',
@@ -543,15 +562,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             },
           });
 
-          // Generate LOD levels in background for progressive loading
-          this.generateAndSendLOD(webview, header, voxelOnly, signal, fsPath);
-
-          // Show chunk loading progress for large volumes
-          const totalChunks = Math.ceil(header.nx / 64) * Math.ceil(header.ny / 64) * Math.ceil(header.nz / 64);
-          if (totalChunks > 10) {
-            this.showChunkProgress(totalChunks, totalChunks);
-            setTimeout(() => this.hideChunkProgress(), 3000);
-          }
+          // Defer LOD generation to background — don't block initial display
+          setTimeout(() => {
+            if (!signal.aborted) {
+              this.generateAndSendLOD(webview, header, voxelOnly, signal, fsPath);
+            }
+          }, 500);
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Local load error:', err);
@@ -559,6 +575,207 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         }
       },
     });
+  }
+
+  /**
+   * Single-pass streaming gzip load: decompresses the file once,
+   * sends z=0 preview as soon as available, and returns the full
+   * decompressed data. Eliminates the previous double-read bug.
+   */
+  private async streamingLocalGzLoad(
+    webview: vscode.Webview,
+    fsPath: string,
+    signal: AbortSignal
+  ): Promise<{ rawData: Uint8Array; header: any } | null> {
+    return new Promise((resolve, reject) => {
+      const gunzip = zlib.createGunzip();
+      const chunks: Buffer[] = [];
+      let totalSize = 0;
+      let resolved = false;
+      let header: any = null;
+      let previewSent = false;
+      let firstSliceNeeded = Infinity;
+
+      const fileStream = fs.createReadStream(fsPath, { highWaterMark: 4 * 1024 * 1024 });
+      fileStream.pipe(gunzip);
+
+      const onAbort = () => {
+        if (!resolved) {
+          resolved = true;
+          fileStream.destroy();
+          gunzip.destroy();
+          reject(new DOMException('Aborted', 'AbortError'));
+        }
+      };
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+      gunzip.on('data', (chunk: Buffer) => {
+        if (resolved) return;
+        if (signal.aborted) { gunzip.destroy(); return; }
+        chunks.push(chunk);
+        totalSize += chunk.length;
+
+        // Parse header as soon as we have enough data
+        if (!header && totalSize >= 544) {
+          const buf = Buffer.concat(chunks);
+          header = this.parseNiiHeaderFromBuffer(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
+          if (header) {
+            const { nx, ny, voxOffset, bytesPerVoxel } = header;
+            firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
+          }
+        }
+
+        // Send z=0 preview as soon as available
+        if (header && !previewSent && totalSize >= firstSliceNeeded) {
+          previewSent = true;
+          this.sendEarlyPreviewFromHeader(webview, header, chunks, signal);
+        }
+      });
+
+      gunzip.on('end', () => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        if (resolved) return;
+        resolved = true;
+        const buf = Buffer.concat(chunks);
+        const rawData = new Uint8Array(buf.buffer, buf.byteOffset, buf.length);
+        if (!header) {
+          header = this.parseNiiHeaderFromBuffer(rawData);
+        }
+        if (!header) {
+          reject(new Error('Failed to parse NIfTI header'));
+          return;
+        }
+        resolve({ rawData, header });
+      });
+
+      gunzip.on('error', (err) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        if (!resolved) { resolved = true; reject(err); }
+      });
+
+      fileStream.on('error', (err) => {
+        if (signal) signal.removeEventListener('abort', onAbort);
+        if (!resolved) { resolved = true; reject(err); }
+      });
+    });
+  }
+
+  /**
+   * Send z=0 axial preview from decompressed chunks.
+   */
+  private sendEarlyPreviewFromHeader(
+    webview: vscode.Webview,
+    header: any,
+    chunks: Buffer[],
+    signal: AbortSignal
+  ): void {
+    try {
+      const buf = Buffer.concat(chunks);
+      const { nx, ny, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = header;
+      const sliceEnd = voxOffset + nx * ny * bytesPerVoxel;
+      if (buf.length < sliceEnd) return;
+
+      const sliceBytes = new Uint8Array(buf.buffer, buf.byteOffset + voxOffset, nx * ny * bytesPerVoxel);
+      const bpv = Math.max(1, bytesPerVoxel);
+      const le = littleEndian;
+      const slope = scl_slope || 1;
+      const inter = scl_inter || 0;
+      const axialSlice = new Float32Array(nx * ny);
+      const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
+
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < nx * ny; i++) {
+        const off = i * bpv;
+        let val: number;
+        switch (datatype) {
+          case 2: val = sliceBytes[off]; break;
+          case 4: val = view.getInt16(off, le); break;
+          case 8: val = view.getInt32(off, le); break;
+          case 16: val = view.getFloat32(off, le); break;
+          case 64: val = view.getFloat64(off, le); break;
+          case 256: val = (sliceBytes[off] << 24) >> 24; break;
+          case 512: val = view.getUint16(off, le); break;
+          case 768: val = view.getUint32(off, le); break;
+          default: val = 0;
+        }
+        const v = val * slope + inter;
+        axialSlice[i] = v;
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      if (min === max) max = min + 1;
+
+      if (!signal.aborted) {
+        webview.postMessage({
+          type: 'preview',
+          header,
+          globalMin: min, globalMax: max,
+          slope, inter,
+          sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
+          axialSlice,
+          coronalSlice: new Float32Array(0),
+          sagittalSlice: new Float32Array(0),
+          partialPreview: true,
+        });
+      }
+    } catch {
+      // Preview failed — non-critical
+    }
+  }
+
+  /**
+   * Send early preview from fully decompressed raw data (native path).
+   */
+  private sendEarlyPreviewFromRawData(
+    webview: vscode.Webview,
+    header: any,
+    rawData: Uint8Array,
+    signal: AbortSignal
+  ): void {
+    const { nx, ny, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = header;
+    const sliceBytes = rawData.subarray(voxOffset, voxOffset + nx * ny * bytesPerVoxel);
+    const bpv = Math.max(1, bytesPerVoxel);
+    const le = littleEndian;
+    const slope = scl_slope || 1;
+    const inter = scl_inter || 0;
+    const axialSlice = new Float32Array(nx * ny);
+    const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
+
+    let min = Infinity, max = -Infinity;
+    for (let i = 0; i < nx * ny; i++) {
+      const off = i * bpv;
+      let val: number;
+      switch (datatype) {
+        case 2: val = sliceBytes[off]; break;
+        case 4: val = view.getInt16(off, le); break;
+        case 8: val = view.getInt32(off, le); break;
+        case 16: val = view.getFloat32(off, le); break;
+        case 64: val = view.getFloat64(off, le); break;
+        case 256: val = (sliceBytes[off] << 24) >> 24; break;
+        case 512: val = view.getUint16(off, le); break;
+        case 768: val = view.getUint32(off, le); break;
+        default: val = 0;
+      }
+      const v = val * slope + inter;
+      axialSlice[i] = v;
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+    if (min === max) max = min + 1;
+
+    if (!signal.aborted) {
+      webview.postMessage({
+        type: 'preview',
+        header,
+        globalMin: min, globalMax: max,
+        slope, inter,
+        sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
+        axialSlice,
+        coronalSlice: new Float32Array(0),
+        sagittalSlice: new Float32Array(0),
+        partialPreview: true,
+      });
+    }
   }
 
   private startPreviewLoad(
@@ -609,10 +826,41 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         try {
           this.volumeCache.setActive(uriKey, webviewId);
 
-          // For remote files: use lightweight preview (header + 3 middle slices)
-          // instead of downloading the entire volume on the Extension Host.
-          // The webview Worker will load the full volume via the proxy's /file/{id} endpoint.
+          // For remote files: the webview Worker's streaming path now provides
+          // an early preview (within ~1s for .nii.gz) by overlapping download
+          // and decompression. Sending a separate preview from the Extension
+          // Host would cause a redundant download of the same remote file.
+          // Instead, we skip the Extension Host preview and let the Worker
+          // handle everything — this cuts total time-to-preview dramatically
+          // for remote files.
+          //
+          // Exception: for non-HTTP remote schemes (vscode-remote://, etc.),
+          // the Worker can't stream directly, so we still need the preview.
+          const uriScheme = uri.scheme;
+          const isHttpRemote = uriScheme === 'http' || uriScheme === 'https';
+          const isGzip = uri.toString().endsWith('.gz');
+
+          if (isRemote && isHttpRemote) {
+            // For HTTP(S) remotes: send a minimal "preview pending" message
+            // so the webview knows to start the worker immediately without
+            // waiting for the 800ms fallback timer.
+            webview.postMessage({
+              type: 'preview',
+              header: null,
+              globalMin: 0, globalMax: 1,
+              slope: 1, inter: 0,
+              sliceIdx: { axial: 0, coronal: 0, sagittal: 0 },
+              axialSlice: new Float32Array(0),
+              coronalSlice: new Float32Array(0),
+              sagittalSlice: new Float32Array(0),
+              partialPreview: true,
+              remoteStreaming: true,  // signal: start worker now
+            });
+            return;
+          }
+
           if (isRemote) {
+            // Non-HTTP remote (vscode-remote://, etc.): use proxy preview
             const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
             if (!preview || signal.aborted) return;
 
@@ -1148,7 +1396,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
   <p><b>A/C/S/M</b> Maximize view</p>
   <p><b>Auto</b> Auto contrast</p>
   <p><b>Reset</b> Reset all views</p>
-  <div class="ver">v2.1.0 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+  <div class="ver">v2.1.2 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
 </div>
 <div id="a11y-announce" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)"></div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>

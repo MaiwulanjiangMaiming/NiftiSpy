@@ -16,6 +16,7 @@ interface VolumeImage {
   url: string;
   slope: number;
   inter: number;
+  colormap: string;
   preview?: {
     axial: Float32Array;
     coronal: Float32Array;
@@ -52,6 +53,9 @@ interface PerformanceProfile {
 }
 
 type RenderBackend = 'webgpu' | 'webgl3d' | 'webgl2d' | 'canvas2d';
+type TypedArray = Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+
+const DEBUG = typeof window !== 'undefined' && typeof URLSearchParams !== 'undefined' && new URLSearchParams(window.location.search).has('debug');
 
 const images: VolumeImage[] = [];
 let activeImageIdx = 0;
@@ -60,6 +64,7 @@ let compareMode = false;
 let header: NiiHeader | null = null;
 let volumeData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | null = null;
 let sharedVolumeBuffer: SharedArrayBuffer | null = null;
+let offscreenCanvas2D: HTMLCanvasElement | null = null;
 let sabAvailable = false;
 
 try { sabAvailable = typeof SharedArrayBuffer !== 'undefined'; } catch { sabAvailable = false; }
@@ -80,12 +85,16 @@ function verifySABSupport(): boolean {
 // Verify SAB support on load
 verifySABSupport();
 
-function createSharedVolumeBuffer(data: Float32Array): SharedArrayBuffer | null {
+function createSharedVolumeBuffer(data: any /* TypedArray */): SharedArrayBuffer | null {
   if (!sabAvailable) return null;
   try {
-    const sab = new SharedArrayBuffer(data.byteLength);
-    const view = new Float32Array(sab);
-    view.set(data);
+    // Reserve 8 bytes at the front for metadata (avoid corrupting first voxel)
+    const HEADER_BYTES = 8;
+    const sab = new SharedArrayBuffer(HEADER_BYTES + data.byteLength);
+    // Write body after header
+    const bodyBytes = new Uint8Array(sab, HEADER_BYTES);
+    const srcBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    bodyBytes.set(srcBytes);
     return sab;
   } catch {
     return null;
@@ -364,54 +373,36 @@ let webgpuAvailable = false;
 let webgpuChecked = false;
 let renderBackend: RenderBackend = 'canvas2d';
 
-async function detectBestRenderBackend(): Promise<RenderBackend> {
-  // 1. Try WebGPU: request adapter
-  try {
-    if (typeof navigator !== 'undefined' && navigator.gpu) {
-      const adapter = await navigator.gpu.requestAdapter();
-      if (adapter) return 'webgpu';
-    }
-  } catch { }
-
-  // 2. Try WebGL2 3D texture
+// Sync detection: WebGL2 getContext is synchronous — no need for async.
+// WebGPU is checked asynchronously later (non-blocking, graceful upgrade).
+function detectBestRenderBackendSync(): RenderBackend {
   try {
     const testCanvas = document.createElement('canvas');
     const gl2 = testCanvas.getContext('webgl2') as WebGL2RenderingContext | null;
     if (gl2) {
       const max3D = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE) || 0;
-      if (max3D >= 256) {
-        return 'webgl3d';
-      }
-      // 3. WebGL2 available but no 3D texture
+      if (max3D >= 256) return 'webgl3d';
       return 'webgl2d';
     }
   } catch { }
-
-  // 4. Fallback to Canvas 2D
   return 'canvas2d';
 }
 
 function applyRenderBackend(configValue: string): void {
   if (configValue === 'auto') {
-    detectBestRenderBackend().then((backend) => {
-      renderBackend = backend;
-    });
-  } else if (configValue === 'webgl') {
-    // Manual override: pick best WebGL variant
-    try {
-      const testCanvas = document.createElement('canvas');
-      const gl2 = testCanvas.getContext('webgl2') as WebGL2RenderingContext | null;
-      if (gl2) {
-        const max3D = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE) || 0;
-        renderBackend = max3D >= 256 ? 'webgl3d' : 'webgl2d';
-      } else {
-        renderBackend = 'canvas2d';
-      }
-    } catch {
-      renderBackend = 'canvas2d';
+    // Synchronous detection — ensures renderBackend is set before first render
+    renderBackend = detectBestRenderBackendSync();
+    // Async WebGPU upgrade (non-blocking)
+    if (typeof navigator !== 'undefined' && navigator.gpu) {
+      navigator.gpu.requestAdapter().then(adapter => {
+        if (adapter && renderBackend !== 'webgpu') {
+          renderBackend = 'webgpu';
+        }
+      }).catch(() => {});
     }
+  } else if (configValue === 'webgl') {
+    renderBackend = detectBestRenderBackendSync();
   } else {
-    // 'canvas' manual override
     renderBackend = 'canvas2d';
   }
 }
@@ -420,7 +411,8 @@ applyRenderBackend('auto');
 
 let volumeRaycaster: VolumeRaycaster | null = null;
 let renderMode: 'slice' | 'volume' = 'slice';
-let volumeRotationMatrix = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
+let mipInitialized = false; // lazy init: MIP panel content rendered on demand
+let volumeRotationMatrix = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]) as Float32Array;
 let volumeZoom = 1.0;
 let isDraggingVolume = false;
 let lastVolumeMouseX = 0;
@@ -563,6 +555,21 @@ class WebGLRenderer {
   private animatingSliceIdx: Record<string, number> = { axial: 0, coronal: 0, sagittal: 0 };
   private animationFrameId: number | null = null;
   private static readonly SLICE_LERP_SPEED = 0.25;
+  // Cached uniform locations for renderSlice3D
+  private u3d_volume: WebGLUniformLocation | null = null;
+  private u3d_colormap: WebGLUniformLocation | null = null;
+  private u3d_windowLevel: WebGLUniformLocation | null = null;
+  private u3d_windowWidth: WebGLUniformLocation | null = null;
+  private u3d_sliceIndex: WebGLUniformLocation | null = null;
+  private u3d_axis: WebGLUniformLocation | null = null;
+  private u3d_volumeSize: WebGLUniformLocation | null = null;
+  private u3d_flipX: WebGLUniformLocation | null = null;
+  private u3d_flipY: WebGLUniformLocation | null = null;
+  private u3d_slope: WebGLUniformLocation | null = null;
+  private u3d_inter: WebGLUniformLocation | null = null;
+  private u3d_programCached: WebGLProgram | null = null;
+  // Cached LUT data buffer
+  private cachedLutData: Uint8Array = new Uint8Array(256 * 4);
 
   private vertexShaderSource = `#version 100
 attribute vec2 a_position;
@@ -634,6 +641,8 @@ uniform int u_axis;
 uniform vec3 u_volumeSize;
 uniform int u_flipX;
 uniform int u_flipY;
+uniform float u_slope;
+uniform float u_inter;
 out vec4 fragColor;
 void main() {
   float fx = (u_flipX == 1) ? 1.0 - v_texCoord.x : v_texCoord.x;
@@ -647,8 +656,9 @@ void main() {
     uvw = vec3(u_sliceIndex / u_volumeSize.x, fx, fy);
   }
   float rawValue = texture(u_volume, uvw).r;
+  float scaledValue = rawValue * u_slope + u_inter;
   float lo = u_windowLevel - u_windowWidth * 0.5;
-  float t = clamp((rawValue - lo) / u_windowWidth, 0.0, 1.0);
+  float t = clamp((scaledValue - lo) / u_windowWidth, 0.0, 1.0);
   vec4 color = texture(u_colormap, vec2(t, 0.5));
   fragColor = color;
 }`;
@@ -847,14 +857,26 @@ void main() {
     return true;
   }
 
-  uploadVolume3D(data: Float32Array, nx: number, ny: number, nz: number): boolean {
+  uploadVolume3D(data: TypedArray, nx: number, ny: number, nz: number): boolean {
     if (!this.isWebGL2 || !this.program3D) return false;
     const gl2 = this.gl as WebGL2RenderingContext;
 
     const max3DSize = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE);
     if (nx > max3DSize || ny > max3DSize || nz > max3DSize) return false;
 
-    const estimatedBytes = nx * ny * nz * 4;
+    // Map JS TypedArray to WebGL type constant
+    let glType: number;
+    const bytesPerVoxel = data.BYTES_PER_ELEMENT;
+    if (data instanceof Uint8Array) glType = gl2.UNSIGNED_BYTE;
+    else if (data instanceof Int8Array) glType = gl2.BYTE;
+    else if (data instanceof Int16Array) glType = gl2.SHORT;
+    else if (data instanceof Uint16Array) glType = gl2.UNSIGNED_SHORT;
+    else if (data instanceof Int32Array) glType = gl2.INT;
+    else if (data instanceof Uint32Array) glType = gl2.UNSIGNED_INT;
+    else if (data instanceof Float32Array) glType = gl2.FLOAT;
+    else return false; // Unsupported type (e.g. Float64Array)
+
+    const estimatedBytes = nx * ny * nz * bytesPerVoxel;
     const maxTextureSize = gl2.getParameter(gl2.MAX_TEXTURE_SIZE);
     const availableMB = (maxTextureSize * maxTextureSize * 4) / (1024 * 1024);
     if (estimatedBytes > availableMB * 1024 * 1024) return false;
@@ -889,14 +911,17 @@ void main() {
     gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_R, gl2.CLAMP_TO_EDGE);
 
     try {
-      gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, nz, 0, gl2.RED, gl2.FLOAT, data);
+      // Use R32F internal format so WebGL auto-converts integer data to float.
+      // This lets the shader use sampler3D (float) while uploading native types
+      // (half the bandwidth for int16, quarter for uint8 vs manual float32).
+      gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, nz, 0, gl2.RED, glType, data);
     } catch {
       gl2.deleteTexture(this.texture3D);
       this.texture3D = null;
       return false;
     }
 
-    if (gl2.getError() !== gl2.NO_ERROR) {
+    if (DEBUG && gl2.getError() !== gl2.NO_ERROR) {
       gl2.deleteTexture(this.texture3D);
       this.texture3D = null;
       return false;
@@ -908,11 +933,12 @@ void main() {
     return true;
   }
 
-  private uploadVolume3DChunked(data: Float32Array, nx: number, ny: number, nz: number): boolean {
+  private uploadVolume3DChunked(data: TypedArray, nx: number, ny: number, nz: number): boolean {
     const gl2 = this.gl as WebGL2RenderingContext;
     // Determine chunk size: split along Z axis
     const sliceSize = nx * ny;
-    const bytesPerSlice = sliceSize * 4;
+    const bytesPerVoxel = data.BYTES_PER_ELEMENT;
+    const bytesPerSlice = sliceSize * bytesPerVoxel;
     const targetChunkBytes = 256 * 1024 * 1024; // 256MB per chunk
     const slicesPerChunk = Math.max(1, Math.floor(targetChunkBytes / bytesPerSlice));
     const numChunks = Math.ceil(nz / slicesPerChunk);
@@ -925,6 +951,17 @@ void main() {
     this.chunkNz = nz;
 
     const filter = this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
+
+    // Map JS TypedArray to WebGL type constant
+    let glType: number;
+    if (data instanceof Uint8Array) glType = gl2.UNSIGNED_BYTE;
+    else if (data instanceof Int8Array) glType = gl2.BYTE;
+    else if (data instanceof Int16Array) glType = gl2.SHORT;
+    else if (data instanceof Uint16Array) glType = gl2.UNSIGNED_SHORT;
+    else if (data instanceof Int32Array) glType = gl2.INT;
+    else if (data instanceof Uint32Array) glType = gl2.UNSIGNED_INT;
+    else if (data instanceof Float32Array) glType = gl2.FLOAT;
+    else return false;
 
     for (let c = 0; c < numChunks; c++) {
       const zStart = c * slicesPerChunk;
@@ -943,7 +980,7 @@ void main() {
       gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_R, gl2.CLAMP_TO_EDGE);
 
       try {
-        gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, chunkDepth, 0, gl2.RED, gl2.FLOAT, chunkData);
+        gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, chunkDepth, 0, gl2.RED, glType, chunkData);
       } catch {
         // Clean up already created chunk textures
         for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
@@ -953,7 +990,7 @@ void main() {
         return false;
       }
 
-      if (gl2.getError() !== gl2.NO_ERROR) {
+      if (DEBUG && gl2.getError() !== gl2.NO_ERROR) {
         for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
         this.texture3DChunks = [];
         this.chunkCount = 0;
@@ -981,7 +1018,8 @@ void main() {
 
   renderSlice3D(canvas: HTMLCanvasElement, axis: number, sliceIndex: number,
     nx: number, ny: number, nz: number, lo: number, range: number,
-    cmapName: string, flipX: boolean = false, flipY: boolean = false): boolean {
+    cmapName: string, flipX: boolean = false, flipY: boolean = false,
+    slope: number = 1, inter: number = 0): boolean {
     if (!this.volume3DReady || !this.program3D || !this.isWebGL2) return false;
     const gl2 = this.gl as WebGL2RenderingContext;
 
@@ -996,7 +1034,10 @@ void main() {
     gl2.activeTexture(gl2.TEXTURE0);
     if (this.chunkCount > 0) {
       // Chunked: select the correct chunk based on slice index
-      const effectiveSliceZ = axis === 0 ? sliceIndex : axis === 1 ? sliceIndex : sliceIndex;
+      // TODO: For axis=1 (coronal), sliceIndex is y-direction index but chunks are split along z.
+      //       The effectiveSliceZ should ideally be the z-coordinate, not the sliceIndex.
+      //       Currently all branches resolve to sliceIndex, which may be incorrect for non-axial views.
+      const effectiveSliceZ = sliceIndex;
       const chunkIdx = Math.min(Math.floor(effectiveSliceZ / this.chunkZSize), this.chunkCount - 1);
       const tex = this.texture3DChunks[chunkIdx];
       if (!tex) return false;
@@ -1015,15 +1056,32 @@ void main() {
     gl2.activeTexture(gl2.TEXTURE1);
     gl2.bindTexture(gl2.TEXTURE_2D, this.colormapTexture);
 
-    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_volume'), 0);
-    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_colormap'), 1);
-    gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_windowLevel'), lo + range * 0.5);
-    gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_windowWidth'), range);
-    gl2.uniform1f(gl2.getUniformLocation(this.program3D, 'u_sliceIndex'), sliceIndex);
-    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_axis'), axis);
-    gl2.uniform3f(gl2.getUniformLocation(this.program3D, 'u_volumeSize'), nx, ny, nz);
-    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_flipX'), flipX ? 1 : 0);
-    gl2.uniform1i(gl2.getUniformLocation(this.program3D, 'u_flipY'), flipY ? 1 : 0);
+    // Cache uniform locations (program may change between calls)
+    if (this.u3d_programCached !== this.program3D) {
+      this.u3d_volume = gl2.getUniformLocation(this.program3D, 'u_volume');
+      this.u3d_colormap = gl2.getUniformLocation(this.program3D, 'u_colormap');
+      this.u3d_windowLevel = gl2.getUniformLocation(this.program3D, 'u_windowLevel');
+      this.u3d_windowWidth = gl2.getUniformLocation(this.program3D, 'u_windowWidth');
+      this.u3d_sliceIndex = gl2.getUniformLocation(this.program3D, 'u_sliceIndex');
+      this.u3d_axis = gl2.getUniformLocation(this.program3D, 'u_axis');
+      this.u3d_volumeSize = gl2.getUniformLocation(this.program3D, 'u_volumeSize');
+      this.u3d_flipX = gl2.getUniformLocation(this.program3D, 'u_flipX');
+      this.u3d_flipY = gl2.getUniformLocation(this.program3D, 'u_flipY');
+      this.u3d_slope = gl2.getUniformLocation(this.program3D, 'u_slope');
+      this.u3d_inter = gl2.getUniformLocation(this.program3D, 'u_inter');
+      this.u3d_programCached = this.program3D;
+    }
+    gl2.uniform1i(this.u3d_volume, 0);
+    gl2.uniform1i(this.u3d_colormap, 1);
+    gl2.uniform1f(this.u3d_windowLevel, lo + range * 0.5);
+    gl2.uniform1f(this.u3d_windowWidth, range);
+    gl2.uniform1f(this.u3d_sliceIndex, sliceIndex);
+    gl2.uniform1i(this.u3d_axis, axis);
+    gl2.uniform3f(this.u3d_volumeSize, nx, ny, nz);
+    gl2.uniform1i(this.u3d_flipX, flipX ? 1 : 0);
+    gl2.uniform1i(this.u3d_flipY, flipY ? 1 : 0);
+    gl2.uniform1f(this.u3d_slope, slope);
+    gl2.uniform1f(this.u3d_inter, inter);
 
     const aPos = gl2.getAttribLocation(this.program3D, 'a_position');
     const aTex = gl2.getAttribLocation(this.program3D, 'a_texCoord');
@@ -1046,7 +1104,7 @@ void main() {
     if (!this.isWebGL2 || !this.gl) return;
     const gl2 = this.gl as WebGL2RenderingContext;
     const cmapFn = COLORMAPS[cmapName] || COLORMAPS.gray;
-    const lutData = new Uint8Array(256 * 4);
+    const lutData = this.cachedLutData;
     for (let i = 0; i < 256; i++) {
       const t = i / 255;
       const [r, g, b] = cmapFn(t);
@@ -1082,7 +1140,7 @@ void main() {
   private updateLUT(cmapName: string): void {
     const gl = this.gl!;
     const cmapFn = COLORMAPS[cmapName] || COLORMAPS.gray;
-    const lutData = new Uint8Array(256 * 4);
+    const lutData = this.cachedLutData;
     for (let i = 0; i < 256; i++) {
       const t = i / 255;
       const [r, g, b] = cmapFn(t);
@@ -1733,7 +1791,7 @@ function tryUploadVolume3D() {
   if (!volumeData || !header) return;
   const { nx, ny, nz } = header;
   const n = nx * ny * nz;
-  const estimatedBytes = n * 4; // Float32 = 4 bytes per voxel
+  const estimatedBytes = n * volumeData.BYTES_PER_ELEMENT;
 
   // Skip 3D texture upload if volume exceeds 1GB to prevent GPU OOM
   const VOLUME_3D_MAX_BYTES = 1 * 1024 * 1024 * 1024; // 1GB
@@ -1742,30 +1800,29 @@ function tryUploadVolume3D() {
     console.log(`[NiftiSpy] Skipping 3D texture upload: volume size ${(estimatedBytes / (1024 * 1024)).toFixed(0)}MB exceeds 1GB limit`);
   }
 
-  let float32Data: Float32Array;
-  if (volumeData instanceof Float32Array) {
-    float32Data = volumeData;
-  } else {
-    float32Data = new Float32Array(n);
-    for (let i = 0; i < n; i++) float32Data[i] = (volumeData as any)[i] * dataSlope + dataInter;
-  }
-
-  sharedVolumeBuffer = createSharedVolumeBuffer(float32Data);
+  // Upload native typed array directly — no CPU-side float32 conversion.
+  // WebGL2 auto-converts integer types to float in the texture (R32F internal).
+  sharedVolumeBuffer = createSharedVolumeBuffer(volumeData);
   if (sharedVolumeBuffer) {
     broadcastToSliceWorkers({
       type: 'sharedVolume',
       buffer: sharedVolumeBuffer,
       nx, ny, nz,
       slope: dataSlope, inter: dataInter,
+      datatype: header.datatype,
     });
   }
 
   if (!skipVolume3D) {
+    // Convert Float64 to Float32 for GPU upload (extremely rare datatype)
+    const gpuData = volumeData instanceof Float64Array
+      ? Float32Array.from(volumeData)
+      : volumeData as any;
     for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
       const r = glRenderers[axis];
       if (r) {
         if (!r.isVolume3DReady()) {
-          r.uploadVolume3D(float32Data, nx, ny, nz);
+          r.uploadVolume3D(gpuData, nx, ny, nz);
         }
         // Try enabling OffscreenCanvas for this axis (only for WebGL2 3D texture path)
         if (r.isVolume3DReady() && !offscreenCanvasEnabled[axis]) {
@@ -1774,16 +1831,23 @@ function tryUploadVolume3D() {
       }
       const wgr = webgpuRenderers[axis];
       if (wgr && wgr.isReady()) {
-        wgr.uploadVolume3D(float32Data, nx, ny, nz);
+        wgr.uploadVolume3D(gpuData, nx, ny, nz);
       }
     }
   }
 
-  if (!volumeRaycaster) {
-    initVolumeRaycaster();
-  }
-  if (volumeRaycaster) {
-    volumeRaycaster.uploadVolume(float32Data, nx, ny, nz);
+  // Lazy-init VolumeRaycaster only when user switches to volume mode
+  // Avoids wasting GPU memory + upload time for the common slice-only workflow
+  if (renderMode === 'volume' || mipInitialized) {
+    if (!volumeRaycaster) {
+      initVolumeRaycaster();
+    }
+    if (volumeRaycaster) {
+      const gpuData = volumeData instanceof Float64Array
+        ? Float32Array.from(volumeData)
+        : volumeData as any;
+      volumeRaycaster.uploadVolume(gpuData, nx, ny, nz);
+    }
   }
 }
 
@@ -2469,7 +2533,7 @@ function setupVolumeInteraction(): void {
     const currY = 1 - (2 * (e.clientY - rect.top)) / rect.height;
 
     const deltaRot = VolumeRaycaster.arcballRotation(prevX, prevY, currX, currY);
-    volumeRotationMatrix = multiply4x4(deltaRot, volumeRotationMatrix);
+    volumeRotationMatrix = multiply4x4(deltaRot as Float32Array, volumeRotationMatrix as Float32Array) as Float32Array;
     renderVolume3D();
   });
 
@@ -2486,17 +2550,79 @@ function setupVolumeInteraction(): void {
   }, { passive: false });
 }
 
-function multiply4x4(a: Float32Array, b: Float32Array): Float32Array {
+function multiply4x4(a: Float32Array | ArrayLike<number>, b: Float32Array | ArrayLike<number>): Float32Array {
   const out = new Float32Array(16);
+  const aa = a as ArrayLike<number>, bb = b as ArrayLike<number>;
   for (let i = 0; i < 4; i++) {
     for (let j = 0; j < 4; j++) {
       out[i * 4 + j] = 0;
       for (let k = 0; k < 4; k++) {
-        out[i * 4 + j] += a[i * 4 + k] * b[k * 4 + j];
+        out[i * 4 + j] += aa[i * 4 + k] * bb[k * 4 + j];
       }
     }
   }
   return out;
+}
+
+// GPU-only slice rendering — skips CPU extractSlice entirely.
+// Only used when WebGL3D/WebGPU texture is uploaded and ready.
+function paintSlice3D(axis: string, w: number, h: number, pixelW: number, pixelH: number) {
+  fpsCounter.recordFrame();
+  if (!header) return;
+
+  const canvas = canvases[axis as keyof typeof canvases];
+  if (!canvas) return;
+
+  const vs = viewState[axis as keyof typeof viewState] as { zoom: number; panX: number; panY: number };
+  const zoom = vs.zoom;
+  const panX = vs.panX;
+  const panY = vs.panY;
+
+  const dpr = window.devicePixelRatio || 1;
+  const container = canvas.parentElement!;
+  const dw = container.clientWidth;
+  const dh = container.clientHeight;
+  if (dw === 0 || dh === 0) return;
+
+  const ar = pixelW / pixelH;
+  let cw: number, ch: number;
+  if (dw / dh > ar) { ch = dh; cw = Math.floor(dh * ar); }
+  else { cw = dw; ch = Math.floor(dw / ar); }
+
+  cw = Math.floor(cw * zoom);
+  ch = Math.floor(ch * zoom);
+
+  canvas.style.width = dw + 'px';
+  canvas.style.height = dh + 'px';
+  canvas.width = dw * dpr;
+  canvas.height = dh * dpr;
+
+  const renderer = getOrCreateRenderer(axis as Axis);
+  const flips = viewFlips[axis] || { flipX: false, flipY: false };
+  const axisIdx = axis === 'axial' ? 0 : axis === 'coronal' ? 1 : 2;
+
+  const webgpuRenderer = webgpuRenderers[axis as Axis];
+  if (renderBackend === 'webgpu' && webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
+    axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz,
+    windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY
+  )) {
+    updateDirectionLabels(axis);
+    updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+    updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+    updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+    return;
+  }
+
+  if (renderer && renderer.renderSlice3D(canvas, axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY, dataSlope, dataInter)) {
+    updateDirectionLabels(axis);
+    updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+    updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+    updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+    return;
+  }
+
+  // Should not reach here if volume3D is ready, but fallback gracefully
+  paintSlice(axis, extractSlice(axis as 'axial' | 'coronal' | 'sagittal', sliceIdx[axis as Axis]), w, h, pixelW, pixelH);
 }
 
 function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixelW: number, pixelH: number) {
@@ -2576,7 +2702,7 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
       return;
     }
 
-    if (renderer.renderSlice3D(canvas, axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY)) {
+    if (renderer.renderSlice3D(canvas, axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz, windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY, dataSlope, dataInter)) {
       updateDirectionLabels(axis);
       updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
       updateScaleBar(axis, pixelW, pixelH, zoom, cw);
@@ -2611,31 +2737,30 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   const dataRange = globalMax - globalMin || 1;
   const n = w * h;
 
-  // Apply window/level normalization to Uint8
-  // Try WASM SIMD path first (4x parallel f32 processing)
-  const normalized = new Uint8Array(n);
+  // Normalize + colormap: merge into single pass to avoid double iteration
   const wasm = getWasmBindings();
   if (wasm && data instanceof Float32Array) {
-    normalized.set(wasm.applyWindowLevel(data, lo, range, globalMin, globalMax));
+    const normalized = wasm.applyWindowLevel(data, lo, range, globalMin, globalMax);
+    for (let i = 0; i < n; i++) {
+      const t = normalized[i] / 255;
+      const [r, g, b] = cmapFn(t);
+      const idx = i * 4;
+      pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
+    }
   } else {
+    // Single-pass: normalize + colormap in one loop
     for (let i = 0; i < n; i++) {
       const norm = (data[i] - globalMin) / dataRange;
       const t = Math.max(0, Math.min(1, (norm - lo) / range));
-      normalized[i] = (t * 255 + 0.5) | 0;
+      const [r, g, b] = cmapFn(t);
+      const idx = i * 4;
+      pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
     }
   }
 
-  // Apply colormap to normalized values
-  for (let i = 0; i < n; i++) {
-    const t = normalized[i] / 255;
-    const [r, g, b] = cmapFn(t);
-    const idx = i * 4;
-    pixels[idx] = r; pixels[idx + 1] = g; pixels[idx + 2] = b; pixels[idx + 3] = 255;
-  }
-
-  const tc = document.createElement('canvas');
-  tc.width = w; tc.height = h;
-  const tctx = tc.getContext('2d')!;
+  if (!offscreenCanvas2D) offscreenCanvas2D = document.createElement('canvas');
+  offscreenCanvas2D.width = w; offscreenCanvas2D.height = h;
+  const tctx = offscreenCanvas2D.getContext('2d')!;
   tctx.putImageData(imgData, 0, 0);
 
   ctx.fillStyle = '#000';
@@ -2651,7 +2776,7 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   ctx.save();
   ctx.translate(finalOffsetX, finalOffsetY);
   ctx.scale(finalScaleX, finalScaleY);
-  ctx.drawImage(tc, 0, 0);
+  ctx.drawImage(offscreenCanvas2D, 0, 0);
   ctx.restore();
 
   updateDirectionLabels(axis);
@@ -2749,30 +2874,28 @@ function computeOrientationFromQform(h: any): string {
   return computeOrientationFromSform(scaled_x, scaled_y, scaled_z);
 }
 
-function computeViewFlips() {
-  if (!header) return;
-  const srow_x = header.srow_x;
-  const srow_y = header.srow_y;
-  const srow_z = header.srow_z;
+function computeFlipsForHeader(h: NiiHeader) {
+  const srow_x = h.srow_x;
+  const srow_y = h.srow_y;
+  const srow_z = h.srow_z;
 
   const xDir = getAnatomicalAxisDir(srow_x);
   const yDir = getAnatomicalAxisDir(srow_y);
   const zDir = getAnatomicalAxisDir(srow_z);
 
-  viewFlips.axial = {
-    flipX: xDir.dir > 0,
-    flipY: yDir.dir < 0
+  return {
+    axial: { flipX: xDir.dir > 0, flipY: yDir.dir < 0 },
+    coronal: { flipX: xDir.dir > 0, flipY: zDir.dir < 0 },
+    sagittal: { flipX: yDir.dir > 0, flipY: zDir.dir < 0 }
   };
+}
 
-  viewFlips.coronal = {
-    flipX: xDir.dir > 0,
-    flipY: zDir.dir < 0
-  };
-
-  viewFlips.sagittal = {
-    flipX: yDir.dir > 0,
-    flipY: zDir.dir < 0
-  };
+function computeViewFlips() {
+  if (!header) return;
+  const flips = computeFlipsForHeader(header);
+  viewFlips.axial = flips.axial;
+  viewFlips.coronal = flips.coronal;
+  viewFlips.sagittal = flips.sagittal;
 }
 
 // ITK-Snap style letter mapping: [anatomical axis][direction index]
@@ -3070,10 +3193,21 @@ function renderAllViews() {
   }
 
   if (volumeData) {
-    paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
-    paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, nx * dx, nz * dz);
-    paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
-    paintMIP();
+    // When WebGL3D/WebGPU texture is ready, skip CPU extractSlice — GPU samples directly
+    const renderer3D = glRenderers.axial;
+    const hasVolume3D = renderer3D && renderer3D.isVolume3DReady() &&
+      renderBackend !== 'canvas2d' && renderBackend !== 'webgl2d';
+    if (hasVolume3D) {
+      // GPU path: paintSlice3D uses 3D texture sampling, no CPU extraction needed
+      paintSlice3D('axial', nx, ny, nx * dx, ny * dy);
+      paintSlice3D('coronal', nx, nz, nx * dx, nz * dz);
+      paintSlice3D('sagittal', ny, nz, ny * dy, nz * dz);
+    } else {
+      paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
+      paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, nx * dx, nz * dz);
+      paintSlice('sagittal', extractSlice('sagittal', sliceIdx.sagittal), ny, nz, ny * dy, nz * dz);
+    }
+    if (mipInitialized) paintMIP();
   } else {
     // LOD-aware rendering: use best available LOD level
     for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
@@ -3218,7 +3352,7 @@ function renderCompareViews(changedAxis?: 'axial' | 'coronal' | 'sagittal') {
     if (sbsR) { sbsR.textContent = img1.name; sbsR.style.display = compareLayout === 'sideBySide' ? '' : 'none'; }
   }
   if (!changedAxis) {
-    paintMIP();
+    if (mipInitialized) paintMIP();
     updateAllInfo();
   }
 }
@@ -3367,7 +3501,10 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
 
-  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, colormap, true);
+  const flips0 = img0.header ? computeFlipsForHeader(img0.header)[axis as 'axial' | 'coronal' | 'sagittal'] : { flipX: false, flipY: false };
+  const flips1 = img1.header ? computeFlipsForHeader(img1.header)[axis as 'axial' | 'coronal' | 'sagittal'] : { flipX: false, flipY: false };
+
+  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, img0.colormap, true);
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -3378,18 +3515,22 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   // Draw base image (img0) scaled to unified physical extent
   ctx.save();
   ctx.translate(offsetX, offsetY);
-  ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
+  ctx.scale(flips0.flipX ? -cw * dpr / w0 : cw * dpr / w0, flips0.flipY ? ch * dpr / h0_ : -ch * dpr / h0_);
+  if (flips0.flipX) ctx.translate(-w0, 0);
+  if (flips0.flipY) ctx.translate(0, -h0_);
   ctx.globalAlpha = 1.0;
   ctx.drawImage(tc0, 0, 0);
   ctx.restore();
 
   // Draw overlay image (img1) using pre-registered data1
   if (data1 && data1.length > 0) {
-    const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, overlayColormap);
+    const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap);
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
-    ctx.scale(cw * dpr / w1, -ch * dpr / h1_);
+    ctx.scale(flips1.flipX ? -cw * dpr / w1 : cw * dpr / w1, flips1.flipY ? ch * dpr / h1_ : -ch * dpr / h1_);
+    if (flips1.flipX) ctx.translate(-w1, 0);
+    if (flips1.flipY) ctx.translate(0, -h1_);
     ctx.globalAlpha = overlayOpacity;
     ctx.drawImage(tc1, 0, 0);
     ctx.restore();
@@ -3440,27 +3581,45 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
 
-  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, colormap);
-  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, overlayColormap);
+  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, img0.colormap);
+  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap);
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Left half: img0 with unified scale
-  const offsetX0 = (halfW * dpr - cw * dpr) / 2;
-  const offsetY0 = (dh * dpr + ch * dpr) / 2;
+  const flips0 = img0.header ? computeFlipsForHeader(img0.header)[axis as 'axial' | 'coronal' | 'sagittal'] : { flipX: false, flipY: false };
+  const flips1 = img1.header ? computeFlipsForHeader(img1.header)[axis as 'axial' | 'coronal' | 'sagittal'] : { flipX: false, flipY: false };
+
+  // Each half is clipped to its own rectangle so zooming/panning one image
+  // does not draw over the other image.
+  const imgLeft0 = (halfW - cw) / 2 + vs.panX;
+  const imgTop0 = (dh - ch) / 2 + vs.panY;
+  const offsetX0 = imgLeft0 * dpr;
+  const offsetY0 = (imgTop0 + ch) * dpr;
   ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, halfW * dpr, dh * dpr);
+  ctx.clip();
   ctx.translate(offsetX0, offsetY0);
-  ctx.scale(cw * dpr / w0, -ch * dpr / h0_);
+  ctx.scale(flips0.flipX ? -cw * dpr / w0 : cw * dpr / w0, flips0.flipY ? ch * dpr / h0_ : -ch * dpr / h0_);
+  if (flips0.flipX) ctx.translate(-w0, 0);
+  if (flips0.flipY) ctx.translate(0, -h0_);
   ctx.drawImage(tc0, 0, 0);
   ctx.restore();
 
   // Right half: img1 with unified scale (same physical size as img0)
-  const offsetX1 = halfW * dpr + (halfW * dpr - cw * dpr) / 2;
-  const offsetY1 = (dh * dpr + ch * dpr) / 2;
+  const imgLeft1 = halfW + (halfW - cw) / 2 + vs.panX;
+  const imgTop1 = (dh - ch) / 2 + vs.panY;
+  const offsetX1 = imgLeft1 * dpr;
+  const offsetY1 = (imgTop1 + ch) * dpr;
   ctx.save();
+  ctx.beginPath();
+  ctx.rect(halfW * dpr, 0, (dw - halfW) * dpr, dh * dpr);
+  ctx.clip();
   ctx.translate(offsetX1, offsetY1);
-  ctx.scale(cw * dpr / w1, -ch * dpr / h1_);
+  ctx.scale(flips1.flipX ? -cw * dpr / w1 : cw * dpr / w1, flips1.flipY ? ch * dpr / h1_ : -ch * dpr / h1_);
+  if (flips1.flipX) ctx.translate(-w1, 0);
+  if (flips1.flipY) ctx.translate(0, -h1_);
   ctx.drawImage(tc1, 0, 0);
   ctx.restore();
 
@@ -3485,11 +3644,13 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
     const cx0 = sliceX0 / (nx0 - 1 || 1);
     const cy0 = sliceY0 / (ny0 - 1 || 1);
 
-    // Use unified cw/ch for crosshair positioning
-    const imgLeft0 = (halfW - cw) / 2 - vs.panX;
-    const imgTop0 = (dh - ch) / 2 - vs.panY;
-    const sx0 = (imgLeft0 + cx0 * cw) * dpr;
-    const sy0 = (imgTop0 + (1 - cy0) * ch) * dpr;
+    // Use unified cw/ch for crosshair positioning (same pan as rendering)
+    const imgLeft0 = (halfW - cw) / 2 + vs.panX;
+    const imgTop0 = (dh - ch) / 2 + vs.panY;
+    const cx0_screen = flips0.flipX ? 1 - cx0 : cx0;
+    const cy0_screen = flips0.flipY ? cy0 : 1 - cy0;
+    const sx0 = (imgLeft0 + cx0_screen * cw) * dpr;
+    const sy0 = (imgTop0 + cy0_screen * ch) * dpr;
 
     ctx.strokeStyle = 'rgba(255,0,0,0.6)';
     ctx.lineWidth = 1 * dpr;
@@ -3510,11 +3671,13 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
     const cx1 = Math.max(0, Math.min(1, sliceX1 / (nx1 - 1 || 1)));
     const cy1 = Math.max(0, Math.min(1, sliceY1 / (ny1 - 1 || 1)));
 
-    // Use unified cw/ch for crosshair positioning
-    const imgLeft1 = halfW + (halfW - cw) / 2 - vs.panX;
-    const imgTop1 = (dh - ch) / 2 - vs.panY;
-    const sx1 = (imgLeft1 + cx1 * cw) * dpr;
-    const sy1 = (imgTop1 + (1 - cy1) * ch) * dpr;
+    // Use unified cw/ch for crosshair positioning (same pan as rendering)
+    const imgLeft1 = halfW + (halfW - cw) / 2 + vs.panX;
+    const imgTop1 = (dh - ch) / 2 + vs.panY;
+    const cx1_screen = flips1.flipX ? 1 - cx1 : cx1;
+    const cy1_screen = flips1.flipY ? cy1 : 1 - cy1;
+    const sx1 = (imgLeft1 + cx1_screen * cw) * dpr;
+    const sy1 = (imgTop1 + cy1_screen * ch) * dpr;
 
     ctx.strokeStyle = 'rgba(255,200,0,0.6)';
     ctx.lineWidth = 1 * dpr;
@@ -3601,7 +3764,16 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
   }
 
   if (volumeData) {
-    if (axis === 'axial') {
+    // Skip CPU extractSlice when 3D texture is ready
+    const renderer3D = glRenderers[axis as Axis];
+    const hasVolume3D = renderer3D && renderer3D.isVolume3DReady() &&
+      renderBackend !== 'canvas2d' && renderBackend !== 'webgl2d';
+    if (hasVolume3D) {
+      const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+      const pixelH = axis === 'axial' ? ny * dy : nz * dz;
+      paintSlice3D(axis, axis === 'axial' ? nx : axis === 'coronal' ? nx : ny,
+        axis === 'axial' ? ny : axis === 'coronal' ? nz : nz, pixelW, pixelH);
+    } else if (axis === 'axial') {
       paintSlice('axial', extractSlice('axial', sliceIdx.axial), nx, ny, nx * dx, ny * dy);
     } else if (axis === 'coronal') {
       paintSlice('coronal', extractSlice('coronal', sliceIdx.coronal), nx, nz, nx * dx, nz * dz);
@@ -3688,18 +3860,31 @@ function updateFileInfo() {
 }
 
 function autoContrast() {
-  if (!volumeData || globalMin === globalMax) return;
+  if (globalMin === globalMax) return;
 
-  const n = volumeData.length;
-  const sampleSize = Math.min(10000, n);
-  const step = Math.max(1, Math.floor(n / sampleSize));
-  const samples: number[] = [];
-  const s = dataSlope;
-  const t = dataInter;
-
-  for (let i = 0; i < n; i += step) {
-    samples.push(volumeData[i] * s + t);
+  let samples: number[] = [];
+  if (volumeData && volumeData.length > 0) {
+    const n = volumeData.length;
+    const sampleSize = Math.min(10000, n);
+    const step = Math.max(1, Math.floor(n / sampleSize));
+    const s = dataSlope;
+    const t = dataInter;
+    for (let i = 0; i < n; i += step) {
+      samples.push(volumeData[i] * s + t);
+    }
+  } else {
+    // Fallback to preview slices before the full volume is loaded
+    const addSlice = (slice: Float32Array | undefined) => {
+      if (!slice || slice.length === 0) return;
+      const step = Math.max(1, Math.floor(slice.length / 3000));
+      for (let i = 0; i < slice.length; i += step) samples.push(slice[i]);
+    };
+    addSlice(currentSlices.axial?.data);
+    addSlice(currentSlices.coronal?.data);
+    addSlice(currentSlices.sagittal?.data);
   }
+
+  if (samples.length === 0) return;
   samples.sort((a, b) => a - b);
 
   const p1Idx = Math.floor(samples.length * 0.01);
@@ -3776,7 +3961,9 @@ function renderColormapPreview() {
   if (!ctx) return;
   const w = canvas.width;
   const h = canvas.height;
-  const cmapFn = COLORMAPS[colormap];
+  const activeImg = images[activeImageIdx];
+  const activeColormap = activeImg?.colormap || colormap;
+  const cmapFn = COLORMAPS[activeColormap];
   if (!cmapFn) return;
   const imgData = ctx.createImageData(w, h);
   for (let x = 0; x < w; x++) {
@@ -3885,9 +4072,20 @@ function applyPreviewData(previewData: any) {
   sliceIdx.coronal = previewData.sliceIdx.coronal;
   sliceIdx.sagittal = previewData.sliceIdx.sagittal;
 
-  setCurrentSlice('axial', new Float32Array(previewData.slices.axial), header!.nx, header!.ny, 1);
-  setCurrentSlice('coronal', new Float32Array(previewData.slices.coronal), header!.nx, header!.nz, 1);
-  setCurrentSlice('sagittal', new Float32Array(previewData.slices.sagittal), header!.ny, header!.nz, 1);
+  // Reuse preview slice arrays directly — avoid unnecessary copy.
+  // If slices are empty (placeholder), skip them.
+  const axialSlice = previewData.slices.axial?.length > 0
+    ? (previewData.slices.axial instanceof Float32Array ? previewData.slices.axial : new Float32Array(previewData.slices.axial))
+    : null;
+  const coronalSlice = previewData.slices.coronal?.length > 0
+    ? (previewData.slices.coronal instanceof Float32Array ? previewData.slices.coronal : new Float32Array(previewData.slices.coronal))
+    : null;
+  const sagittalSlice = previewData.slices.sagittal?.length > 0
+    ? (previewData.slices.sagittal instanceof Float32Array ? previewData.slices.sagittal : new Float32Array(previewData.slices.sagittal))
+    : null;
+  if (axialSlice) setCurrentSlice('axial', axialSlice, header!.nx, header!.ny, 1);
+  if (coronalSlice) setCurrentSlice('coronal', coronalSlice, header!.nx, header!.nz, 1);
+  if (sagittalSlice) setCurrentSlice('sagittal', sagittalSlice, header!.ny, header!.nz, 1);
 
   windowLevel = 0.5;
   windowWidth = 1.0;
@@ -3908,10 +4106,11 @@ function setPrimaryImageFromPreview(previewData: any) {
     url: fileUrl,
     slope: previewData.slope || 1,
     inter: previewData.inter || 0,
+    colormap: colormap,
     preview: {
-      axial: new Float32Array(previewData.slices.axial),
-      coronal: new Float32Array(previewData.slices.coronal),
-      sagittal: new Float32Array(previewData.slices.sagittal),
+      axial: previewData.slices.axial instanceof Float32Array ? previewData.slices.axial : new Float32Array(previewData.slices.axial),
+      coronal: previewData.slices.coronal?.length > 0 ? (previewData.slices.coronal instanceof Float32Array ? previewData.slices.coronal : new Float32Array(previewData.slices.coronal)) : new Float32Array(0),
+      sagittal: previewData.slices.sagittal?.length > 0 ? (previewData.slices.sagittal instanceof Float32Array ? previewData.slices.sagittal : new Float32Array(previewData.slices.sagittal)) : new Float32Array(0),
     },
     state: 'preview',
     lastAccess: Date.now(),
@@ -4061,6 +4260,10 @@ window.addEventListener('message', async (e) => {
   viewerConfig.nativeAcceleration = msg.nativeAcceleration || viewerConfig.nativeAcceleration;
   if (msg.renderMode === 'volume' || msg.renderMode === 'slice') {
     renderMode = msg.renderMode;
+    if (renderMode === 'volume') {
+      mipInitialized = true;
+      // VolumeRaycaster will be initialized lazily in tryUploadVolume3D
+    }
   }
   fullVolumeLoaded = false;
   volumeData = null;
@@ -4114,6 +4317,49 @@ function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
 }
 
 function handleDirectPreview(msg: any): void {
+  // Remote streaming fast path: Extension Host skipped the preview download
+  // because the Worker will stream the remote file directly (overlapping
+  // download + decompress + early slice extraction). Start the Worker
+  // immediately instead of falling back to the 800ms preview re-fetch.
+  if (msg.remoteStreaming === true) {
+    images.length = 0;
+    images.push({
+      header: null as any,
+      data: null,
+      min: 0,
+      max: 1,
+      name: fileName,
+      url: fileUrl,
+      slope: 1,
+      inter: 0,
+      colormap: colormap,
+      state: 'loading',
+      lastAccess: Date.now(),
+    });
+    activeImageIdx = 0;
+    publishPerfMonitor();
+
+    loadingText.textContent = 'Streaming from remote...';
+    updateProgress(0.02, 'Streaming remote file...', 'Stream');
+    setupInteraction();
+
+    void ensureImageData(0, 'active').catch((err) => {
+      if ((err as any)?.name !== 'AbortError') {
+        loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
+      }
+    });
+    return;
+  }
+
+  // Partial early preview (e.g. z=0 axial slice only) can look strange and
+  // is quickly replaced by the full volume. Keep the loading spinner visible
+  // instead so users see a clean transition to the correct image.
+  if (msg.partialPreview) {
+    loadingText.textContent = 'Loading volume...';
+    updateProgress(0.25, 'Reading volume data...');
+    return;
+  }
+
   header = msg.header;
   computeViewFlips();
   globalMin = msg.globalMin;
@@ -4219,17 +4465,10 @@ function handleCachedVolume(msg: any): void {
     workerCopyBytes = volumeData.byteLength; // would be duplicated in workers without SAB
     sharedBufferBytes = 0;
 
-    // Create SharedArrayBuffer and broadcast to slice workers for zero-copy access
+    // Create SharedArrayBuffer for slice workers (CPU fallback path only)
+    // GPU 3D texture path doesn't need SAB — shader handles everything
     if (header && volumeData) {
-      const n = header.nx * header.ny * header.nz;
-      let float32Data: Float32Array;
-      if (volumeData instanceof Float32Array) {
-        float32Data = volumeData;
-      } else {
-        float32Data = new Float32Array(n);
-        for (let i = 0; i < n; i++) float32Data[i] = (volumeData as any)[i] * dataSlope + dataInter;
-      }
-      sharedVolumeBuffer = createSharedVolumeBuffer(float32Data);
+      sharedVolumeBuffer = createSharedVolumeBuffer(volumeData);
       if (sharedVolumeBuffer) {
         sharedBufferBytes = sharedVolumeBuffer.byteLength;
         workerCopyBytes = 0; // workers no longer need their own copy
@@ -4238,6 +4477,7 @@ function handleCachedVolume(msg: any): void {
           buffer: sharedVolumeBuffer,
           nx: header.nx, ny: header.ny, nz: header.nz,
           slope: dataSlope, inter: dataInter,
+          datatype: msg.datatype || 16,
         });
       }
     }
@@ -4262,6 +4502,7 @@ function handleCachedVolume(msg: any): void {
   initialWindowLevel = windowLevel;
 
   if (pendingAddImageIdx >= 0 && pendingAddImageIdx < images.length) {
+    const existingCmap = images[pendingAddImageIdx]?.colormap ?? colormap;
     images[pendingAddImageIdx] = {
       header: msg.header,
       data: volumeData,
@@ -4271,6 +4512,7 @@ function handleCachedVolume(msg: any): void {
       url: fileUrl,
       slope: msg.slope || 1,
       inter: msg.inter || 0,
+      colormap: existingCmap,
       state: volumeData ? 'ready' : 'preview',
       lastAccess: Date.now(),
     };
@@ -4287,6 +4529,7 @@ function handleCachedVolume(msg: any): void {
       url: fileUrl,
       slope: msg.slope || 1,
       inter: msg.inter || 0,
+      colormap: colormap,
       state: volumeData ? 'ready' : 'preview',
       lastAccess: Date.now(),
     });
@@ -4437,6 +4680,7 @@ function setPrimaryImageFromDirectPreview(msg: any, axial: Float32Array, coronal
     url: fileUrl,
     slope: msg.slope || 1,
     inter: msg.inter || 0,
+    colormap: colormap,
     preview: { axial, coronal, sagittal },
     state: 'preview',
     lastAccess: Date.now(),
@@ -4501,6 +4745,11 @@ function loadFullVolume() {
     if (d.type === 'preview') {
       if (previewReceived) return;
       previewReceived = true;
+      // Partial early preview (axial z=0 only) is not user-ready; keep loading visible.
+      if (d.partialPreview) {
+        loadingText.textContent = 'Loading volume...';
+        return;
+      }
       if (!header) {
         header = d.header;
         computeViewFlips();
@@ -4513,7 +4762,6 @@ function loadFullVolume() {
         sliceIdx.coronal = d.sliceIdx.coronal;
         sliceIdx.sagittal = d.sliceIdx.sagittal;
 
-        autoContrast();
         initialWindowWidth = windowWidth;
         initialWindowLevel = windowLevel;
 
@@ -4556,6 +4804,7 @@ function loadFullVolume() {
           url: fileUrl,
           slope: d.slope || 1,
           inter: d.inter || 0,
+          colormap: colormap,
           preview: currentSlices.axial && currentSlices.coronal && currentSlices.sagittal ? {
             axial: new Float32Array(currentSlices.axial.data),
             coronal: new Float32Array(currentSlices.coronal.data),
@@ -4570,7 +4819,9 @@ function loadFullVolume() {
 
       updateImagePicker();
       updateProgress(1.0);
+      loading.style.display = 'none';
       renderAllViews();
+      setupInteraction();
       return;
     }
   };
@@ -4616,9 +4867,20 @@ async function switchToImage(idx: number) {
     void refreshSlices(['axial', 'coronal', 'sagittal'], true).catch(() => {});
   }
 
-  autoContrast();
   initialWindowWidth = windowWidth;
   initialWindowLevel = windowLevel;
+
+  const cmapSelect = document.getElementById('colormap') as HTMLSelectElement;
+  const overlayCmapSelect = document.getElementById('overlay-colormap') as HTMLSelectElement;
+  if (cmapSelect && images[activeImageIdx]) {
+    cmapSelect.value = images[activeImageIdx].colormap;
+    colormap = images[activeImageIdx].colormap;
+  }
+  if (overlayCmapSelect && images[1]) {
+    overlayCmapSelect.value = images[1].colormap;
+    overlayColormap = images[1].colormap;
+  }
+  renderColormapPreview();
 
   updateFileInfo();
   updateSliderValues();
@@ -4726,7 +4988,7 @@ function renderThumbnail(canvas: HTMLCanvasElement, img: VolumeImage) {
   const w = nx, h = ny;
   const imgData = ctx.createImageData(w, h);
   const pixels = imgData.data;
-  const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
+  const cmapFn = COLORMAPS[img.colormap] || COLORMAPS.gray;
   const lo = windowLevel - windowWidth * 0.5;
   const hi = windowLevel + windowWidth * 0.5;
   const range = hi - lo || 1;
@@ -4783,6 +5045,7 @@ async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: b
     url,
     slope: 1,
     inter: 0,
+    colormap: colormap,
     state: 'loading',
     lastAccess: Date.now(),
   });
@@ -4874,7 +5137,14 @@ function setupInteraction() {
 
   wwSlider?.addEventListener('input', () => { const v = validateWindowLevel(Number(wwSlider.value) / 100, windowLevel); windowWidth = v.windowWidth; scheduleRender(); a11yAnnounce(`Window width: ${Math.round(windowWidth * 100)}`); });
   wlSlider?.addEventListener('input', () => { const v = validateWindowLevel(windowWidth, Number(wlSlider.value) / 100); windowLevel = v.windowLevel; scheduleRender(); a11yAnnounce(`Window level: ${Math.round(windowLevel * 100)}`); });
-  cmapSelect?.addEventListener('change', () => { colormap = cmapSelect.value; sliceRenderCache.clear(); renderColormapPreview(); scheduleRender(); });
+  cmapSelect?.addEventListener('change', () => {
+    const activeImg = images[activeImageIdx];
+    if (activeImg) activeImg.colormap = cmapSelect.value;
+    colormap = cmapSelect.value;
+    sliceRenderCache.clear();
+    renderColormapPreview();
+    scheduleRender();
+  });
   btnAuto?.addEventListener('click', autoContrast);
   btnReset?.addEventListener('click', resetViews);
 
@@ -4918,6 +5188,15 @@ function setupInteraction() {
       const img0 = images[0];
       applyImageState(img0, true);
       activeImageIdx = 0;
+      if (cmapSelect && img0) {
+        cmapSelect.value = img0.colormap;
+        colormap = img0.colormap;
+      }
+      if (overlayCmapSelect && images[1]) {
+        overlayCmapSelect.value = images[1].colormap;
+        overlayColormap = images[1].colormap;
+      }
+      renderColormapPreview();
       sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
       sliceIdx.coronal = Math.min(sliceIdx.coronal, img0.header.ny - 1);
       sliceIdx.sagittal = Math.min(sliceIdx.sagittal, img0.header.nx - 1);
@@ -4938,6 +5217,8 @@ function setupInteraction() {
 
   const overlayCmapSelect = document.getElementById('overlay-colormap') as HTMLSelectElement;
   overlayCmapSelect?.addEventListener('change', () => {
+    const overlayImg = images[1];
+    if (overlayImg) overlayImg.colormap = overlayCmapSelect.value;
     overlayColormap = overlayCmapSelect.value;
     if (compareMode) renderAllViews();
   });
@@ -5335,9 +5616,9 @@ function setupInteraction() {
         return;
       }
 
-      const { nx, ny, nz, dx, dy } = header;
-      const pixelW = nx * dx;
-      const pixelH = ny * dy;
+      const { nx, ny, nz, dx, dy, dz } = header;
+      const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+      const pixelH = axis === 'axial' ? ny * dy : nz * dz;
       const ar = pixelW / pixelH;
       const vs = viewState[axis];
       let cw: number, ch: number;
@@ -5352,18 +5633,24 @@ function setupInteraction() {
       if (clickX < imgLeft || clickX > imgLeft + cw ||
           clickY < imgTop || clickY > imgTop + ch) return;
 
+      const flips = viewFlips[axis] || { flipX: false, flipY: false };
       const nx_click = (clickX - imgLeft) / cw;
       const ny_click = (clickY - imgTop) / ch;
+      // The renderer may flip the image horizontally/vertically based on
+      // the sform orientation. Click coordinates must be transformed with
+      // the same flip so that the crosshair jumps to the clicked voxel.
+      const cx_norm = flips.flipX ? 1 - nx_click : nx_click;
+      const cy_norm = flips.flipY ? ny_click : 1 - ny_click;
 
       if (axis === 'axial') {
-        sliceIdx.sagittal = Math.max(0, Math.min(nx - 1, Math.floor(nx_click * nx)));
-        sliceIdx.coronal = Math.max(0, Math.min(ny - 1, Math.floor((1 - ny_click) * ny)));
+        sliceIdx.sagittal = Math.max(0, Math.min(nx - 1, Math.floor(cx_norm * nx)));
+        sliceIdx.coronal = Math.max(0, Math.min(ny - 1, Math.floor(cy_norm * ny)));
       } else if (axis === 'coronal') {
-        sliceIdx.sagittal = Math.max(0, Math.min(nx - 1, Math.floor(nx_click * nx)));
-        sliceIdx.axial = Math.max(0, Math.min(nz - 1, Math.floor((1 - ny_click) * nz)));
+        sliceIdx.sagittal = Math.max(0, Math.min(nx - 1, Math.floor(cx_norm * nx)));
+        sliceIdx.axial = Math.max(0, Math.min(nz - 1, Math.floor(cy_norm * nz)));
       } else {
-        sliceIdx.coronal = Math.max(0, Math.min(ny - 1, Math.floor(nx_click * ny)));
-        sliceIdx.axial = Math.max(0, Math.min(nz - 1, Math.floor((1 - ny_click) * nz)));
+        sliceIdx.coronal = Math.max(0, Math.min(ny - 1, Math.floor(cx_norm * ny)));
+        sliceIdx.axial = Math.max(0, Math.min(nz - 1, Math.floor(cy_norm * nz)));
       }
 
       if (volumeData) renderAllViews();
@@ -5439,9 +5726,9 @@ function setupInteraction() {
             coordEl.textContent = `${name0}: ${v0}\n${name1}: ${v1}`;
           }
         } else {
-          const { nx, ny, nz, dx, dy } = h0;
-          const pixelW = nx * dx;
-          const pixelH = ny * dy;
+          const { nx, ny, nz, dx, dy, dz } = h0;
+          const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+          const pixelH = axis === 'axial' ? ny * dy : nz * dz;
           const ar = pixelW / pixelH;
           let imgW: number, imgH: number;
           if (rect.width / rect.height > ar) { imgH = rect.height; imgW = imgH * ar; }
@@ -5475,9 +5762,9 @@ function setupInteraction() {
         return;
       }
 
-      const { nx, ny, nz, dx, dy } = header;
-      const pixelW = nx * dx;
-      const pixelH = ny * dy;
+      const { nx, ny, nz, dx, dy, dz } = header;
+      const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
+      const pixelH = axis === 'axial' ? ny * dy : nz * dz;
       const ar = pixelW / pixelH;
       const vs = viewState[axis];
       let imgW: number, imgH: number;
@@ -5492,22 +5779,25 @@ function setupInteraction() {
       if (mouseX < imgLeft || mouseX > imgLeft + imgW ||
           mouseY < imgTop || mouseY > imgTop + imgH) return;
 
+      const flips = viewFlips[axis] || { flipX: false, flipY: false };
       const nx_mouse = (mouseX - imgLeft) / imgW;
       const ny_mouse = (mouseY - imgTop) / imgH;
+      const cx_norm = flips.flipX ? 1 - nx_mouse : nx_mouse;
+      const cy_norm = flips.flipY ? ny_mouse : 1 - ny_mouse;
 
       let px: number, py: number, pz: number;
 
       if (axis === 'axial') {
-        px = Math.floor(nx_mouse * nx);
-        py = Math.floor((1 - ny_mouse) * ny);
+        px = Math.floor(cx_norm * nx);
+        py = Math.floor(cy_norm * ny);
         pz = sliceIdx.axial;
       } else if (axis === 'coronal') {
-        px = Math.floor(nx_mouse * nx);
-        pz = Math.floor((1 - ny_mouse) * nz);
+        px = Math.floor(cx_norm * nx);
+        pz = Math.floor(cy_norm * nz);
         py = sliceIdx.coronal;
       } else {
-        py = Math.floor(nx_mouse * ny);
-        pz = Math.floor((1 - ny_mouse) * nz);
+        py = Math.floor(cx_norm * ny);
+        pz = Math.floor(cy_norm * nz);
         px = sliceIdx.sagittal;
       }
 
@@ -5573,6 +5863,7 @@ function setupInteraction() {
     mipDragging = true;
     mipLastX = e.clientX;
     mipLastY = e.clientY;
+    if (!mipInitialized) { mipInitialized = true; paintMIP(); }
     mipCanvas.style.cursor = 'grabbing';
   });
 

@@ -2,13 +2,34 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as https from 'https';
 
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 6, timeout: 30000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 6, timeout: 30000 });
+// High-performance keep-alive agents with generous socket pools.
+// The proxy multiplexes many parallel range requests onto the remote;
+// the default Node agent (maxSockets=Infinity but no keep-alive) is
+// too slow because every request opens a new TCP+TLS connection.
+export const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 32,
+  timeout: 60000,
+  scheduling: 'lifo',  // reuse most recent socket (warm cache)
+});
+export const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 64,
+  maxFreeSockets: 32,
+  timeout: 60000,
+  scheduling: 'lifo',
+});
+
+/** Pick the right keep-alive agent for a URL. */
+export function getAgentForUrl(url: string): http.Agent | https.Agent {
+  return url.startsWith('https:') ? httpsAgent : httpAgent;
+}
 
 export function readLocalFilePartial(fsPath: string, start: number, end: number): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    const stream = fs.createReadStream(fsPath, { start, end });
+    const stream = fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 });
     stream.on('data', (chunk) => { if (Buffer.isBuffer(chunk)) chunks.push(chunk); });
     stream.on('end', () => {
       const total = chunks.reduce((s, c) => s + c.length, 0);

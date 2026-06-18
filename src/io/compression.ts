@@ -8,7 +8,13 @@ import { parseNiiHeaderQuick } from '../nifti/headerParser';
 
 export function shouldCompress(req: http.IncomingMessage): boolean {
   const acceptEncoding = req.headers['accept-encoding'] || '';
-  return acceptEncoding.includes('gzip');
+  if (!acceptEncoding.includes('gzip')) return false;
+  // Skip compression for localhost — the data crosses a loopback
+  // connection where bandwidth is effectively infinite and gzip
+  // only adds CPU latency. This is critical for large volumes.
+  const host = req.headers['host'] || '';
+  if (host.startsWith('127.0.0.1') || host.startsWith('localhost')) return false;
+  return true;
 }
 
 export function compressResponse(data: Buffer, req: http.IncomingMessage, res: http.ServerResponse, contentType: string, extraHeaders?: Record<string, string>): void {

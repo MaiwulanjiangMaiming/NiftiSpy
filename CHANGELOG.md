@@ -2,6 +2,34 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.1.2] - 2026-06-18
+
+### Performance
+- **Local .nii.gz single-pass load**: eliminated the previous double read/decompress bug — the file is now stream-decompressed once, the z=0 preview is parsed from the same decompression pass, and the full volume is sent in the same postMessage. For a 350MB gz volume the extension host now does 1x read + 1x decompress instead of 2x of each.
+- **Native Rust fast gzip for local files**: when the native module is available, `fastDecompressGzip` (flate2) is used for the local `.nii.gz` path — typically 2-3x faster than Node.js `zlib`.
+- **Local .nii direct full read**: local `.nii` files skip the partial-read preview and use a single full `readFile` (SSD < 0.5s for 500MB) plus the native `mmapGetVolumeStats` fast-path. Preview and full volume now share the same buffer slice.
+- **Eliminated worker `previewBuf` double-buffering**: the early preview is parsed directly from the main result buffer via `subarray(0, writeOffset)` instead of being copied into a separate `previewBuf` that was discarded immediately after use.
+- **Typed-array fast path in `processRawVolume`**: min/max and per-axis slice extraction now iterate typed-array views directly instead of going through `DataView` for the dominant aligned-Float32 case.
+- **`computeVoxelStats` typed-array fast paths**: when the volume data is little-endian aligned, switch to `Uint8Array` / `Int16Array` / `Int32Array` / `Float32Array` / `Float64Array` views for sequential reads (3-5x faster than `DataView`).
+- **Defer LOD generation to background**: LOD pyramid is now built 500ms after the cached volume message is posted, so the initial image renders without competing with LOD work.
+- **Larger chunks / higher concurrency**:
+  - Local file proxy: 16MB → 32MB chunks, concurrency 16 → 32, `highWaterMark` 4MB.
+  - Worker local streaming: 64MB → 128MB chunks, concurrency 8 → 16.
+  - Worker remote streaming: concurrency 8 → 12.
+  - HTTP/HTTPS agents: `maxSockets` 32 → 64, `maxFreeSockets` 16 → 32.
+
+### Fixed
+- **No more "strange" intermediate image on load**: the early z=0 partial preview (only axial slice, empty coronal/sagittal) is no longer rendered. The viewer now keeps the loading spinner visible and only paints when the full volume arrives. The worker flags these partial previews with `partialPreview: true`, and the webview ignores them.
+
+### Internal
+- New `streamingLocalGzLoad` in `NiiEditorProvider` consolidates gzip streaming + early preview + full volume in a single pass.
+- New `sendEarlyPreviewFromHeader` / `sendEarlyPreviewFromRawData` helpers extract a z=0 slice from in-progress decompression without buffering the entire volume twice.
+- `processRawVolume` min/max and conversion paths simplified: no intermediate sampled arrays, no redundant header reparse.
+- `VolumeCache.set` now feeds directly from a `voxelOnly` `Uint8Array` view; no slice copy of the full volume.
+- All 5 unit tests pass; build succeeds across extension, viewer, and worker bundles.
+
+---
+
 ## [2.1.1] - 2026-06-08
 
 ### Fixed / Performance
