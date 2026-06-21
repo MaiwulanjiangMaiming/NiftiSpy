@@ -15,7 +15,7 @@ import {
   downsampleSlice,
 } from './nifti/sliceExtractor';
 import { computeSliceMinMax, encodePreviewBinary } from './nifti/previewEncoder';
-import { readLocalFilePartial, readHttpPartial, getAgentForUrl } from './io/fileReader';
+import { readLocalFilePartial, readHttpPartial, readHttpPartialInto, getAgentForUrl } from './io/fileReader';
 import {
   compressResponse,
   gunzipAsync,
@@ -446,42 +446,50 @@ export class LocalFileProxy {
     const method = (req.method || 'GET').toUpperCase();
     const rangeHeader = req.headers['range'];
 
-    // ── Fast path: full-file GET on a remote URL ──
-    // Stream directly from the remote without probing size first.
-    // This eliminates a HEAD round-trip and lets the first byte reach
-    // the webview as soon as the remote responds.
-    if (isHttpRemote && method === 'GET' && !rangeHeader) {
-      await this.streamHttpToResponse(entry.uri.toString(), res);
+    // ── Remote range request: forward directly, skip HEAD size lookup ──
+    // The remote's Content-Range response header carries the total size,
+    // so we cache it from the response and avoid a separate HEAD RTT.
+    // This is critical: the worker issues ~16 parallel range probes and
+    // a HEAD-per-request would add a full RTT to every single one.
+    if (isHttpRemote && method === 'GET' && rangeHeader) {
+      await this.streamHttpRangeToResponse(entry.uri.toString(), rangeHeader, res, entry);
       return;
     }
 
-    if (!entry.size) {
-      if (isHttpRemote) {
-        // For HTTP remotes, try HEAD request to get Content-Length without downloading
-        try {
-          entry.size = await this.getHttpRemoteSize(entry.uri.toString());
-        } catch {
-          // Fall through — size will be unknown, streaming will handle it
+    // ── Remote full-file GET: stream directly without buffering ──
+    if (isHttpRemote && method === 'GET' && !rangeHeader) {
+      await this.streamHttpToResponse(entry.uri.toString(), res, entry);
+      return;
+    }
+
+    // ── HEAD: answer with cached size or do one HEAD to the remote ──
+    if (method === 'HEAD') {
+      if (!entry.size) {
+        if (isHttpRemote) {
+          try { entry.size = await this.getHttpRemoteSize(entry.uri.toString()); } catch { /* unknown */ }
+        }
+        if (!entry.size) {
+          const stat = await vscode.workspace.fs.stat(entry.uri);
+          entry.size = Number(stat.size);
         }
       }
-      if (!entry.size) {
-        const stat = await vscode.workspace.fs.stat(entry.uri);
-        entry.size = Number(stat.size);
-      }
-    }
-    const totalSize = entry.size!;
-
-    // HEAD: the webview probes Content-Length + Accept-Ranges to decide whether
-    // to use the parallel ranged download. Answer with headers only.
-    if (method === 'HEAD') {
-      res.writeHead(200, {
-        'Content-Length': totalSize,
+      const headHeaders: Record<string, string | number> = {
+        'Content-Length': entry.size || 0,
         'Accept-Ranges': 'bytes',
         'Content-Type': 'application/octet-stream',
-      });
+      };
+      if (isHttpRemote) headHeaders['X-Remote-Source'] = 'true';
+      res.writeHead(200, headHeaders);
       res.end();
       return;
     }
+
+    // ── Local file paths (fsPath or vscode-remote) need a size lookup ──
+    if (!entry.size) {
+      const stat = await vscode.workspace.fs.stat(entry.uri);
+      entry.size = Number(stat.size);
+    }
+    const totalSize = entry.size!;
 
     if (rangeHeader) {
       const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
@@ -503,9 +511,6 @@ export class LocalFileProxy {
           'Content-Type': 'application/octet-stream',
         });
         fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 }).pipe(res);
-      } else if (isHttpRemote) {
-        // Stream HTTP Range request directly from remote to client
-        await this.streamHttpRangeToResponse(entry.uri.toString(), start, end, res);
       } else {
         entry.lastAccess = Date.now();
         if (!entry.dataCache) {
@@ -537,9 +542,6 @@ export class LocalFileProxy {
           'Content-Type': 'application/octet-stream',
         });
         fs.createReadStream(fsPath).pipe(zlib.createGzip({ level: 1 })).pipe(res);
-      } else if (isHttpRemote) {
-        // Stream entire HTTP remote file directly to client without buffering
-        await this.streamHttpToResponse(entry.uri.toString(), res);
       } else {
         entry.lastAccess = Date.now();
         if (!entry.dataCache) {
@@ -582,7 +584,7 @@ export class LocalFileProxy {
     });
   }
 
-  private streamHttpRangeToResponse(url: string, start: number, end: number, res: http.ServerResponse): Promise<void> {
+  private streamHttpRangeToResponse(url: string, rangeHeader: string, res: http.ServerResponse, entry?: FileEntry): Promise<void> {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const options: any = {
@@ -590,7 +592,7 @@ export class LocalFileProxy {
         port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
         path: parsed.pathname + parsed.search,
         method: 'GET',
-        headers: { Range: `bytes=${start}-${end}` },
+        headers: { Range: rangeHeader },
         agent: getAgentForUrl(url),
       };
       const mod = parsed.protocol === 'https:' ? https : http;
@@ -598,9 +600,20 @@ export class LocalFileProxy {
         if (response.statusCode === 206 || response.statusCode === 200) {
           const contentRange = response.headers['content-range'];
           const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+
+          // Cache total size from Content-Range so subsequent requests
+          // (and the HEAD path) don't need another round-trip.
+          if (entry && contentRange) {
+            const m = contentRange.match(/\/(\d+)/);
+            if (m) entry.size = parseInt(m[1]);
+          } else if (entry && contentLength && response.statusCode === 200) {
+            entry.size = contentLength;
+          }
+
           const headers: Record<string, string | number> = {
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
+            'X-Remote-Source': 'true',
           };
           if (contentRange) {
             headers['Content-Range'] = contentRange;
@@ -623,7 +636,7 @@ export class LocalFileProxy {
     });
   }
 
-  private streamHttpToResponse(url: string, res: http.ServerResponse): Promise<void> {
+  private streamHttpToResponse(url: string, res: http.ServerResponse, entry?: FileEntry): Promise<void> {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const options = {
@@ -637,9 +650,11 @@ export class LocalFileProxy {
       const request = mod.request(options, (response: any) => {
         if (response.statusCode === 200) {
           const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+          if (entry && contentLength) entry.size = contentLength;
           const headers: Record<string, string | number> = {
             'Accept-Ranges': 'bytes',
             'Content-Type': 'application/octet-stream',
+            'X-Remote-Source': 'true',
           };
           if (contentLength) {
             headers['Content-Length'] = contentLength;
@@ -679,6 +694,10 @@ export class LocalFileProxy {
       ranges.push({ start, end });
     }
 
+    // Pre-allocate the entire result buffer and write each chunk directly
+    // into it via readHttpPartialInto — avoids one intermediate Buffer
+    // allocation + memcpy per chunk (saves ~CHUNK_SIZE bytes of temp
+    // memory and a full-copy per request).
     const result = Buffer.alloc(totalSize);
     let running = 0;
     let nextIdx = 0;
@@ -690,10 +709,9 @@ export class LocalFileProxy {
           const idx = nextIdx++;
           const { start, end } = ranges[idx];
           running++;
-          readHttpPartial(url, start, end, signal)
-            .then(chunk => {
+          readHttpPartialInto(url, start, end, result, start, signal)
+            .then(() => {
               if (poolError) return;
-              result.set(chunk, start);
             })
             .catch(err => {
               if (!poolError) poolError = err;

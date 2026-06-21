@@ -2,6 +2,24 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.1.3] - 2026-06-20
+
+### Performance
+- **Parallel range-request download for remote volumes**: replaced the single-stream GET with 16-way concurrent byte-range downloads (8MB chunks for remote, 32MB for local proxy). Bandwidth utilization jumps from ~15% to ~90% on high-latency links.
+- **1MB range probe eliminates HEAD RTT**: the worker's primary path now issues a 1MB range request to discover `Content-Length` and fetch header data in one round-trip, instead of a separate HEAD request that adds a full RTT before any data flows.
+- **Streaming decompress overlap for .nii.gz**: gzip volumes are decompressed via `DecompressionStream` concurrently with download — chunks are fed in order to the decompressor as they arrive, so decompression runs in parallel with the remaining downloads.
+- **Early preview from probe data**: uncompressed volumes emit a z=0 axial slice preview from the 1MB probe response; gzip volumes emit from the first decompressed slice. Preview appears in ~1 second instead of waiting for the full download.
+- **Pre-allocated buffers**: exact-size pre-allocation based on `Content-Length` (uncompressed) or estimated ratio (gzip) replaces geometric buffer growth, eliminating multiple realloc + memcpy cycles.
+- **Zero-copy HTTP chunk writes**: new `readHttpPartialInto()` in `fileReader.ts` writes range-response data directly into the pre-allocated target buffer, avoiding one intermediate `Buffer[]` + `concat` allocation per 32MB chunk.
+- **Proxy range-request passthrough without HEAD**: `LocalFileProxy` now forwards remote range requests directly to the origin and caches the total size from the `Content-Range` response header, eliminating a HEAD round-trip per request.
+- **`X-Remote-Source` header**: the proxy adds this header to all remote file responses so the worker can auto-tune chunk size and concurrency for local vs. remote files.
+
+### Fixed
+- **Auto Contrast in Overlay/SBS modes**: clicking "Auto Contrast" had no effect in Side-by-Side mode (both images ignored W/L) and only affected the base image in Overlay mode (the overlay image ignored W/L). Both modes now correctly apply the global window/level to all images.
+- **Auto Contrast sampling for compare mode**: `autoContrast()` previously only sampled the primary volume, producing a W/L that was suboptimal for the secondary image. It now samples both volumes, normalizing each to [0,1] using its own min/max, so the computed W/L works well for both images simultaneously.
+
+---
+
 ## [2.1.2] - 2026-06-18
 
 ### Performance

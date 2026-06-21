@@ -80,3 +80,55 @@ export function readHttpPartial(urlStr: string, start: number, end: number, sign
     req.end();
   });
 }
+
+/**
+ * Fetch an HTTP byte-range and write it directly into a pre-allocated buffer
+ * at the given offset. Avoids the intermediate Buffer[] + concat allocation
+ * that readHttpPartial performs — critical when downloading many large
+ * parallel chunks (each 8–32 MB) into a single contiguous volume buffer.
+ *
+ * Returns the number of bytes written.
+ */
+export function readHttpPartialInto(
+  urlStr: string,
+  start: number,
+  end: number,
+  target: Uint8Array,
+  offset: number,
+  signal?: AbortSignal,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const isHttps = url.protocol === 'https:';
+    const mod = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
+    const options: http.RequestOptions = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: { Range: `bytes=${start}-${end}` },
+      agent,
+    };
+
+    let written = 0;
+    const req = mod.request(options, (res) => {
+      if (res.statusCode === 206 || res.statusCode === 200) {
+        res.on('data', (chunk: Buffer) => {
+          // Write directly into the target buffer — no intermediate allocation.
+          target.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), offset + written);
+          written += chunk.byteLength;
+        });
+        res.on('end', () => resolve(written));
+      } else {
+        reject(new Error(`HTTP ${res.statusCode}`));
+      }
+    });
+    req.on('error', reject);
+    if (signal) {
+      const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+    req.end();
+  });
+}

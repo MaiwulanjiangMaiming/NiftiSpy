@@ -3524,7 +3524,7 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
 
   // Draw overlay image (img1) using pre-registered data1
   if (data1 && data1.length > 0) {
-    const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap);
+    const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap, true);
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
@@ -3581,8 +3581,8 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
 
-  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, img0.colormap);
-  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap);
+  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, img0.colormap, true);
+  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap, true);
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -3862,26 +3862,61 @@ function updateFileInfo() {
 function autoContrast() {
   if (globalMin === globalMax) return;
 
+  // Collect samples normalized to [0,1] using each volume's own min/max.
+  // This matches how renderSliceToTempCanvas applies W/L: each image is
+  // independently normalized before the global W/L is applied, so the
+  // W/L must be computed in normalized space to work for all images.
   let samples: number[] = [];
+
+  // Primary volume (img0)
   if (volumeData && volumeData.length > 0) {
     const n = volumeData.length;
     const sampleSize = Math.min(10000, n);
     const step = Math.max(1, Math.floor(n / sampleSize));
     const s = dataSlope;
     const t = dataInter;
+    const range0 = globalMax - globalMin || 1;
     for (let i = 0; i < n; i += step) {
-      samples.push(volumeData[i] * s + t);
+      samples.push(((volumeData[i] * s + t) - globalMin) / range0);
     }
   } else {
     // Fallback to preview slices before the full volume is loaded
+    const range0 = globalMax - globalMin || 1;
     const addSlice = (slice: Float32Array | undefined) => {
       if (!slice || slice.length === 0) return;
       const step = Math.max(1, Math.floor(slice.length / 3000));
-      for (let i = 0; i < slice.length; i += step) samples.push(slice[i]);
+      for (let i = 0; i < slice.length; i += step) samples.push((slice[i] - globalMin) / range0);
     };
     addSlice(currentSlices.axial?.data);
     addSlice(currentSlices.coronal?.data);
     addSlice(currentSlices.sagittal?.data);
+  }
+
+  // Secondary volume (img1) in compare mode — sample and normalize
+  // using img1's own range so the W/L works for both images.
+  if (compareMode && images.length >= 2) {
+    const img1 = images[1];
+    const range1 = img1.max - img1.min || 1;
+    if (img1.data && img1.data.length > 0) {
+      const d1 = img1.data;
+      const n1 = d1.length;
+      const sampleSize1 = Math.min(10000, n1);
+      const step1 = Math.max(1, Math.floor(n1 / sampleSize1));
+      const s1 = img1.slope || 1;
+      const t1 = img1.inter || 0;
+      for (let i = 0; i < n1; i += step1) {
+        samples.push(((d1[i] * s1 + t1) - img1.min) / range1);
+      }
+    } else if (img1.preview) {
+      const addSlice = (slice: Float32Array | undefined) => {
+        if (!slice || slice.length === 0) return;
+        const step = Math.max(1, Math.floor(slice.length / 3000));
+        for (let i = 0; i < slice.length; i += step) samples.push((slice[i] - img1.min) / range1);
+      };
+      addSlice(img1.preview.axial);
+      addSlice(img1.preview.coronal);
+      addSlice(img1.preview.sagittal);
+    }
   }
 
   if (samples.length === 0) return;
@@ -3892,9 +3927,9 @@ function autoContrast() {
   const p1 = samples[p1Idx];
   const p99 = samples[p99Idx];
 
-  const range = globalMax - globalMin || 1;
-  windowLevel = ((p1 + p99) / 2 - globalMin) / range;
-  windowWidth = (p99 - p1) / range;
+  // W/L is in normalized [0,1] space — works for all images
+  windowLevel = (p1 + p99) / 2;
+  windowWidth = p99 - p1;
 
   const wwSlider = document.getElementById('ww-slider') as HTMLInputElement;
   const wlSlider = document.getElementById('wl-slider') as HTMLInputElement;
