@@ -14,6 +14,7 @@ interface VolumeImage {
   max: number;
   name: string;
   url: string;
+  directUrl: string;  // Original remote URL for direct fetch (bypasses proxy)
   slope: number;
   inter: number;
   colormap: string;
@@ -122,6 +123,7 @@ type CompareLayout = 'overlay' | 'sideBySide';
 let compareLayout: CompareLayout = 'overlay';
 let colormap = 'gray';
 let fileUrl = '';
+let directUrl = '';  // Original remote URL for direct fetch (bypasses proxy)
 let isGzip = false;
 let fileName = '';
 let crosshairVisible = true;
@@ -495,9 +497,14 @@ class BandwidthEstimator {
   private samples: { bytes: number; durationMs: number }[] = [];
   private maxSamples = 10;
   private _estimatedBps: number = 10 * 1024 * 1024;
+  private _estimatedRttMs: number = 50;
 
   get estimatedBps(): number {
     return this._estimatedBps;
+  }
+
+  get estimatedRttMs(): number {
+    return this._estimatedRttMs;
   }
 
   addSample(bytes: number, durationMs: number): void {
@@ -515,6 +522,13 @@ class BandwidthEstimator {
     this._estimatedBps = (totalBytes / totalMs) * 1000 * 8;
   }
 
+  addRttSample(rttMs: number): void {
+    if (rttMs <= 0) return;
+    // Exponential moving average for RTT: smooth, responsive to regime changes.
+    const alpha = 0.3;
+    this._estimatedRttMs = this._estimatedRttMs * (1 - alpha) + rttMs * alpha;
+  }
+
   get qualityLevel(): 'high' | 'medium' | 'low' {
     const mbps = this._estimatedBps / (1024 * 1024);
     if (mbps > 50) return 'high';
@@ -524,6 +538,81 @@ class BandwidthEstimator {
 }
 
 const bandwidthEstimator = new BandwidthEstimator();
+
+// Warm up the TCP/TLS connection for a remote URL as early as possible and
+// measure the round-trip time. On high-latency links this hides the handshake
+// cost from the first real Range request.
+const warmupCache = new Map<string, Promise<void>>();
+function isWarmupable(url: string): boolean {
+  return url.startsWith('http://') || url.startsWith('https://');
+}
+async function warmupConnection(url: string): Promise<void> {
+  if (!isWarmupable(url)) return;
+  const cached = warmupCache.get(url);
+  if (cached) return cached;
+  const promise = (async () => {
+    try {
+      const start = performance.now();
+      // Use HEAD when allowed; fallback to a tiny Range request.  Both warm
+      // the connection without transferring meaningful data.
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 5000);
+      let resp: Response | undefined;
+      try {
+        resp = await fetch(url, { method: 'HEAD', signal: controller.signal, mode: 'cors' });
+      } catch {
+        // HEAD may be disallowed; try a single-byte Range request.
+        controller.abort();
+        const ctrl2 = new AbortController();
+        const t2 = window.setTimeout(() => ctrl2.abort(), 5000);
+        resp = await fetch(url, {
+          method: 'GET',
+          headers: { Range: 'bytes=0-0' },
+          signal: ctrl2.signal,
+          mode: 'cors',
+        });
+        window.clearTimeout(t2);
+      } finally {
+        window.clearTimeout(timeout);
+      }
+      if (resp) {
+        // Ensure response body is consumed so the connection can be reused.
+        try { await resp.body?.cancel(); } catch { /* ignore */ }
+        const rtt = performance.now() - start;
+        bandwidthEstimator.addRttSample(rtt);
+        if (DEBUG) console.log('[NiftiSpy] connection warmup RTT:', rtt.toFixed(1), 'ms for', url);
+      }
+    } catch (err) {
+      if (DEBUG) console.log('[NiftiSpy] connection warmup failed:', (err as any)?.message || err);
+    }
+  })();
+  warmupCache.set(url, promise);
+  return promise;
+}
+
+function injectPreconnectHint(url: string): void {
+  if (!isWarmupable(url)) return;
+  try {
+    const u = new URL(url);
+    const origin = u.origin;
+    if (!origin || origin === location.origin) return;
+    const id = 'preconnect-' + origin.replace(/[^a-z0-9]/gi, '-');
+    if (document.getElementById(id)) return;
+    const link = document.createElement('link');
+    link.id = id;
+    link.rel = 'preconnect';
+    link.href = origin;
+    link.crossOrigin = 'anonymous';
+    document.head.appendChild(link);
+    const dns = document.createElement('link');
+    dns.id = id + '-dns';
+    dns.rel = 'dns-prefetch';
+    dns.href = origin;
+    document.head.appendChild(dns);
+  } catch {
+    // ignore malformed URLs
+  }
+}
 
 class WebGLRenderer {
   private gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
@@ -1869,7 +1958,7 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
   }
 }
 
-async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void): Promise<any> {
+async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void, directFetchUrl?: string): Promise<any> {
   const worker = new Worker(await ensureWorkerBlobUrl());
   const requestId = nextStreamRequestId++;
   return new Promise((resolve, reject) => {
@@ -1885,6 +1974,11 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
       if (msg.id !== requestId) return;
       if (msg.type === 'progress' || msg.type === 'preview') {
         progress?.(msg);
+        return;
+      }
+      if (msg.type === 'bandwidthSample') {
+        bandwidthEstimator.addSample(msg.bytes || 0, msg.durationMs || 0);
+        if (msg.rttMs) bandwidthEstimator.addRttSample(msg.rttMs);
         return;
       }
       if (msg.type === 'cancelled') {
@@ -1906,7 +2000,17 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
       cleanup();
       reject(new Error(err.message || 'Worker error'));
     };
-    worker.postMessage({ id: requestId, type: 'loadVolume', url, isGzip: gz });
+    // Optionally pass a recent bandwidth + RTT estimate so the Worker can choose
+    // an initial chunk size tuned for the current network.
+    worker.postMessage({
+      id: requestId,
+      type: 'loadVolume',
+      url,
+      isGzip: gz,
+      directUrl: directFetchUrl || '',
+      estimatedBps: bandwidthEstimator?.estimatedBps ?? 0,
+      estimatedRttMs: bandwidthEstimator?.estimatedRttMs ?? 0,
+    });
   });
 }
 
@@ -1952,7 +2056,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
           if (index === activeImageIdx && msg.type === 'progress') {
             updateProgress(0.5 + msg.value * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
           }
-        });
+        }, img.directUrl);
         img.header = result.header;
         img.data = result.voxelData;
         img.min = result.globalMin;
@@ -2033,6 +2137,7 @@ async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
     }>({
       type: 'fetchSlice',
       url: fileUrl,
+    directUrl: directUrl,
       axis,
       index: sliceIdx[axis],
       factor,
@@ -2592,10 +2697,14 @@ function paintSlice3D(axis: string, w: number, h: number, pixelW: number, pixelH
   cw = Math.floor(cw * zoom);
   ch = Math.floor(ch * zoom);
 
-  canvas.style.width = dw + 'px';
-  canvas.style.height = dh + 'px';
-  canvas.width = dw * dpr;
-  canvas.height = dh * dpr;
+  const newW3d = dw * dpr;
+  const newH3d = dh * dpr;
+  if (canvas.width !== newW3d || canvas.height !== newH3d) {
+    canvas.style.width = dw + 'px';
+    canvas.style.height = dh + 'px';
+    canvas.width = newW3d;
+    canvas.height = newH3d;
+  }
 
   const renderer = getOrCreateRenderer(axis as Axis);
   const flips = viewFlips[axis] || { flipX: false, flipY: false };
@@ -2656,10 +2765,17 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   cw = Math.floor(cw * zoom);
   ch = Math.floor(ch * zoom);
 
-  canvas.style.width = dw + 'px';
-  canvas.style.height = dh + 'px';
-  canvas.width = dw * dpr;
-  canvas.height = dh * dpr;
+  // Only update canvas dimensions when they actually change — setting
+  // canvas.width/height clears the canvas and resets all state, which
+  // is expensive on every frame during scrolling/WL adjustment.
+  const newW = dw * dpr;
+  const newH = dh * dpr;
+  if (canvas.width !== newW || canvas.height !== newH) {
+    canvas.style.width = dw + 'px';
+    canvas.style.height = dh + 'px';
+    canvas.width = newW;
+    canvas.height = newH;
+  }
 
   const renderer = getOrCreateRenderer(axis as Axis);
   const flips = viewFlips[axis] || { flipX: false, flipY: false };
@@ -2782,7 +2898,7 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   updateDirectionLabels(axis);
   updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
   updateScaleBar(axis, pixelW, pixelH, zoom, cw);
-  updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
+  updateMinimap(axis, w, h, zoom, panX, panY, cw, ch, data);
 }
 
 // ITK-Snap style: Get dominant anatomical axis and direction from a srow vector
@@ -3074,7 +3190,7 @@ function updateScaleBar(axis: string, pixelW: number, pixelH: number, zoom: numb
   }
 }
 
-function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, cw: number, ch: number) {
+function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, cw: number, ch: number, existingSliceData?: Float32Array) {
   const container = canvases[axis as keyof typeof canvases]?.parentElement;
   if (!container) return;
   const minimap = container.querySelector('.minimap') as HTMLDivElement;
@@ -3092,7 +3208,9 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
   const mh = minimap.clientHeight;
   
   if (minimapCanvas && header) {
-    const sliceData = extractSlice(axis as 'axial' | 'coronal' | 'sagittal', sliceIdx[axis as keyof typeof sliceIdx]);
+    // Reuse existing slice data if provided (avoids redundant extractSlice call)
+    const sliceData = existingSliceData || extractSlice(axis as 'axial' | 'coronal' | 'sagittal', sliceIdx[axis as keyof typeof sliceIdx]);
+    const shouldRelease = !existingSliceData && sliceData;  // only release if we extracted it ourselves
     if (sliceData && sliceData.length > 0) {
       const mctx = minimapCanvas.getContext('2d');
       if (mctx) {
@@ -3122,7 +3240,7 @@ function updateMinimap(axis: string, w: number, h: number, zoom: number, panX: n
         }
         mctx.putImageData(imgData, 0, 0);
       }
-      float32Pool.release(sliceData);
+      if (shouldRelease) float32Pool.release(sliceData);
     }
   }
 
@@ -4139,6 +4257,7 @@ function setPrimaryImageFromPreview(previewData: any) {
     max: previewData.globalMax,
     name: fileName,
     url: fileUrl,
+    directUrl: directUrl,
     slope: previewData.slope || 1,
     inter: previewData.inter || 0,
     colormap: colormap,
@@ -4241,6 +4360,11 @@ let directPreviewTimer: number | null = null;
 
 window.addEventListener('DOMContentLoaded', () => {
   publishPerfMonitor();
+  // Pre-warm the Worker blob URL so the first loadVolumeViaWorker()
+  // doesn't pay the fetch+text+Blob creation cost (~150-200ms).
+  // This runs in parallel with the IPC round-trip for the 'ready' → 'config'
+  // messages, so it's effectively free.
+  ensureWorkerBlobUrl().catch(() => {});
   vscode.postMessage({ type: 'ready' });
 });
 
@@ -4248,7 +4372,10 @@ window.addEventListener('message', async (e) => {
   const msg = e.data;
 
   if (msg.type === 'newImage') {
-    loadNewImage(msg.fileUrl, msg.fileName, msg.isGzip, msg.isRemote);
+    const target = msg.directUrl || msg.fileUrl;
+    injectPreconnectHint(target);
+    void warmupConnection(target);
+    loadNewImage(msg.fileUrl, msg.fileName, msg.isGzip, msg.isRemote, msg.directUrl);
     return;
   }
 
@@ -4285,6 +4412,10 @@ window.addEventListener('message', async (e) => {
 
   broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
   fileUrl = msg.fileUrl;
+  directUrl = msg.directUrl || '';
+  const targetUrl = directUrl || fileUrl;
+  injectPreconnectHint(targetUrl);
+  void warmupConnection(targetUrl);
   fileName = msg.fileName;
   isGzip = fileName.endsWith('.gz');
   isRemoteSource = !!msg.isRemote;
@@ -4334,12 +4465,16 @@ window.addEventListener('message', async (e) => {
   renderColormapPreview();
 
   directPreviewReceived = false;
+  // Use a shorter timeout for remote files — the Worker's streaming path
+  // provides early preview, so we don't need to wait 800ms for the
+  // Extension Host preview. For local files, 400ms is still enough.
+  const previewTimeout = isRemoteSource ? 300 : 400;
   directPreviewTimer = window.setTimeout(() => {
     directPreviewTimer = null;
     if (!directPreviewReceived) {
       fallbackToHttpPreview();
     }
-  }, 800);
+  }, previewTimeout);
 });
 
 function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
@@ -4357,6 +4492,11 @@ function handleDirectPreview(msg: any): void {
   // download + decompress + early slice extraction). Start the Worker
   // immediately instead of falling back to the 800ms preview re-fetch.
   if (msg.remoteStreaming === true) {
+    // Cancel the fallback timer — the Worker streaming path will provide
+    // early preview, no need for the HTTP preview fallback.
+    if (directPreviewTimer) { clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+    directPreviewReceived = true;
+
     images.length = 0;
     images.push({
       header: null as any,
@@ -4365,6 +4505,7 @@ function handleDirectPreview(msg: any): void {
       max: 1,
       name: fileName,
       url: fileUrl,
+    directUrl: directUrl,
       slope: 1,
       inter: 0,
       colormap: colormap,
@@ -4545,6 +4686,7 @@ function handleCachedVolume(msg: any): void {
       max: msg.globalMax,
       name: fileName,
       url: fileUrl,
+    directUrl: directUrl,
       slope: msg.slope || 1,
       inter: msg.inter || 0,
       colormap: existingCmap,
@@ -4562,6 +4704,7 @@ function handleCachedVolume(msg: any): void {
       max: msg.globalMax,
       name: fileName,
       url: fileUrl,
+    directUrl: directUrl,
       slope: msg.slope || 1,
       inter: msg.inter || 0,
       colormap: colormap,
@@ -4713,6 +4856,7 @@ function setPrimaryImageFromDirectPreview(msg: any, axial: Float32Array, coronal
     max: msg.globalMax,
     name: fileName,
     url: fileUrl,
+    directUrl: directUrl,
     slope: msg.slope || 1,
     inter: msg.inter || 0,
     colormap: colormap,
@@ -4837,6 +4981,7 @@ function loadFullVolume() {
           max: d.globalMax,
           name: fileName,
           url: fileUrl,
+    directUrl: directUrl,
           slope: d.slope || 1,
           inter: d.inter || 0,
           colormap: colormap,
@@ -5058,9 +5203,13 @@ function primeSliceFramesFromPreview(img: VolumeImage): void {
   setCurrentSlice('sagittal', new Float32Array(img.preview.sagittal), img.header.ny, img.header.nz, 1);
 }
 
-async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: boolean) {
+async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: boolean, newDirectUrl?: string) {
   broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
   fileUrl = url;
+  if (newDirectUrl) directUrl = newDirectUrl;
+  const targetUrl = directUrl || fileUrl;
+  injectPreconnectHint(targetUrl);
+  void warmupConnection(targetUrl);
   fileName = name;
   isGzip = name.endsWith('.gz');
   isRemoteSource = !!_remote;
@@ -5078,6 +5227,7 @@ async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: b
     max: 1,
     name,
     url,
+    directUrl: directUrl,
     slope: 1,
     inter: 0,
     colormap: colormap,

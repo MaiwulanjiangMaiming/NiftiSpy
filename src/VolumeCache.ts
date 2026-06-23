@@ -116,11 +116,21 @@ export class VolumeCache {
   }
 
   private evictIfNeeded(): void {
-    // Evict from tail (LRU) until under both limits
+    // Evict from tail (LRU) until under both limits.
+    // Skip entries with active webviews instead of stopping —
+    // previously a single active entry at the tail would block
+    // eviction of all idle entries before it, potentially causing OOM.
     while (this.tail && (this.map.size > this.maxEntries || this._totalBytes > this.maxBytes)) {
       const lru = this.tail;
-      // Never evict entries with active webviews
-      if (lru.entry.activeWebviewId !== null) break;
+      if (lru.entry.activeWebviewId !== null) {
+        // Skip this active entry — move it to head so we can inspect
+        // the next LRU candidate. If all entries are active, stop.
+        this.removeNode(lru);
+        this.addToHead(lru);
+        // If moving it didn't change the tail, all entries are active
+        if (this.tail === lru) break;
+        continue;
+      }
       this.removeNode(lru);
       this.map.delete(lru.key);
       this._totalBytes -= lru.entry.byteSize;
@@ -134,14 +144,13 @@ export class VolumeCache {
     let node = this.tail;
     while (node) {
       const prev = node.prev;
-      if (node.entry.activeWebviewId === null) {
-        const age = now - node.entry.timestamp;
-        const ttl = age < ACTIVE_TTL_MS ? ACTIVE_TTL_MS : IDLE_TTL_MS;
-        if (age > ttl) {
-          this.removeNode(node);
-          this.map.delete(node.key);
-          this._totalBytes -= node.entry.byteSize;
-        }
+      // TTL based on active status, not age
+      const ttl = node.entry.activeWebviewId !== null ? ACTIVE_TTL_MS : IDLE_TTL_MS;
+      const age = now - node.entry.timestamp;
+      if (age > ttl) {
+        this.removeNode(node);
+        this.map.delete(node.key);
+        this._totalBytes -= node.entry.byteSize;
       }
       node = prev;
     }

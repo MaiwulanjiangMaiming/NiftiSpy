@@ -191,8 +191,14 @@ export class LocalFileProxy {
   private activeRequests = 0;
 
   private enqueueRequest(priority: number, execute: () => Promise<void>): void {
-    this.priorityQueue.push({ priority, execute });
-    this.priorityQueue.sort((a, b) => b.priority - a.priority);
+    // Binary insert into sorted array — O(log n) instead of O(n log n) sort
+    let lo = 0, hi = this.priorityQueue.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.priorityQueue[mid].priority > priority) lo = mid + 1;
+      else hi = mid;
+    }
+    this.priorityQueue.splice(lo, 0, { priority, execute });
     this.processPriorityQueue();
   }
 

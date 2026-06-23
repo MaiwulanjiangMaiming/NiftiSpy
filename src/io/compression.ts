@@ -5,6 +5,7 @@ import * as stream from 'stream';
 import * as zlib from 'zlib';
 import { extractAxialSliceFromRange } from '../nifti/sliceExtractor';
 import { parseNiiHeaderQuick } from '../nifti/headerParser';
+import { getAgentForUrl } from './fileReader';
 
 export function shouldCompress(req: http.IncomingMessage): boolean {
   const acceptEncoding = req.headers['accept-encoding'] || '';
@@ -177,6 +178,7 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: url.pathname + url.search,
       method: 'GET',
+      agent: getAgentForUrl(urlStr),  // reuse keep-alive connections
     };
 
     const req = mod.request(options, (res) => {

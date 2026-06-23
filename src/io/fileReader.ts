@@ -8,6 +8,7 @@ import * as https from 'https';
 // too slow because every request opens a new TCP+TLS connection.
 export const httpAgent = new http.Agent({
   keepAlive: true,
+  keepAliveMsecs: 5000,  // send keep-alive probe every 5s
   maxSockets: 64,
   maxFreeSockets: 32,
   timeout: 60000,
@@ -15,6 +16,7 @@ export const httpAgent = new http.Agent({
 });
 export const httpsAgent = new https.Agent({
   keepAlive: true,
+  keepAliveMsecs: 5000,
   maxSockets: 64,
   maxFreeSockets: 32,
   timeout: 60000,
@@ -25,6 +27,8 @@ export const httpsAgent = new https.Agent({
 export function getAgentForUrl(url: string): http.Agent | https.Agent {
   return url.startsWith('https:') ? httpsAgent : httpAgent;
 }
+
+const HTTP_TIMEOUT_MS = 30_000;  // 30s request timeout — prevent infinite hangs
 
 export function readLocalFilePartial(fsPath: string, start: number, end: number): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
@@ -73,6 +77,10 @@ export function readHttpPartial(urlStr: string, start: number, end: number, sign
       }
     });
     req.on('error', reject);
+    // Timeout — prevent infinite hangs on half-open connections
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error(`HTTP request timeout after ${HTTP_TIMEOUT_MS}ms`));
+    });
     if (signal) {
       const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
       signal.addEventListener('abort', onAbort, { once: true });
@@ -115,9 +123,18 @@ export function readHttpPartialInto(
     const req = mod.request(options, (res) => {
       if (res.statusCode === 206 || res.statusCode === 200) {
         res.on('data', (chunk: Buffer) => {
-          // Write directly into the target buffer — no intermediate allocation.
-          target.set(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength), offset + written);
-          written += chunk.byteLength;
+          // Bounds check — prevent writing past target buffer if server
+          // returns more data than expected (e.g. ignored Range header)
+          const remaining = target.length - offset - written;
+          if (remaining <= 0) return;
+          const copyLen = Math.min(chunk.byteLength, remaining);
+          if (copyLen === chunk.byteLength) {
+            target.set(new Uint8Array(chunk.buffer, chunk.byteOffset, copyLen), offset + written);
+          } else {
+            // Partial copy — chunk exceeds remaining space
+            target.set(new Uint8Array(chunk.buffer, chunk.byteOffset, copyLen), offset + written);
+          }
+          written += copyLen;
         });
         res.on('end', () => resolve(written));
       } else {
@@ -125,6 +142,10 @@ export function readHttpPartialInto(
       }
     });
     req.on('error', reject);
+    // Timeout — prevent infinite hangs on half-open connections
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error(`HTTP request timeout after ${HTTP_TIMEOUT_MS}ms`));
+    });
     if (signal) {
       const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
       signal.addEventListener('abort', onAbort, { once: true });

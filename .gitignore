@@ -16,3 +16,17 @@ native/index.node
 native-wasm/target/
 *.wasm
 .niftispy-index
+
+# Benchmark/generated artifacts
+benchmarks/tmp/
+*.log
+.eslintcache
+*.tsbuildinfo
+.cache/
+coverage/
+
+# OS/Editor droppings
+*.swp
+*.swo
+*~
+

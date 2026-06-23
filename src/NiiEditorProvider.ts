@@ -20,12 +20,18 @@ class LoadQueue {
   private queue: LoadJob[] = [];
   private activeRemote = 0;
   private activeLocal = 0;
-  private maxRemote = 1;
+  private maxRemote = 3;
   private maxLocal = 2;
 
   enqueue(job: LoadJob): void {
-    this.queue.push(job);
-    this.queue.sort((a, b) => b.priority - a.priority);
+    // Binary insert — O(log n) instead of O(n log n) sort
+    let lo = 0, hi = this.queue.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.queue[mid].priority > job.priority) lo = mid + 1;
+      else hi = mid;
+    }
+    this.queue.splice(lo, 0, job);
     this.processNext();
   }
 
@@ -33,7 +39,15 @@ class LoadQueue {
     const idx = this.queue.findIndex(j => j.webviewId === webviewId);
     if (idx >= 0) {
       this.queue[idx].priority = 100;
-      this.queue.sort((a, b) => b.priority - a.priority);
+      // Re-insert in sorted position
+      const job = this.queue.splice(idx, 1)[0];
+      let lo = 0, hi = this.queue.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (this.queue[mid].priority > job.priority) lo = mid + 1;
+        else hi = mid;
+      }
+      this.queue.splice(lo, 0, job);
     }
   }
 
@@ -226,6 +240,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           nativeAcceleration: config.get('nativeAcceleration', 'auto'),
           isRemote,
           fileUrl,
+          directUrl: isRemote ? uri.toString() : '',
           fileName: path.basename(uri.fsPath ?? uri.toString()),
           webviewId,
           fileSize,
@@ -261,6 +276,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             webview.postMessage({
               type: 'newImage',
               fileUrl: imgUrl,
+              directUrl: imgUri.toString(),
               fileName: imgFileName,
               isGzip: imgIsGzip,
               isRemote: true,
@@ -1222,7 +1238,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
            script-src ${webview.cspSource} 'unsafe-inline' 'unsafe-eval' blob:;
            style-src ${webview.cspSource} 'unsafe-inline';
            img-src ${webview.cspSource} data: blob:;
-           connect-src ${webview.cspSource} http://127.0.0.1:* blob: data:;
+           connect-src ${webview.cspSource} http://127.0.0.1:* http: https: blob: data:;
            worker-src ${webview.cspSource} blob:;">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NIfTI Fast View</title>
