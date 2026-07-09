@@ -2,7 +2,7 @@ const DB_NAME = 'niftispy-cache';
 const DB_VERSION = 2;
 const STORE_NAME = 'chunks';
 const META_STORE = 'meta';
-const MAX_CACHE_SIZE = 500 * 1024 * 1024;
+const MAX_CACHE_SIZE = 1.5 * 1024 * 1024 * 1024; // 1.5 GB
 
 let dbInstance: IDBDatabase | null = null;
 

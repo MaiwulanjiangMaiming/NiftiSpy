@@ -21,6 +21,8 @@ import {
   gunzipAsync,
   streamingGunzipPreview,
   streamingHttpGunzipPreview,
+  streamingGunzipPreviewVolume,
+  type VolumePreviewResult,
 } from './io/compression';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
 
@@ -55,6 +57,7 @@ const REQUEST_PRIORITY = {
   header: 100,
   preview: 80,
   previewBin: 80,
+  previewVolume: 90, // higher than slice — users want to see *something* fast
   slice: 50,
   lod: 20,
   file: 10,
@@ -249,10 +252,11 @@ export class LocalFileProxy {
     const headerMatch = path.match(/^\/header\/(\d+)$/);
     const previewMatch = path.match(/^\/preview\/(\d+)$/);
     const previewBinMatch = path.match(/^\/preview-bin\/(\d+)$/);
+    const previewVolumeMatch = path.match(/^\/preview-volume\/(\d+)/);
     const sliceMatch = path.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
     const lodMatch = path.match(/^\/lod\/(\d+)\/(\d+)$/);
     const fileMatch = path.match(/^\/file\/(\d+)$/);
-    const match = headerMatch || previewMatch || previewBinMatch || sliceMatch || lodMatch || fileMatch;
+    const match = headerMatch || previewMatch || previewBinMatch || previewVolumeMatch || sliceMatch || lodMatch || fileMatch;
 
     if (!match) {
       stream.respond({ ':status': 404, 'access-control-allow-origin': '*' });
@@ -270,6 +274,7 @@ export class LocalFileProxy {
     const priority = headerMatch ? REQUEST_PRIORITY.header
       : previewMatch ? REQUEST_PRIORITY.preview
       : previewBinMatch ? REQUEST_PRIORITY.previewBin
+      : previewVolumeMatch ? REQUEST_PRIORITY.previewVolume
       : sliceMatch ? REQUEST_PRIORITY.slice
       : lodMatch ? REQUEST_PRIORITY.lod
       : REQUEST_PRIORITY.file;
@@ -293,6 +298,9 @@ export class LocalFileProxy {
           await this.handlePreview(entry, h2Response, fakeReq);
         } else if (previewBinMatch) {
           await this.handlePreviewBinary(entry, h2Response, fakeReq);
+        } else if (previewVolumeMatch) {
+          const factor = parseFactorFromPath(path);
+          await this.handlePreviewVolume(entry, factor, h2Response, fakeReq);
         } else if (sliceMatch) {
           await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), h2Response, fakeReq);
           // Server push for adjacent slices
@@ -391,10 +399,11 @@ export class LocalFileProxy {
     const headerMatch = _req.url?.match(/^\/header\/(\d+)$/);
     const previewMatch = _req.url?.match(/^\/preview\/(\d+)$/);
     const previewBinMatch = _req.url?.match(/^\/preview-bin\/(\d+)$/);
+    const previewVolumeMatch = _req.url?.match(/^\/preview-volume\/(\d+)/);
     const sliceMatch = _req.url?.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
     const lodMatch = _req.url?.match(/^\/lod\/(\d+)\/(\d+)$/);
     const fileMatch = _req.url?.match(/^\/file\/(\d+)$/);
-    const match = headerMatch || previewMatch || previewBinMatch || sliceMatch || lodMatch || fileMatch;
+    const match = headerMatch || previewMatch || previewBinMatch || previewVolumeMatch || sliceMatch || lodMatch || fileMatch;
     if (!match) {
       _res.writeHead(404);
       _res.end();
@@ -411,6 +420,7 @@ export class LocalFileProxy {
     const priority = headerMatch ? REQUEST_PRIORITY.header
       : previewMatch ? REQUEST_PRIORITY.preview
       : previewBinMatch ? REQUEST_PRIORITY.previewBin
+      : previewVolumeMatch ? REQUEST_PRIORITY.previewVolume
       : sliceMatch ? REQUEST_PRIORITY.slice
       : lodMatch ? REQUEST_PRIORITY.lod
       : REQUEST_PRIORITY.file;
@@ -427,6 +437,11 @@ export class LocalFileProxy {
         }
         if (previewBinMatch) {
           await this.handlePreviewBinary(entry, _res, _req);
+          return;
+        }
+        if (previewVolumeMatch) {
+          const factor = parseFactorFromPath(_req.url || '');
+          await this.handlePreviewVolume(entry, factor, _res, _req);
           return;
         }
         if (sliceMatch) {
@@ -1002,6 +1017,310 @@ export class LocalFileProxy {
     } catch (err: any) {
       res.writeHead(500);
       res.end(String(err?.message ?? err));
+    }
+  }
+
+  /**
+   * Low-resolution subsampled volume endpoint for fast remote preview.
+   *
+   * Downloads only every `factor`-th axial slice from the source (1/factor of
+   * the data) and extracts every `factor`-th voxel in x and y from each
+   * fetched slice. The result is a complete (nx/factor × ny/factor ×
+   * nz/factor) Float32 volume that can be rendered immediately in all three
+   * orthogonal views, at 1/factor³ of the original voxel count.
+   *
+   * For a 256³ Float32 volume at factor=4: downloads 16 MB (64 source
+   * slices × 256 KB), produces a 64³ = 1 MB preview volume. On a 10 Mbps
+   * link with 100 ms RTT, the preview arrives in ~2 s instead of ~50 s
+   * for the full 64 MB.
+   *
+   * Stage 1: only uncompressed .nii (local fs + HTTP remote). Gzip falls
+   * back to 503 so the worker continues with the existing streaming path.
+   */
+  private async handlePreviewVolume(
+    entry: FileEntry,
+    factor: number,
+    res: http.ServerResponse,
+    req: http.IncomingMessage,
+  ): Promise<void> {
+    try {
+      const fsPath = entry.uri.fsPath;
+      const uriStr = entry.uri.toString();
+      const isGzip = fsPath ? fsPath.endsWith('.gz') : uriStr.endsWith('.gz');
+
+      // For gzip, use a larger minimum factor (8) because gzip requires
+      // sequential decompression — a larger factor means fewer slices to
+      // decompress before the preview is ready (12.5% vs 25% of the file).
+      const f = isGzip ? 8 : Math.max(2, Math.min(8, Math.floor(factor) || 4));
+
+      // ── Gzip streaming preview (Stage 2) ──
+      // Stream-download + decompress the .nii.gz and extract a strided
+      // sub-sampled volume, resolving as soon as the needed z-slices are
+      // available — without waiting for the full file to download.
+      if (isGzip) {
+        const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+        // Only local and HTTP sources support streaming; vscode-remote
+        // falls through to the cached-data path below.
+        if (fsPath || isHttpRemote) {
+          const ac = new AbortController();
+          req.on('close', () => { if (!res.writableEnded) ac.abort(); });
+          try {
+            const source = fsPath
+              ? { type: 'file' as const, path: fsPath }
+              : { type: 'http' as const, url: uriStr };
+            const result = await streamingGunzipPreviewVolume(source, f, ac.signal);
+            // Build a low-res header (scaled spacings + adjusted sform)
+            const loHeader: any = { ...result.header };
+            loHeader.nx = result.outNx;
+            loHeader.ny = result.outNy;
+            loHeader.nz = result.outNz;
+            loHeader.dx = (result.header.dx || 1) * f;
+            loHeader.dy = (result.header.dy || 1) * f;
+            loHeader.dz = (result.header.dz || 1) * f;
+            loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
+            if (Array.isArray(result.header.sform)) {
+              const sform = result.header.sform.map((row: number[]) => [...row]);
+              for (const row of sform) { row[0] *= f; row[1] *= f; row[2] *= f; }
+              loHeader.sform = sform;
+            }
+            const slope = result.header.scl_slope || 1;
+            const inter = result.header.scl_inter || 0;
+
+            // Encode binary response (same layout as non-gzip path)
+            const headerJson = JSON.stringify(loHeader);
+            const headerBuf = Buffer.from(headerJson, 'utf8');
+            const voxelBuf = Buffer.from(result.volume.buffer, result.volume.byteOffset, result.volume.byteLength);
+            const totalLen = 4 + headerBuf.length + 4 * 7 + voxelBuf.length;
+            const buf = Buffer.alloc(totalLen);
+            let offset = 0;
+            buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
+            headerBuf.copy(buf, offset); offset += headerBuf.length;
+            buf.writeUInt32LE(f, offset); offset += 4;
+            buf.writeUInt32LE(result.outNx, offset); offset += 4;
+            buf.writeUInt32LE(result.outNy, offset); offset += 4;
+            buf.writeUInt32LE(result.outNz, offset); offset += 4;
+            buf.writeFloatLE(result.min, offset); offset += 4;
+            buf.writeFloatLE(result.max, offset); offset += 4;
+            buf.writeFloatLE(slope, offset); offset += 4;
+            buf.writeFloatLE(inter, offset); offset += 4;
+            voxelBuf.copy(buf, offset);
+            compressResponse(buf, req, res, 'application/octet-stream');
+          } catch (err: any) {
+            if (err?.name === 'AbortError') return;
+            if (!res.headersSent) {
+              res.writeHead(500);
+              res.end(String(err?.message ?? err));
+            }
+          }
+          return;
+        }
+        // vscode-remote gzip: fall through to cached-data path below.
+        // loadFileData() will download + decompress the full file, then
+        // the standard subsampling code reads from entry.dataCache.
+      }
+
+      // ── Parse header (from cache or fetch first 544 bytes) ──
+      if (!entry.headerCache) {
+        let headerBytes: Uint8Array;
+        if (fsPath) {
+          headerBytes = await readLocalFilePartial(fsPath, 0, 543);
+        } else if (entry.uri.scheme === 'http' || entry.uri.scheme === 'https') {
+          headerBytes = await readHttpPartial(uriStr, 0, 543);
+        } else {
+          // Other remote (vscode-remote://): must load full data to parse header
+          const { header } = await this.loadFileData(entry);
+          entry.headerCache = header;
+          headerBytes = new Uint8Array(0);
+        }
+        if (!entry.headerCache) {
+          const header = parseNiiHeaderQuick(headerBytes);
+          if (!header) {
+            res.writeHead(500);
+            res.end('Failed to parse NIfTI header');
+            return;
+          }
+          entry.headerCache = header;
+        }
+      }
+
+      const header = entry.headerCache;
+      const { nx, ny, nz, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = header;
+      const bpv = Math.max(1, bytesPerVoxel);
+      const slope = scl_slope || 1;
+      const inter = scl_inter || 0;
+      const le = littleEndian;
+
+      const outNx = Math.max(1, Math.floor(nx / f));
+      const outNy = Math.max(1, Math.floor(ny / f));
+      const outNz = Math.max(1, Math.floor(nz / f));
+      const outCount = outNx * outNy * outNz;
+      const output = new Float32Array(outCount);
+
+      // ── Decide source: local fs, HTTP remote, or cached data ──
+      const isLocal = !!fsPath;
+      const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+
+      // For non-HTTP remote (vscode-remote://) without cached data, load full
+      // data once and then subsample from memory.
+      if (!isLocal && !isHttpRemote && !entry.dataCache) {
+        await this.loadFileData(entry);
+      }
+      const cachedData = (!isLocal && !isHttpRemote) ? entry.dataCache : null;
+
+      // ── Fetch each source z-slice and extract every f-th voxel ──
+      // Bounded concurrency: 16 parallel range requests. For a 256³ volume
+      // at factor=4, this is 64 slices → 4 batches → ~4 RTTs total.
+      const MAX_CONCURRENT = 16;
+      const sliceByteSize = nx * ny * bpv;
+
+      const fetchAndExtractSlice = async (outZ: number): Promise<void> => {
+        const srcZ = outZ * f;
+        const sliceStart = voxOffset + srcZ * nx * ny * bpv;
+        const sliceEnd = sliceStart + sliceByteSize; // exclusive
+
+        let sliceBytes: Uint8Array;
+        if (cachedData) {
+          sliceBytes = cachedData.subarray(sliceStart, sliceEnd);
+        } else if (isLocal) {
+          sliceBytes = await readLocalFilePartial(fsPath!, sliceStart, sliceEnd - 1);
+        } else {
+          sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd - 1);
+        }
+
+        const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
+        const outSliceBase = outZ * outNy * outNx;
+
+        for (let outY = 0; outY < outNy; outY++) {
+          const srcY = outY * f;
+          const rowBase = srcY * nx;
+          const outRowBase = outSliceBase + outY * outNx;
+          for (let outX = 0; outX < outNx; outX++) {
+            const srcX = outX * f;
+            const off = (rowBase + srcX) * bpv;
+            let val: number;
+            switch (datatype) {
+              case 2: val = sliceBytes[off]; break;
+              case 4: val = view.getInt16(off, le); break;
+              case 8: val = view.getInt32(off, le); break;
+              case 16: val = view.getFloat32(off, le); break;
+              case 64: val = view.getFloat64(off, le); break;
+              case 256: val = (sliceBytes[off] << 24) >> 24; break;
+              case 512: val = view.getUint16(off, le); break;
+              case 768: val = view.getUint32(off, le); break;
+              default: val = 0;
+            }
+            output[outRowBase + outX] = val * slope + inter;
+          }
+        }
+      };
+
+      // Bounded-concurrency pool
+      await new Promise<void>((resolve, reject) => {
+        let nextZ = 0;
+        let active = 0;
+        let settled = false;
+        const launch = (): void => {
+          while (active < MAX_CONCURRENT && nextZ < outNz && !settled) {
+            const z = nextZ++;
+            active++;
+            fetchAndExtractSlice(z)
+              .catch(err => { if (!settled) { settled = true; reject(err); } })
+              .finally(() => {
+                active--;
+                if (settled) return;
+                if (nextZ >= outNz && active === 0) {
+                  settled = true;
+                  resolve();
+                } else {
+                  launch();
+                }
+              });
+          }
+          if (nextZ >= outNz && active === 0 && !settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        launch();
+      });
+
+      // ── Compute min/max from subsampled data ──
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < outCount; i++) {
+        const v = output[i];
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+      if (min === max) max = min + 1;
+
+      // ── Build a low-res header for the viewer ──
+      // Scale voxel sizes so the physical volume dimensions are preserved.
+      const loHeader: any = { ...header };
+      loHeader.nx = outNx;
+      loHeader.ny = outNy;
+      loHeader.nz = outNz;
+      loHeader.dx = (header.dx || 1) * f;
+      loHeader.dy = (header.dy || 1) * f;
+      loHeader.dz = (header.dz || 1) * f;
+      loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
+      // Preserve sform/qform codes but adjust the translation column so the
+      // center of the low-res volume maps to the same world coordinate as the
+      // center of the full volume. This keeps the orientation labels correct.
+      if (Array.isArray(header.sform)) {
+        const sform = header.sform.map((row: number[]) => [...row]);
+        // sform maps voxel → world. After subsampling, voxel (i,j,k) in the
+        // low-res volume corresponds to voxel (i*f, j*f, k*f) in the full
+        // volume. So world = sform * (i*f, j*f, k*f, 1)^T.
+        // The new sform is: [a*f, b*f, c*f, d] for each row [a, b, c, d].
+        for (const row of sform) {
+          row[0] *= f;
+          row[1] *= f;
+          row[2] *= f;
+        }
+        loHeader.sform = sform;
+      }
+
+      // ── Encode binary response ──
+      // Layout (little-endian):
+      //   [4]  header_json_length (uint32)
+      //   [N]  header_json (UTF-8)
+      //   [4]  factor (uint32)
+      //   [4]  out_nx (uint32)
+      //   [4]  out_ny (uint32)
+      //   [4]  out_nz (uint32)
+      //   [4]  global_min (float32)
+      //   [4]  global_max (float32)
+      //   [4]  slope (float32)
+      //   [4]  inter (float32)
+      //   [M]  voxel_data (Float32, out_nx*out_ny*out_nz * 4 bytes)
+      const headerJson = JSON.stringify(loHeader);
+      const headerBuf = Buffer.from(headerJson, 'utf8');
+      const voxelBuf = Buffer.from(output.buffer, output.byteOffset, output.byteLength);
+
+      const totalLen = 4 + headerBuf.length + 4 * 7 + voxelBuf.length;
+      const buf = Buffer.alloc(totalLen);
+      let offset = 0;
+
+      buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
+      headerBuf.copy(buf, offset); offset += headerBuf.length;
+
+      buf.writeUInt32LE(f, offset); offset += 4;
+      buf.writeUInt32LE(outNx, offset); offset += 4;
+      buf.writeUInt32LE(outNy, offset); offset += 4;
+      buf.writeUInt32LE(outNz, offset); offset += 4;
+      buf.writeFloatLE(min, offset); offset += 4;
+      buf.writeFloatLE(max, offset); offset += 4;
+      buf.writeFloatLE(slope, offset); offset += 4;
+      buf.writeFloatLE(inter, offset); offset += 4;
+
+      voxelBuf.copy(buf, offset);
+
+      compressResponse(buf, req, res, 'application/octet-stream');
+    } catch (err: any) {
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end(String(err?.message ?? err));
+      }
     }
   }
 
@@ -1616,6 +1935,18 @@ export class LocalFileProxy {
       return null;
     }
   }
+}
+
+/**
+ * Parse the `factor` query parameter from a request path.
+ * Returns 4 if the parameter is missing or invalid.
+ */
+function parseFactorFromPath(path: string): number {
+  const qIdx = path.indexOf('?');
+  if (qIdx < 0) return 4;
+  const params = new URLSearchParams(path.slice(qIdx + 1));
+  const f = parseInt(params.get('factor') || '4', 10);
+  return Number.isFinite(f) ? f : 4;
 }
 
 /**

@@ -263,3 +263,215 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
     req.end();
   });
 }
+
+export interface VolumePreviewResult {
+  header: any;
+  volume: Float32Array;
+  min: number;
+  max: number;
+  outNx: number;
+  outNy: number;
+  outNz: number;
+}
+
+/**
+ * Stream-download + decompress a .nii.gz file and extract a strided
+ * sub-sampled volume, resolving as soon as all needed z-slices have been
+ * decompressed — WITHOUT waiting for the full file to download.
+ *
+ * For a 256³ Float32 volume at factor=8, only 32 z-slices (12.5% of the
+ * decompressed data) are needed, so the HTTP connection can be closed
+ * early once those slices are extracted.
+ */
+export function streamingGunzipPreviewVolume(
+  source: { type: 'file'; path: string } | { type: 'http'; url: string },
+  factor: number,
+  signal?: AbortSignal,
+): Promise<VolumePreviewResult> {
+  return new Promise((resolve, reject) => {
+    const f = Math.max(2, Math.min(8, Math.floor(factor) || 4));
+    const gunzip = zlib.createGunzip();
+    const chunks: Buffer[] = [];
+    let totalSize = 0;
+    let resolved = false;
+    let header: any = null;
+    let output: Float32Array | null = null;
+    let outNx = 0, outNy = 0, outNz = 0;
+    let nextNeededZ = 0;
+    let min = Infinity, max = -Infinity;
+    let sourceStream: stream.Readable | null = null;
+    let req: http.ClientRequest | null = null;
+
+    const cleanup = (): void => {
+      try { gunzip.destroy(); } catch {}
+      try { (sourceStream as any)?.destroy?.(); } catch {}
+      try { req?.destroy(); } catch {}
+    };
+
+    const onAbort = (): void => {
+      if (!resolved) {
+        resolved = true;
+        cleanup();
+        reject(new DOMException('Aborted', 'AbortError'));
+      }
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+
+    const tryExtractSlices = (): void => {
+      if (!header || !output) return;
+      const h = header;
+      const nx: number = h.nx, ny: number = h.ny;
+      const voxOffset: number = h.voxOffset;
+      const bpv: number = Math.max(1, h.bytesPerVoxel);
+      const datatype: number = h.datatype;
+      const slope: number = h.scl_slope || 1;
+      const inter: number = h.scl_inter || 0;
+      const le: boolean = h.littleEndian;
+      const sliceByteSize = nx * ny * bpv;
+
+      // Quick guard: do we have enough decompressed data for the next
+      // needed slice?  This avoids O(n) Buffer.concat on every chunk.
+      const nextSliceEnd = voxOffset + (nextNeededZ * f) * sliceByteSize + sliceByteSize;
+      if (totalSize < nextSliceEnd) return;
+
+      const buf = Buffer.concat(chunks);
+
+      while (nextNeededZ < outNz) {
+        const srcZ = nextNeededZ * f;
+        const sliceStart = voxOffset + srcZ * sliceByteSize;
+        const sliceEnd = sliceStart + sliceByteSize;
+        if (buf.length < sliceEnd) break;
+
+        const sliceBytes = buf.subarray(sliceStart, sliceEnd);
+        const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
+        const outSliceBase = nextNeededZ * outNy * outNx;
+
+        for (let outY = 0; outY < outNy; outY++) {
+          const srcY = outY * f;
+          const rowBase = srcY * nx;
+          const outRowBase = outSliceBase + outY * outNx;
+          for (let outX = 0; outX < outNx; outX++) {
+            const srcX = outX * f;
+            const off = (rowBase + srcX) * bpv;
+            let val: number;
+            switch (datatype) {
+              case 2: val = sliceBytes[off]; break;
+              case 4: val = view.getInt16(off, le); break;
+              case 8: val = view.getInt32(off, le); break;
+              case 16: val = view.getFloat32(off, le); break;
+              case 64: val = view.getFloat64(off, le); break;
+              case 256: val = (sliceBytes[off] << 24) >> 24; break;
+              case 512: val = view.getUint16(off, le); break;
+              case 768: val = view.getUint32(off, le); break;
+              default: val = 0;
+            }
+            const scaled = val * slope + inter;
+            output[outRowBase + outX] = scaled;
+            if (scaled < min) min = scaled;
+            if (scaled > max) max = scaled;
+          }
+        }
+        nextNeededZ++;
+      }
+
+      if (nextNeededZ >= outNz && !resolved) {
+        resolved = true;
+        if (min === max) max = min + 1;
+        if (signal) signal.removeEventListener('abort', onAbort);
+        cleanup();
+        resolve({ header, volume: output, min, max, outNx, outNy, outNz });
+      }
+    };
+
+    gunzip.on('data', (chunk: Buffer) => {
+      if (resolved) return;
+      if (signal?.aborted) { cleanup(); return; }
+      chunks.push(chunk);
+      totalSize += chunk.length;
+
+      if (!header && totalSize >= 544) {
+        const buf = Buffer.concat(chunks);
+        header = parseNiiHeaderQuick(new Uint8Array(buf.buffer, buf.byteOffset, buf.length));
+        if (header) {
+          outNx = Math.max(1, Math.floor(header.nx / f));
+          outNy = Math.max(1, Math.floor(header.ny / f));
+          outNz = Math.max(1, Math.floor(header.nz / f));
+          output = new Float32Array(outNx * outNy * outNz);
+        }
+      }
+
+      if (header && output) {
+        tryExtractSlices();
+      }
+    });
+
+    gunzip.on('end', () => {
+      if (!resolved) {
+        // Stream ended — if we got at least some slices, resolve with
+        // what we have (remaining voxels stay zero).  Otherwise reject.
+        if (header && output && nextNeededZ > 0) {
+          resolved = true;
+          if (min === max) max = min + 1;
+          if (signal) signal.removeEventListener('abort', onAbort);
+          resolve({ header, volume: output, min, max, outNx, outNy, outNz });
+        } else if (!resolved) {
+          resolved = true;
+          if (signal) signal.removeEventListener('abort', onAbort);
+          reject(new Error('Stream ended before enough data for preview volume'));
+        }
+      }
+    });
+
+    gunzip.on('error', (err: Error) => {
+      if (!resolved) {
+        resolved = true;
+        if (signal) signal.removeEventListener('abort', onAbort);
+        reject(err);
+      }
+    });
+
+    // Create source stream and pipe through gunzip
+    if (source.type === 'file') {
+      sourceStream = fs.createReadStream(source.path);
+      sourceStream.on('error', (err: Error) => {
+        if (!resolved) {
+          resolved = true;
+          if (signal) signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      });
+      sourceStream.pipe(gunzip);
+    } else {
+      const url = new URL(source.url);
+      const mod = url.protocol === 'https:' ? https : http;
+      const options: http.RequestOptions = {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === 'https:' ? 443 : 80),
+        path: url.pathname + url.search,
+        method: 'GET',
+        agent: getAgentForUrl(source.url),
+      };
+      req = mod.request(options, (res) => {
+        if (res.statusCode !== 200) {
+          if (!resolved) {
+            resolved = true;
+            if (signal) signal.removeEventListener('abort', onAbort);
+            reject(new Error(`HTTP ${res.statusCode}`));
+          }
+          return;
+        }
+        sourceStream = res;
+        res.pipe(gunzip);
+      });
+      req.on('error', (err: Error) => {
+        if (!resolved) {
+          resolved = true;
+          if (signal) signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      });
+      req.end();
+    }
+  });
+}
+

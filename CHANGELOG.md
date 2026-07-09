@@ -2,6 +2,30 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.1.4] - 2026-07-09
+
+### Performance — Faster Loading & Switching
+- **Parallelized preview + full download**: `handleLoadVolume` now fires the low-res preview fetch concurrently with the full parallel download instead of awaiting it serially, saving 1-2s on first load for 100MB remote files.
+- **Anticipatory next-image preload**: the viewer speculatively loads the next image in the background after the current image finishes, so clicking "next" is instant or nearly-instant.
+- **Preconnect next-image origin**: before preloading, the viewer injects `<link rel="preconnect">` and warms the HTTP connection to the next image's origin, eliminating TCP/TLS RTT on switch.
+- **Adaptive preview factor for slow networks**: the worker chooses `factor=8` (1/512 data) when estimated bandwidth is below 5 MB/s, and `factor=4` otherwise, so previews arrive much faster on weak links.
+- **Persistent full-volume IndexedDB cache**: added `VolumeCacheDB` that stores complete voxel buffers on disk. Images evicted from memory (`MAX_RESIDENT_IMAGE_DATA` 2 → 4) restore from disk instead of re-downloading from the remote server.
+- **Larger disk cache budgets**: `SliceCacheDB` and legacy cache limits raised from 500MB to 1.5GB.
+- **Fixed GPU 3D texture stale data bug**: `applyImageState` now calls `clearVolume3D()` before re-uploading, ensuring the correct image is rendered after switching.
+
+---
+
+## [2.2.0] - 2026-06-28
+
+### Performance — Low-Resolution Fast Preview
+- **Strided sub-sampled preview volume for .nii files**: the proxy exposes a new `/preview-volume/{id}?factor=N` endpoint that fetches only every N-th voxel in each axis via parallel Range requests (16-way concurrency) and returns a complete low-res Float32 volume. For a 100MB remote .nii file at factor=4, only ~1.5MB of data is transferred, giving a full three-view preview in ~1-2s instead of waiting for the entire download.
+- **Streaming gzip preview for .nii.gz files**: `streamingGunzipPreviewVolume()` in `compression.ts` stream-downloads + decompresses a .nii.gz file and extracts the sub-sampled volume as soon as enough z-slices are available (factor=8 → 12.5% of the file), then closes the HTTP connection early. This brings .nii.gz preview time down from "wait for full download" to ~2-3s for a 100MB file.
+- **`previewVolume` message in worker → viewer pipeline**: the worker fetches the low-res volume before starting the full download, sends it as a `previewVolume` message (with transferable `Float32Array`), and the viewer immediately renders all three orthogonal views with a "低分辨率预览" badge. When the full-resolution volume arrives, the viewer seamlessly replaces the preview, scales slice indices back to full-res space, and hides the badge.
+- **Worker skips redundant `preview` message**: when `previewVolume` has already been sent, the worker sets `earlyPreviewSent` so `processRawVolume` skips the redundant single-slice preview computation.
+- **Slice index preservation on upgrade**: when the full-res volume replaces the low-res preview, the viewer scales the user's current slice indices by the factor (e.g., slice 32 at factor=4 → slice 128 at full-res), preserving the viewing position.
+
+---
+
 ## [2.1.3] - 2026-06-20
 
 ### Performance

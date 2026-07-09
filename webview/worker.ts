@@ -1605,6 +1605,101 @@ async function streamingNiiLoadFromResponse(
   return final;
 }
 
+/**
+ * Try to fetch a low-resolution subsampled preview volume from the proxy's
+ * /preview-volume/{id}?factor=N endpoint. On success, emits a `previewVolume`
+ * message to the main thread so the viewer can render all three orthogonal
+ * views immediately at reduced resolution, while the full volume continues
+ * downloading in the background.
+ *
+ * Binary response layout (little-endian):
+ *   [4]  header_json_length (uint32)
+ *   [N]  header_json (UTF-8)  — low-res header with scaled dims/voxel sizes
+ *   [4]  factor (uint32)
+ *   [4]  out_nx (uint32)
+ *   [4]  out_ny (uint32)
+ *   [4]  out_nz (uint32)
+ *   [4]  global_min (float32)
+ *   [4]  global_max (float32)
+ *   [4]  slope (float32)
+ *   [4]  inter (float32)
+ *   [M]  voxel_data (Float32, out_nx*out_ny*out_nz * 4 bytes)
+ *
+ * Returns true if a preview was emitted, false if the endpoint was
+ * unavailable or the fetch failed (caller falls back to existing flow).
+ */
+async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: AbortSignal, estimatedBps = 0): Promise<boolean> {
+  // Convert /file/{id} → /preview-volume/{id}?factor=N
+  // Only proxy URLs (localhost) have this endpoint. Direct remote URLs don't.
+  if (!proxyUrl.includes('/file/')) return false;
+  // Adaptive factor: on slow links (<5 MB/s) use factor=8 (1/512 data) so the
+  // preview arrives much faster; on fast links use factor=4 (1/64 data) for
+  // better quality since the transfer time difference is negligible.
+  const factor = (estimatedBps > 0 && estimatedBps < 5 * 1024 * 1024 * 8) ? 8 : 4;
+  const previewUrl = proxyUrl.replace('/file/', '/preview-volume/') + `?factor=${factor}`;
+
+  try {
+    const resp = await fetchWithRetry(previewUrl, undefined, 2, signal);
+    if (!resp.ok) return false;
+
+    const ab = await resp.arrayBuffer();
+    const data = new Uint8Array(ab);
+    if (data.length < 4) return false;
+
+    let offset = 0;
+    const dv = new DataView(ab);
+
+    const headerLen = dv.getUint32(offset, true); offset += 4;
+    if (offset + headerLen > data.length) return false;
+
+    const headerJson = new TextDecoder().decode(data.subarray(offset, offset + headerLen));
+    offset += headerLen;
+
+    let header: any;
+    try { header = JSON.parse(headerJson); } catch { return false; }
+
+    if (offset + 28 > data.length) return false;
+    const factor = dv.getUint32(offset, true); offset += 4;
+    const outNx = dv.getUint32(offset, true); offset += 4;
+    const outNy = dv.getUint32(offset, true); offset += 4;
+    const outNz = dv.getUint32(offset, true); offset += 4;
+    const min = dv.getFloat32(offset, true); offset += 4;
+    const max = dv.getFloat32(offset, true); offset += 4;
+    const slope = dv.getFloat32(offset, true); offset += 4;
+    const inter = dv.getFloat32(offset, true); offset += 4;
+
+    const voxelCount = outNx * outNy * outNz;
+    const voxelBytes = voxelCount * 4;
+    if (offset + voxelBytes > data.length) return false;
+
+    // Copy voxel data into a fresh, transferable Float32Array so we can
+    // transfer its buffer to the main thread without neutering the response.
+    const voxelData = new Float32Array(voxelCount);
+    voxelData.set(new Float32Array(ab, offset, voxelCount));
+
+    self.postMessage({
+      id,
+      type: 'previewVolume',
+      header,
+      voxelData,
+      globalMin: min,
+      globalMax: max,
+      slope,
+      inter,
+      factor,
+      datatype: 16, // Float32
+    }, [voxelData.buffer]);
+
+    // Cache the low-res header so processRawVolume can skip redundant parse
+    earlyPreviewSent.add(id);
+    earlyPreviewHeaders.set(id, header);
+    return true;
+  } catch (err: any) {
+    if (err?.name === 'AbortError') throw err;
+    return false;
+  }
+}
+
 async function handleLoadVolume(id: number, url: string, isGzip: boolean, directFetchUrl?: string, estimatedBps = 0, estimatedRttMs = 0) {
   cancelVolumeLoad(id);
   const controller = new AbortController();
@@ -1619,6 +1714,29 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
   const fetchUrl = directFetchUrl || url;
   try {
     self.postMessage({ id, type: 'progress', value: 0.02, stage: 'downloading' });
+
+    // ── Low-res preview volume (Stage 1: .nii, Stage 2: .nii.gz) ──
+    // The proxy exposes /preview-volume/{id}?factor=N which streams the
+    // remote file, subsamples every N-th voxel, and returns a complete
+    // low-res Float32 volume. For .nii it uses parallel Range requests;
+    // for .nii.gz it stream-decompresses just enough slices (factor=8 →
+    // 12.5% of the file) and closes the connection early.  This gives a
+    // full three-view preview in ~1-3 s for a 100 MB remote file.
+    // Falls back silently if the endpoint is unavailable.
+    //
+    // KEY OPTIMIZATION: fire the preview fetch concurrently with the full
+    // download instead of awaiting it serially.  The preview goes through
+    // the localhost proxy (subsampling server-side) while the full download
+    // goes direct to the remote origin — they use different connections
+    // and overlap completely, saving 1-2 s of serial wait.
+    // The preview sends its own 'previewVolume' message when ready; if it
+    // arrives after processRawVolume, the redundant 'preview' message is
+    // simply ignored by the main thread (~5ms CPU waste, negligible).
+    tryFetchPreviewVolume(url, id, signal, estimatedBps).catch((err: any) => {
+      // AbortError is expected when the load is cancelled — swallow it to
+      // avoid an unhandled rejection (this promise is intentionally not awaited).
+      if (err?.name === 'AbortError') return;
+    });
 
     const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
     let rawData: Uint8Array;

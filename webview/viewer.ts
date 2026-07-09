@@ -1,7 +1,7 @@
 import { NiiHeader, DATATYPE_NAMES } from './nii-parser';
 import { WebGPURenderer } from './webgpuRenderer';
 import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
-import { deriveFileHash } from './SliceCacheDB';
+import { deriveFileHash, getVolumeCacheDB, makeTypedArrayFromBuffer } from './SliceCacheDB';
 import { initWasmBindings, getWasmBindings } from './wasmBridge';
 
 declare function acquireVsCodeApi(): any;
@@ -130,6 +130,10 @@ let crosshairVisible = true;
 let isRemoteSource = false;
 let fullVolumeLoaded = false;
 let interactionInitialized = false;
+// Low-res preview state (Stage 1: strided sub-sampling)
+let isLowResPreview = false;
+let lowResFactor = 1;
+let lowResBadge: HTMLDivElement | null = null;
 
 // Measurement tools state
 let measureMode = false;
@@ -163,8 +167,8 @@ let enableLOD = true;
 let lodUpgradeTimer: number | null = null;
 let lastScrollTime = 0;
 
-const MAX_RESIDENT_IMAGE_DATA = 2;
-const MAX_PARALLEL_VOLUME_LOADS = 1;
+const MAX_RESIDENT_IMAGE_DATA = 4;
+const MAX_PARALLEL_VOLUME_LOADS = 2;
 const ACTIVE_FULL_LOAD_DEBOUNCE_MS = 180;
 let activeVolumeLoads = 0;
 type VolumeLoadPriority = 'active' | 'background';
@@ -1678,6 +1682,13 @@ class SliceWorkerPool {
     for (const w of this.workers) w.postMessage(message);
   }
 
+  /** Send a message to only the first worker — avoids duplicate downloads
+   *  when loading a volume (broadcast would make every worker fetch the
+   *  same file simultaneously, wasting 2/3 of bandwidth). */
+  sendToFirst(message: Record<string, any>): void {
+    if (this.workers.length > 0) this.workers[0].postMessage(message);
+  }
+
   terminate(): void {
     for (const w of this.workers) w.terminate();
     this.workers = [];
@@ -1731,7 +1742,7 @@ function attachWorkerRouter(worker: Worker) {
       else pending.resolve(msg);
       return;
     }
-    if (msg?.type === 'progress' || msg?.type === 'preview' || msg?.type === 'volume' || msg?.type === 'error') {
+    if (msg?.type === 'progress' || msg?.type === 'preview' || msg?.type === 'previewVolume' || msg?.type === 'volume' || msg?.type === 'error') {
       workerStreamListener?.(msg);
     }
   };
@@ -1818,7 +1829,10 @@ function cancelQueuedVolumeLoads(exceptKey?: string): void {
 async function reprioritizeVolumeLoad(key: string, priority: VolumeLoadPriority): Promise<void> {
   if (priority !== 'active') return;
   cancelQueuedVolumeLoads(key);
-  if (activeVolumeLoadKey && activeVolumeLoadKey !== key) {
+  // Only cancel the active load when at capacity. With MAX_PARALLEL_VOLUME_LOADS > 1
+  // we let the previous load continue in the background so the user can keep
+  // browsing the first image while the second loads.
+  if (activeVolumeLoadKey && activeVolumeLoadKey !== key && activeVolumeLoads >= MAX_PARALLEL_VOLUME_LOADS) {
     cancelVolumeLoadByKey(activeVolumeLoadKey);
   }
 }
@@ -1950,6 +1964,14 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
   globalMax = img.max;
   fileName = img.name;
   img.lastAccess = Date.now();
+  // Clear old GPU 3D textures so the new volume's data gets uploaded.
+  // Without this, isVolume3DReady() stays true from the previous image and
+  // tryUploadVolume3D() skips the upload — rendering stale data after a switch.
+  if (volumeData) {
+    for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
+      glRenderers[axis]?.clearVolume3D();
+    }
+  }
   tryUploadVolume3D();
   if (!preserveSlices && img.preview) {
     setCurrentSlice('axial', new Float32Array(img.preview.axial), img.header.nx, img.header.ny, 1);
@@ -1972,7 +1994,7 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
     worker.onmessage = (ev) => {
       const msg = ev.data;
       if (msg.id !== requestId) return;
-      if (msg.type === 'progress' || msg.type === 'preview') {
+      if (msg.type === 'progress' || msg.type === 'preview' || msg.type === 'previewVolume') {
         progress?.(msg);
         return;
       }
@@ -2032,6 +2054,35 @@ function scheduleActiveImageLoad(index: number): void {
   }, ACTIVE_FULL_LOAD_DEBOUNCE_MS);
 }
 
+// ── Anticipatory preload of the next image ──────────────────────────
+// After the active image finishes loading, we speculatively start loading
+// the NEXT image in the background.  This way, when the user clicks "next",
+// the data is either already in memory, in IndexedDB (instant restore), or
+// mid-download (much shorter wait).  The preload uses 'background' priority
+// so it never cancels or interferes with an active load.
+let preloadTimer: number | null = null;
+function scheduleNextImagePreload(currentIdx: number): void {
+  if (preloadTimer) {
+    window.clearTimeout(preloadTimer);
+    preloadTimer = null;
+  }
+  // Delay 800ms so the active image's render + GPU upload settle first,
+  // and the user has time to start scrolling before we consume bandwidth.
+  preloadTimer = window.setTimeout(() => {
+    preloadTimer = null;
+    const nextIdx = currentIdx + 1;
+    if (nextIdx >= images.length) return;
+    const nextImg = images[nextIdx];
+    if (!nextImg || nextImg.data || nextImg.loadPromise) return;
+    // Warm the TCP/TLS connection so the actual download starts faster
+    const nextUrl = nextImg.directUrl || nextImg.url;
+    injectPreconnectHint(nextUrl);
+    void warmupConnection(nextUrl);
+    // Trigger background load (checks IndexedDB first, then remote)
+    void ensureImageData(nextIdx, 'background').catch(() => {});
+  }, 800);
+}
+
 async function ensureImageData(index: number, priority: VolumeLoadPriority = 'background'): Promise<void> {
   const img = images[index];
   if (!img) return;
@@ -2040,6 +2091,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
   if (img.data) {
     img.lastAccess = Date.now();
     evictInactiveImageData([index, activeImageIdx]);
+    if (index === activeImageIdx) scheduleNextImagePreload(index);
     return;
   }
   if (img.loadPromise) {
@@ -2049,10 +2101,78 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
   img.state = 'loading';
   img.loadPromise = queueVolumeLoad(loadKey, async () => {
     const startedAt = performance.now();
+
+    // ── Try IndexedDB volume cache first ────────────────────────────
+    // If the image was previously evicted from memory (img.data = null) but
+    // the full volume is still on disk, restore it instantly instead of
+    // re-downloading from the remote server.  This is what makes repeated
+    // clicking between images feel instant.
+    try {
+      const cached = await getVolumeCacheDB().get(loadKey);
+      if (cached) {
+        img.header = cached.header;
+        img.data = makeTypedArrayFromBuffer(cached.voxelData, cached.datatype);
+        img.min = cached.min;
+        img.max = cached.max;
+        img.slope = cached.slope;
+        img.inter = cached.inter;
+        img.state = 'ready';
+        img.lastAccess = Date.now();
+        perfMonitor.fullLoads.push(performance.now() - startedAt);
+        publishPerfMonitor();
+        if (index === activeImageIdx) {
+          applyImageState(img, true);
+          hideLowResBadge();
+          updateFileInfo();
+          updateSliderValues();
+          renderAllViews();
+          updateImagePicker();
+        }
+        evictInactiveImageData([index, activeImageIdx]);
+        if (index === activeImageIdx) scheduleNextImagePreload(index);
+        return;
+      }
+    } catch {
+      // Cache read failed — fall through to remote download
+    }
+
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const result = await loadVolumeViaWorker(loadKey, img.url, img.url.endsWith('.gz'), (msg) => {
+          if (msg.type === 'previewVolume' && index === activeImageIdx && !img.data) {
+            // Low-res preview arrived — render immediately so the user sees
+            // something while the full-resolution download continues.
+            img.header = msg.header;
+            img.min = msg.globalMin;
+            img.max = msg.globalMax;
+            img.slope = msg.slope || 1;
+            img.inter = msg.inter || 0;
+            img.state = 'preview';
+            img.lastAccess = Date.now();
+
+            header = msg.header;
+            computeViewFlips();
+            globalMin = msg.globalMin;
+            globalMax = msg.globalMax;
+            dataSlope = msg.slope || 1;
+            dataInter = msg.inter || 0;
+            volumeData = msg.voxelData;
+
+            const h = msg.header;
+            sliceIdx.axial = Math.floor(h.nz / 2);
+            sliceIdx.coronal = Math.floor(h.ny / 2);
+            sliceIdx.sagittal = Math.floor(h.nx / 2);
+
+            updateFileInfo();
+            updateSliderValues();
+            const loadingEl = document.getElementById('loading');
+            if (loadingEl) loadingEl.style.display = 'none';
+            renderAllViews();
+            setupInteraction();
+            showLowResBadge(msg.factor || 4);
+            updateImagePicker();
+          }
           if (index === activeImageIdx && msg.type === 'progress') {
             updateProgress(0.5 + msg.value * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
           }
@@ -2067,14 +2187,43 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
         img.lastAccess = Date.now();
         perfMonitor.fullLoads.push(performance.now() - startedAt);
         publishPerfMonitor();
+
+        // ── Persist full volume to IndexedDB for instant restore later ──
+        // Fire-and-forget: if IndexedDB is full or unavailable, just skip.
+        if (img.data) {
+          const volBuf = img.data.byteOffset === 0
+            ? img.data.buffer
+            : img.data.buffer.slice(img.data.byteOffset, img.data.byteOffset + img.data.byteLength);
+          getVolumeCacheDB().put({
+            key: loadKey,
+            header: result.header,
+            voxelData: volBuf,
+            datatype: result.header.datatype,
+            min: result.globalMin,
+            max: result.globalMax,
+            slope: result.slope || 1,
+            inter: result.inter || 0,
+          }).catch(() => {});
+        }
+
         if (index === activeImageIdx) {
+          // If a low-res preview was shown, scale slice indices back to
+          // full-resolution voxel space before swapping in the full volume.
+          if (isLowResPreview && lowResFactor > 1) {
+            const newH = result.header;
+            sliceIdx.axial = Math.min(newH.nz - 1, Math.round(sliceIdx.axial * lowResFactor));
+            sliceIdx.coronal = Math.min(newH.ny - 1, Math.round(sliceIdx.coronal * lowResFactor));
+            sliceIdx.sagittal = Math.min(newH.nx - 1, Math.round(sliceIdx.sagittal * lowResFactor));
+          }
           applyImageState(img, true);
+          hideLowResBadge();
           updateFileInfo();
           updateSliderValues();
           renderAllViews();
           updateImagePicker();
         }
         evictInactiveImageData([index, activeImageIdx]);
+        if (index === activeImageIdx) scheduleNextImagePreload(index);
         return;
       } catch (err) {
         if ((err as any)?.name === 'AbortError') throw err;
@@ -3161,6 +3310,20 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   crosshairV.style.left = screenX + 'px';
 }
 
+/** Update the crosshair DOM position for a single axis using current viewState. */
+function updateCrosshairPosition(axis: 'axial' | 'coronal' | 'sagittal') {
+  const vs = viewState[axis];
+  // updateCrosshair reads container dims via getBoundingClientRect(); w/h/cw/ch are unused.
+  updateCrosshair(axis, 0, 0, vs.zoom, vs.panX, vs.panY, 0, 0);
+}
+
+/** Update crosshair positions in all three orthogonal views. */
+function updateAllCrosshairs() {
+  updateCrosshairPosition('axial');
+  updateCrosshairPosition('coronal');
+  updateCrosshairPosition('sagittal');
+}
+
 function updateScaleBar(axis: string, pixelW: number, pixelH: number, zoom: number, cw: number) {
   if (!header) return;
   const container = canvases[axis as keyof typeof canvases]?.parentElement;
@@ -3878,6 +4041,7 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
     updateSliceInfo(axis);
     updateSliderValues();
     if (crosshairVisible) updateCoordInfoFromCenter();
+    updateAllCrosshairs();
     return;
   }
 
@@ -3918,6 +4082,9 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
   updateSliceInfo(axis);
   updateSliderValues();
   if (crosshairVisible) updateCoordInfoFromCenter();
+
+  // Scrolling one axis moves the crosshair in the other two views — update all.
+  updateAllCrosshairs();
 
   if (volumeData) preloadSlices(axis, sliceIdx[axis]);
 }
@@ -4907,6 +5074,25 @@ async function fallbackToHttpPreview(): Promise<void> {
   }
 }
 
+function showLowResBadge(factor: number) {
+  isLowResPreview = true;
+  lowResFactor = factor;
+  if (!lowResBadge) {
+    lowResBadge = document.createElement('div');
+    lowResBadge.id = 'lowres-badge';
+    lowResBadge.style.cssText = 'position:fixed;top:12px;right:12px;background:rgba(0,0,0,0.78);color:#ffd54f;padding:6px 12px;border-radius:6px;font-size:12px;font-family:monospace;z-index:9999;pointer-events:none;border:1px solid rgba(255,213,79,0.45);';
+    document.body.appendChild(lowResBadge);
+  }
+  const denom = factor * factor * factor;
+  lowResBadge.textContent = `低分辨率预览 (1/${denom} 数据) · 正在加载完整分辨率…`;
+  lowResBadge.style.display = 'block';
+}
+
+function hideLowResBadge() {
+  isLowResPreview = false;
+  if (lowResBadge) lowResBadge.style.display = 'none';
+}
+
 function loadFullVolume() {
   let previewReceived = false;
   let volumeReceived = false;
@@ -4921,12 +5107,47 @@ function loadFullVolume() {
       if (loadingText) loadingText.textContent = 'Error: ' + d.error;
       return;
     }
+    if (d.type === 'previewVolume') {
+      // Stage 1 low-res preview: a complete strided sub-sampled volume
+      // already decoded by the proxy. Render all three orthogonal views
+      // immediately and surface a badge; the full-resolution `volume`
+      // message will replace it when download/decompress finishes.
+      if (volumeReceived) return;            // full volume already shown
+      if (isLowResPreview) return;           // badge already up
+      header = d.header;
+      computeViewFlips();
+      globalMin = d.globalMin;
+      globalMax = d.globalMax;
+      dataSlope = d.slope || 1;
+      dataInter = d.inter || 0;
+      volumeData = d.voxelData;
+
+      // Center slices within the low-res volume
+      const h = d.header;
+      sliceIdx.axial = Math.floor(h.nz / 2);
+      sliceIdx.coronal = Math.floor(h.ny / 2);
+      sliceIdx.sagittal = Math.floor(h.nx / 2);
+
+      initialWindowWidth = windowWidth;
+      initialWindowLevel = windowLevel;
+
+      updateFileInfo();
+      updateSliderValues();
+
+      const loading = document.getElementById('loading');
+      if (loading) loading.style.display = 'none';
+      renderAllViews();
+      setupInteraction();
+      showLowResBadge(d.factor || 4);
+      return;
+    }
     if (d.type === 'preview') {
       if (previewReceived) return;
       previewReceived = true;
       // Partial early preview (axial z=0 only) is not user-ready; keep loading visible.
       if (d.partialPreview) {
-        loadingText.textContent = 'Loading volume...';
+        // If low-res preview is already shown, don't regress the loading text.
+        if (!isLowResPreview) loadingText.textContent = 'Loading volume...';
         return;
       }
       if (!header) {
@@ -4963,6 +5184,32 @@ function loadFullVolume() {
       volumeReceived = true;
       volumeData = d.voxelData;
       fullVolumeLoaded = true;
+      // Full-resolution volume arrived — clear the low-res preview state.
+      // `header` may already be set from `previewVolume`; only override if
+      // the full-volume header differs (it carries the true dimensions).
+      const prevHeaderWasLowRes = isLowResPreview;
+      if (prevHeaderWasLowRes) {
+        // Preserve the user's current slice indices by scaling them back
+        // into full-resolution voxel space.
+        const prevH = header;
+        const newH = d.header;
+        if (prevH && lowResFactor > 1) {
+          sliceIdx.axial = Math.min(newH.nz - 1, Math.round(sliceIdx.axial * lowResFactor));
+          sliceIdx.coronal = Math.min(newH.ny - 1, Math.round(sliceIdx.coronal * lowResFactor));
+          sliceIdx.sagittal = Math.min(newH.nx - 1, Math.round(sliceIdx.sagittal * lowResFactor));
+        }
+      }
+      // Promote the global header/min/max/slope/inter to full-resolution
+      // values. After a previewVolume, the globals still hold the low-res
+      // header (smaller nx/ny/nz, scaled spacings) and must be replaced
+      // before renderAllViews() reads them.
+      header = d.header;
+      computeViewFlips();
+      globalMin = d.globalMin;
+      globalMax = d.globalMax;
+      dataSlope = d.slope || 1;
+      dataInter = d.inter || 0;
+      hideLowResBadge();
       const primary = images[0];
       if (primary) {
         primary.header = d.header;
@@ -5006,7 +5253,15 @@ function loadFullVolume() {
     }
   };
 
-  if (slicePool) slicePool.broadcast({ id: 0, type: 'loadVolume', url: fileUrl, isGzip });
+  if (slicePool) slicePool.sendToFirst({
+    id: 0,
+    type: 'loadVolume',
+    url: fileUrl,
+    isGzip,
+    directUrl: directUrl || '',
+    estimatedBps: bandwidthEstimator?.estimatedBps ?? 0,
+    estimatedRttMs: bandwidthEstimator?.estimatedRttMs ?? 0,
+  });
 }
 
 function updateProgress(value: number, text?: string, detail?: string) {
@@ -5075,6 +5330,8 @@ async function switchToImage(idx: number) {
       activeLoadDebounceTimer = null;
     }
     publishPerfMonitor();
+    // Image is ready — speculatively preload the next one in the background
+    scheduleNextImagePreload(idx);
   }
 }
 
@@ -5204,7 +5461,15 @@ function primeSliceFramesFromPreview(img: VolumeImage): void {
 }
 
 async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: boolean, newDirectUrl?: string) {
-  broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
+  // If we already have a displayed image, keep it visible while the new one
+  // loads in the background.  Only clear the display when there's nothing to
+  // show (first load or previous image failed).
+  const hasVisibleImage = volumeData && images.length > 0 && images[0]?.data;
+
+  if (!hasVisibleImage) {
+    broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
+  }
+
   fileUrl = url;
   if (newDirectUrl) directUrl = newDirectUrl;
   const targetUrl = directUrl || fileUrl;
@@ -5214,10 +5479,13 @@ async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: b
   isGzip = name.endsWith('.gz');
   isRemoteSource = !!_remote;
   fullVolumeLoaded = false;
-  volumeData = null;
-  currentSlices.axial = null;
-  currentSlices.coronal = null;
-  currentSlices.sagittal = null;
+
+  if (!hasVisibleImage) {
+    volumeData = null;
+    currentSlices.axial = null;
+    currentSlices.coronal = null;
+    currentSlices.sagittal = null;
+  }
 
   pendingAddImageIdx = images.length;
   images.push({
