@@ -21,6 +21,15 @@ flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"
+# libdeflate: ~2x faster decompression than zlib on Apple Silicon.
+# Used by fast_decompress_gzip_oneshot for the local .nii.gz hot path.
+# Benchmarks (libdeflater crate docs, Calgary/Canterbury corpus) show 2-2.5x
+# speedup over flate2 for decompression. libdeflate-sys builds libdeflate
+# from source (static linking, no runtime dependency).
+# Note: libdeflate is one-shot (no streaming), so we pre-allocate the output
+# buffer using gzip ISIZE and call gzip_decompress once. This trades the
+# streaming preview (z=0 slice during decompression) for ~2x throughput.
+libdeflater = "1.25"
 
 [build-dependencies]
 napi-build = "2"
