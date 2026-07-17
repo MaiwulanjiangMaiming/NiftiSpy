@@ -53,6 +53,7 @@ interface NativeBindings {
   fastDecompressGzip?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipOneshot?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipFileAsync?(path: string): Promise<Uint8Array | Buffer>;
+  fastDecompressGzipParallelAsync?(path: string): Promise<Uint8Array | Buffer>;
   mmapExtractSliceBatch?(path: string, header: any, axis: string, indices: number[]): Float32Array[] | null;
   mmapGetVolumeStats?(path: string, header: any): VolumeStats | null;
   fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array | null;
@@ -70,6 +71,7 @@ interface RawNativeBindings {
   fastDecompressGzip?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipOneshot?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipFileAsync?(path: string): Promise<Uint8Array | Buffer>;
+  fastDecompressGzipParallelAsync?(path: string): Promise<Uint8Array | Buffer>;
   mmapExtractSliceBatch?(path: string, headerJson: string, axis: string, indices: number[]): Buffer[] | null;
   mmapGetVolumeStats?(path: string, headerJson: string): RawVolumeStats | null;
   fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Buffer | null;
@@ -131,6 +133,7 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
     fastDecompressGzip: raw.fastDecompressGzip?.bind(raw),
     fastDecompressGzipOneshot: raw.fastDecompressGzipOneshot?.bind(raw),
     fastDecompressGzipFileAsync: raw.fastDecompressGzipFileAsync?.bind(raw),
+    fastDecompressGzipParallelAsync: raw.fastDecompressGzipParallelAsync?.bind(raw),
     mmapExtractSliceBatch(path: string, header: any, axis: string, indices: number[]) {
       const buffers = raw.mmapExtractSliceBatch?.(path, JSON.stringify(header), axis, indices);
       if (!buffers) return null;
@@ -155,7 +158,30 @@ function loadBindings(): NativeBindings | null {
   if (cachedBindings !== undefined) return cachedBindings;
   try {
     const dynamicRequire = createRequire(__filename);
-    const rawBindings = dynamicRequire('../native/index.node') as RawNativeBindings;
+    // Prefer platform-specific napi-rs binary (rusty-rapidgzip parallel build):
+    //   niftispy_native.darwin-arm64.node  (macOS Apple Silicon)
+    //   niftispy_native.darwin-x64.node    (macOS Intel)
+    //   niftispy_native.linux-x64-gnu.node (Linux x86_64)
+    //   niftispy_native.win32-x64-msvc.node(Windows x86_64)
+    // Falls back to native/index.node (wasm-pack legacy build) if not found.
+    const platformName = `${process.platform}-${process.arch}`;
+    const candidates = [
+      `../niftispy_native.${platformName}.node`,
+      `../niftispy_native.${process.platform}-${process.arch}-gnu.node`,
+      '../native/index.node',  // legacy fallback (wasm-pack, no parallel support)
+    ];
+    let rawBindings: RawNativeBindings | null = null;
+    for (const candidate of candidates) {
+      try {
+        rawBindings = dynamicRequire(candidate) as RawNativeBindings;
+        break;
+      } catch {
+        // try next candidate
+      }
+    }
+    if (!rawBindings) {
+      throw new Error('no native binary found');
+    }
     cachedBindings = wrapBindings(rawBindings);
   } catch {
     cachedBindings = null;

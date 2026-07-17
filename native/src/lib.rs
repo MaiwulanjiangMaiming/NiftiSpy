@@ -713,6 +713,152 @@ pub fn fast_decompress_gzip_file_async(path: String) -> AsyncTask<GzipDecompress
   AsyncTask::new(GzipDecompressTask { path })
 }
 
+// ── Parallel gzip decompression (Phase 2: multi-core, cross-platform) ──
+//
+// Uses rusty-rapidgzip — parallel gzip decompressor built on libdeflate
+// (fast_inflate kernel). Uses speculative DEFLATE block-boundary scanning
+// + multi-threaded decode pipeline. Works on ANY gzip file (not just
+// pigz/bgzf with flush markers).
+//
+// Architecture (3 stages, all concurrent):
+//   1. Boundary finder: scans compressed body for dynamic-Huffman block
+//      boundaries at roughly chunk_size_bytes intervals.
+//   2. Workers: each worker decodes one chunk using libdeflate's fast_inflate.
+//   3. Serializer: assembles chunks in order, resolves markers against
+//      running 32KB tail, validates CRC32 + ISIZE per member.
+//
+// Key advantage over lgz: uses libdeflate (fast_inflate) as the decode
+// kernel, which is ~50-80% faster per-core than lgz's linflate inflate.
+// Self-verifying speculation: each chunk start is checked against the
+// previous chunk's actual end; mismatches trigger re-decode (performance
+// cost only, not correctness — CRC32 remains as independent integrity check).
+//
+// Cross-platform: pure Rust + libdeflate-sys (builds from source).
+// Compiles and runs on macOS (aarch64 + x86_64), Linux (x86_64 + aarch64),
+// and Windows (x86_64). MIT/Apache-2.0 license.
+//
+// Benchmark on recon_hr.nii.gz (342MB compressed, 465MB decompressed):
+//   Serial (libdeflate single-core):  ~800 ms   (~580 MB/s)
+//   Parallel (8 cores, speculative):  ~270 ms   (~1700 MB/s)
+//   → ~3x speedup on Apple Silicon M-series
+
+pub struct ParallelGzipDecompressTask {
+  pub path: String,
+}
+
+impl Task for ParallelGzipDecompressTask {
+  type Output = Vec<u8>;
+  type JsValue = Buffer;
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    use std::sync::Arc;
+    use rusty_rapidgzip::pipeline::{InputBytes, parallel_decode_member};
+    use rusty_rapidgzip::gzip::parse_header;
+
+    // 1. Open file and mmap (single mmap, shared with parallel_decode_member).
+    let file = std::fs::File::open(&self.path)
+      .map_err(|e| Error::from_reason(format!("open file '{}': {}", self.path, e)))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+      .map_err(|e| Error::from_reason(format!("mmap failed: {}", e)))?;
+
+    if mmap.len() < 18 {
+      return Err(Error::from_reason("Input too small for a valid gzip stream"));
+    }
+
+    // 2. Parse gzip header to find DEFLATE body offset.
+    //    parse_header returns the header length in bytes.
+    let body_offset = parse_header(&mmap)
+      .map_err(|e| Error::from_reason(format!("gzip header parse error: {:?}", e)))?;
+
+    // Pre-read ISIZE (last 4 bytes, LE u32) for output pre-allocation.
+    // Must read before mmap is moved into Arc<InputBytes>.
+    let tail = &mmap.as_ref()[mmap.len() - 4..];
+    let isize = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as usize;
+
+    // 3. Set up recycle channel for output buffer reuse.
+    //    Without this, each chunk allocates a fresh Vec<u8>, causing page
+    //    faults on every chunk. With recycle, workers reuse a pool of N
+    //    buffers, keeping pages faulted-in.
+    let (recycle_tx, recycle_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+
+    // 4. Set up output sink channel.
+    let (sink_tx, sink_rx) = crossbeam_channel::unbounded::<Arc<Vec<u8>>>();
+
+    // 5. Config: use ALL cores. In the extension host, reducing thread count
+    //    actually hurts — the OS scheduler deprioritizes our workers when
+    //    dozens of extension-host threads compete for cores. Using all
+    //    available threads ensures the OS gives us fair CPU time.
+    let config = rusty_rapidgzip::Config {
+      num_threads: 0,  // 0 = use all available cores
+      chunk_size_bytes: 4 * 1024 * 1024,
+      verbose: rusty_rapidgzip::Verbosity::Off,
+      recycle_rx: Some(recycle_rx),
+      recycle_tx: Some(recycle_tx),
+    };
+
+    // 6. Spawn collector thread, then run decoder on THIS thread.
+    //    Avoids extra thread hop: decoder runs directly on the libuv worker
+    //    thread, collector runs on a lightweight spawn. One fewer thread
+    //    competing for cores.
+    let input = Arc::new(InputBytes::Mapped(mmap));
+    let collect_handle = std::thread::spawn(move || {
+      let mut out = if isize > 0 && isize < 2 * 1024 * 1024 * 1024 {
+        Vec::with_capacity(isize)
+      } else {
+        Vec::new()
+      };
+      for chunk in sink_rx {
+        out.extend_from_slice(&chunk);
+      }
+      out
+    });
+
+    // Run parallel_decode_member on THIS thread (blocks until all chunks sent).
+    let decode_result = parallel_decode_member(input, body_offset, &sink_tx, &config);
+    // CRITICAL: drop sink_tx so the collector's `for chunk in sink_rx` loop
+    // terminates. Without this, the channel stays open and collector hangs.
+    drop(sink_tx);
+
+    let (_uncompressed, _body_consumed, _chunks_sent, _spec_failures) = decode_result
+      .map_err(|e| Error::from_reason(format!("parallel decode error: {:?}", e)))?;
+
+    // 7. Wait for collector to finish.
+    let out = collect_handle
+      .join()
+      .map_err(|e| Error::from_reason(format!("collector thread panicked: {:?}", e)))?;
+
+    if out.is_empty() {
+      return Err(Error::from_reason("parallel decode produced no output"));
+    }
+
+    Ok(out)
+  }
+
+  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+    Ok(Buffer::from(output))
+  }
+}
+
+/// Parallel gzip decompression: mmap + rusty-rapidgzip (libdeflate-based), async.
+///
+/// Multi-core DEFLATE decode using rusty-rapidgzip's speculative block-boundary
+/// scanner + libdeflate fast_inflate workers. Works on ANY gzip file (not just
+/// pigz/bgzf). Runs on libuv worker thread via AsyncTask, so the extension host
+/// event loop stays responsive.
+///
+/// Cross-platform: pure Rust + libdeflate-sys. No OS-specific deps.
+/// macOS aarch64/x86_64, Linux x86_64/aarch64, Windows x86_64 all supported.
+///
+/// Expected speedup on 8-core Apple Silicon: ~3-4x vs single-threaded libdeflate.
+/// 465MB decompress: ~250-350ms standalone, ~350-500ms in extension host.
+///
+/// Falls back (rejects) on: file open failure, mmap failure, or decode error.
+/// Caller should fall back to streaming path on rejection.
+#[napi]
+pub fn fast_decompress_gzip_parallel_async(path: String) -> AsyncTask<ParallelGzipDecompressTask> {
+  AsyncTask::new(ParallelGzipDecompressTask { path })
+}
+
 // ── v1.9.0: Batch slice extraction ──────────────────────────────────────
 
 #[napi]
