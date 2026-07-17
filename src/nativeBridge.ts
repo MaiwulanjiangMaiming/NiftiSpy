@@ -52,6 +52,7 @@ interface NativeBindings {
   mmapExtractPreview?(path: string): NativePreviewResult | null;
   fastDecompressGzip?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipOneshot?(buffer: Buffer): Uint8Array | Buffer;
+  fastDecompressGzipFileAsync?(path: string): Promise<Uint8Array | Buffer>;
   mmapExtractSliceBatch?(path: string, header: any, axis: string, indices: number[]): Float32Array[] | null;
   mmapGetVolumeStats?(path: string, header: any): VolumeStats | null;
   fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array | null;
@@ -68,6 +69,7 @@ interface RawNativeBindings {
   mmapExtractPreview?(path: string): RawNativePreviewResult | null;
   fastDecompressGzip?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipOneshot?(buffer: Buffer): Uint8Array | Buffer;
+  fastDecompressGzipFileAsync?(path: string): Promise<Uint8Array | Buffer>;
   mmapExtractSliceBatch?(path: string, headerJson: string, axis: string, indices: number[]): Buffer[] | null;
   mmapGetVolumeStats?(path: string, headerJson: string): RawVolumeStats | null;
   fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Buffer | null;
@@ -128,6 +130,7 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
     },
     fastDecompressGzip: raw.fastDecompressGzip?.bind(raw),
     fastDecompressGzipOneshot: raw.fastDecompressGzipOneshot?.bind(raw),
+    fastDecompressGzipFileAsync: raw.fastDecompressGzipFileAsync?.bind(raw),
     mmapExtractSliceBatch(path: string, header: any, axis: string, indices: number[]) {
       const buffers = raw.mmapExtractSliceBatch?.(path, JSON.stringify(header), axis, indices);
       if (!buffers) return null;

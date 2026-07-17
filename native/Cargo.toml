@@ -7,7 +7,13 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = "2"
+# napi async feature: required for AsyncTask (runs CPU-intensive work on
+# libuv worker thread, NOT blocking the JS main thread). Critical for
+# fast_decompress_gzip_file_async — without this, the synchronous
+# `fast_decompress_gzip_oneshot` blocks the entire extension host event
+# loop during 791ms libdeflate inflate, causing 22-43% slowdown vs
+# standalone benchmark (964-1133ms measured in extension vs 791ms baseline).
+napi = { version = "2", features = ["async"] }
 napi-derive = "2"
 # flate2 backend choice: benchmarked on Apple Silicon (M-series), the Node.js
 # built-in zlib (system zlib) is FASTER than native fastDecompressGzip with

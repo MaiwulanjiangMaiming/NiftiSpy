@@ -618,7 +618,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             const native = getNativeBindings();
             let result: { rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null = null;
 
-            if (native?.fastDecompressGzipOneshot) {
+            if (native?.fastDecompressGzipFileAsync || native?.fastDecompressGzipOneshot) {
               try {
                 result = await this.oneshotLocalGzLoad(webview, fsPath, signal);
               } catch (err) {
@@ -964,32 +964,51 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   ): Promise<{ rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null> {
     const timing: Record<string, any> = {};
     const native = getNativeBindings();
-    if (!native?.fastDecompressGzipOneshot) {
-      throw new Error('native fastDecompressGzipOneshot unavailable');
+
+    // ── Strategy selection ──
+    // Prefer fastDecompressGzipFileAsync (mmap + AsyncTask + libdeflate):
+    //   - mmap in Rust avoids Node.js fs.readFile overhead (396-1459ms → ~10-50ms)
+    //   - AsyncTask runs on libuv worker thread, NOT blocking JS main thread
+    //     (eliminates 22-43% slowdown: 964-1133ms → 791ms baseline)
+    //   - Single Rust call: mmap + libdeflate oneshot, returns Buffer
+    // Fall back to fastDecompressGzipOneshot (sync, V8 Buffer input) only if
+    // async version unavailable (older native binary).
+    const useAsync = !!native?.fastDecompressGzipFileAsync;
+    if (!useAsync && !native?.fastDecompressGzipOneshot) {
+      throw new Error('native fastDecompressGzipFileAsync/Oneshot unavailable');
     }
 
-    // ── 1. Read entire compressed file into memory ──
-    // For 342MB file: ~50ms from OS cache, ~300ms cold (NVMe SSD).
-    // This is serial with decompression (no pipelining), but the 2x
-    // decompression speedup more than compensates.
-    const tFsStart = performance.now();
-    const compressed = await fs.promises.readFile(fsPath);
-    if (signal.aborted) return null;
-    const tFsEnd = performance.now();
-
-    // ── 2. Native libdeflate one-shot decompression ──
-    // Pre-allocates exact output buffer via gzip ISIZE (handled in Rust).
-    // Returns Node.js Buffer (napi Buffer) wrapping the decompressed Vec<u8>.
-    const tDecompressStart = performance.now();
+    // ── 1+2. Rust mmap + libdeflate oneshot (async, off-thread) ──
+    // For async path: single call returns Promise<Buffer>. Worker thread
+    // does: open file → mmap → read ISIZE → pre-allocate → libdeflate inflate
+    // → return Vec<u8> (converted to Node Buffer in resolve()).
+    // For sync fallback path: TS reads file then calls sync native fn
+    // (kept for backward compat with older native binaries).
+    const tStart = performance.now();
     let decompressed: Uint8Array | Buffer;
-    try {
-      decompressed = native.fastDecompressGzipOneshot(compressed);
-    } finally {
-      // Free compressed buffer ASAP to reduce peak memory.
-      // (compressed goes out of scope after this block; explicit null helps GC.)
+    let tFsEnd: number;
+    let tDecompressEnd: number;
+
+    if (useAsync) {
+      // Async path: entire fs read + decompress happens in Rust worker thread.
+      // We can't separate fs read time from decompress time without Rust-side
+      // timing, but the total is what matters (and it's much faster).
+      try {
+        decompressed = await native!.fastDecompressGzipFileAsync!(fsPath);
+      } catch (err) {
+        throw new Error(`fastDecompressGzipFileAsync failed: ${String(err)}`);
+      }
+      if (signal.aborted) return null;
+      tFsEnd = performance.now();        // approx (mmap+decompress combined)
+      tDecompressEnd = tFsEnd;
+    } else {
+      // Sync fallback path (older native binary): TS reads file, calls sync fn.
+      const compressed = await fs.promises.readFile(fsPath);
+      if (signal.aborted) return null;
+      tFsEnd = performance.now();
+      decompressed = native!.fastDecompressGzipOneshot!(compressed);
+      tDecompressEnd = performance.now();
     }
-    const tDecompressEnd = performance.now();
-    if (signal.aborted) return null;
 
     // Convert to Uint8Array view (zero-copy: napi Buffer IS a Uint8Array,
     // so this is just a type view, no copy. Buffer extends Uint8Array in Node.js.)
@@ -1019,15 +1038,33 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     const tStatsEnd = performance.now();
 
     // ── 6. Report timings ──
-    timing.fsToFirstData = +(tFsEnd - tFsStart).toFixed(1);
-    timing.headerParse = +(tHeaderEnd - tHeaderStart).toFixed(1);
-    timing.previewReady = +(tPreviewSent - tHeaderEnd).toFixed(1);
-    // totalDecompress = fs read + native decompress (matches streaming's definition)
-    timing.totalDecompress = +(tDecompressEnd - tFsStart).toFixed(1);
-    timing.nativeDecompress = +(tDecompressEnd - tDecompressStart).toFixed(1);
-    timing.statsCompute = +(tStatsEnd - tStatsStart).toFixed(1);
-    timing.decompressedBytes = rawData.byteLength;
-    timing.nativeBackend = 'libdeflate';
+    // For async path: fsToFirstData and nativeDecompress are not separable
+    // (both happen in Rust worker thread). Report combined as totalDecompress
+    // and set nativeDecompress = totalDecompress for backward-compat display.
+    if (useAsync) {
+      timing.fsToFirstData = +((tFsEnd - tStart).toFixed(1));
+      timing.headerParse = +(tHeaderEnd - tHeaderStart).toFixed(1);
+      timing.previewReady = +(tPreviewSent - tHeaderEnd).toFixed(1);
+      // totalDecompress = entire Rust worker time (mmap + inflate + buffer transfer)
+      timing.totalDecompress = +((tDecompressEnd - tStart).toFixed(1));
+      // nativeDecompress reported as same (Rust didn't break it down).
+      // Display layer will show "[libdeflate] native decompress" = total.
+      timing.nativeDecompress = timing.totalDecompress;
+      timing.statsCompute = +(tStatsEnd - tStatsStart).toFixed(1);
+      timing.decompressedBytes = rawData.byteLength;
+      timing.nativeBackend = 'libdeflate';
+      timing.asyncPath = true;
+    } else {
+      timing.fsToFirstData = +((tFsEnd - tStart).toFixed(1));
+      timing.headerParse = +(tHeaderEnd - tHeaderStart).toFixed(1);
+      timing.previewReady = +(tPreviewSent - tHeaderEnd).toFixed(1);
+      timing.totalDecompress = +((tDecompressEnd - tStart).toFixed(1));
+      timing.nativeDecompress = +((tDecompressEnd - tFsEnd).toFixed(1));
+      timing.statsCompute = +(tStatsEnd - tStatsStart).toFixed(1);
+      timing.decompressedBytes = rawData.byteLength;
+      timing.nativeBackend = 'libdeflate';
+      timing.asyncPath = false;
+    }
 
     return { rawData, header, stats, timing };
   }

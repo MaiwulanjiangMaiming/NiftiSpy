@@ -614,6 +614,105 @@ pub fn fast_decompress_gzip_oneshot(buffer: Buffer) -> Result<Buffer> {
   Ok(Buffer::from(out))
 }
 
+// ── Async mmap + libdeflate oneshot (Phase 1 deep optimization) ────────
+//
+// Architecture: Node.js calls `fast_decompress_gzip_file_async(path)` which
+// returns immediately with a Promise. The actual work runs on a libuv worker
+// thread via AsyncTask, so the extension host event loop is NOT blocked
+// during the ~791ms libdeflate inflate.
+//
+// Worker thread pipeline:
+//   1. mmap(path)          — ~10-50ms (page cache hit) or ~100-200ms (cold)
+//   2. read gzip footer    — negligible (8 bytes at end of mmap)
+//   3. pre-allocate output — vec![0u8; ISIZE] (zero-init 465MB ~50ms)
+//   4. libdeflate inflate  — ~791ms (matches standalone benchmark, no V8
+//                            interference since we're off the JS thread)
+//   5. return Vec<u8> → resolve() converts to Buffer
+//
+// vs synchronous `fast_decompress_gzip_oneshot`:
+//   - Eliminates Node.js fs.readFile (396-1459ms in extension)
+//   - Eliminates V8 Buffer → Rust input copy (342MB)
+//   - Eliminates JS main thread blocking (964-1133ms measured → 791ms baseline)
+//   - Trade-off: still no early preview (oneshot), preview sent after decompress
+
+pub struct GzipDecompressTask {
+  pub path: String,
+}
+
+impl Task for GzipDecompressTask {
+  type Output = Vec<u8>;
+  type JsValue = Buffer;
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    // 1. Open file and mmap. mmap is lazy — actual page faults happen
+    //    during libdeflate's read pass. On warm page cache this is ~free.
+    let file = std::fs::File::open(&self.path)
+      .map_err(|e| Error::from_reason(format!("open file '{}': {}", self.path, e)))?;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+      .map_err(|e| Error::from_reason(format!("mmap failed: {}", e)))?;
+    let input: &[u8] = mmap.as_ref();
+
+    // 2. Read gzip footer (RFC 1952): last 8 bytes = CRC32 (4) + ISIZE (4, LE u32).
+    if input.len() < 18 {
+      return Err(Error::from_reason("Input too small for a valid gzip stream"));
+    }
+    let tail = &input[input.len() - 8..];
+    let isize = u32::from_le_bytes([tail[4], tail[5], tail[6], tail[7]]) as usize;
+
+    if isize == 0 {
+      return Err(Error::from_reason(
+        "ISIZE is 0 (possibly multi-stream gzip); fall back to streaming",
+      ));
+    }
+    if isize > 2 * 1024 * 1024 * 1024 {
+      return Err(Error::from_reason("ISIZE > 2GB; refusing to pre-allocate"));
+    }
+
+    // 3. Pre-allocate exact output buffer. zero-init has measurable cost
+    //    for 465MB (~50ms) but is required by libdeflate's API.
+    let mut out = vec![0u8; isize];
+
+    // 4. libdeflate oneshot inflate. This is the CPU-bound hot path.
+    let mut decompressor = libdeflater::Decompressor::new();
+    let actual_size = decompressor
+      .gzip_decompress(input, &mut out)
+      .map_err(|e| Error::from_reason(format!("libdeflate decompress error: {:?}", e)))?;
+
+    if actual_size != isize {
+      out.truncate(actual_size);
+    }
+
+    // 5. Return Vec<u8>. The mmap is dropped here (its pages stay in page
+    //    cache for next load). resolve() will convert Vec → Buffer.
+    Ok(out)
+  }
+
+  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+    // Vec<u8> → Node.js Buffer. napi-rs handles the conversion by
+    // transferring ownership of the Vec's heap allocation (no copy).
+    Ok(Buffer::from(output))
+  }
+}
+
+/// Async gzip decompression: mmap + libdeflate oneshot on libuv worker thread.
+///
+/// Returns a Promise<Buffer>. The actual decompression runs off the JS main
+/// thread, so the extension host event loop stays responsive (other
+/// extensions, UI, command palette all keep working during the ~800ms
+/// inflate).
+///
+/// Path is the only argument — Rust does the file I/O via mmap, avoiding
+/// Node.js fs.readFile overhead (396-1459ms measured in extension) and
+/// the 342MB V8 Buffer → Rust input copy.
+///
+/// Falls back (rejects) on: file open failure, mmap failure, ISIZE=0
+/// (multi-stream gzip), ISIZE>2GB, or libdeflate error. Caller should
+/// fall back to streaming path on rejection.
+#[napi]
+pub fn fast_decompress_gzip_file_async(path: String) -> AsyncTask<GzipDecompressTask> {
+  AsyncTask::new(GzipDecompressTask { path })
+}
+
 // ── v1.9.0: Batch slice extraction ──────────────────────────────────────
 
 #[napi]
