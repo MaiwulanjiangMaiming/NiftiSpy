@@ -9,7 +9,15 @@ crate-type = ["cdylib"]
 [dependencies]
 napi = "2"
 napi-derive = "2"
-flate2 = "1"
+# flate2 backend choice: benchmarked on Apple Silicon (M-series), the Node.js
+# built-in zlib (system zlib) is FASTER than native fastDecompressGzip with
+# either miniz_oxide or zlib-ng (951ms vs 1153ms for 465MB decompress).
+# Therefore the extension uses zlib.gunzipSync for the hot path, NOT the
+# native fastDecompressGzip. We keep zlib-ng here for potential use on x86_64
+# Linux/Windows where its SIMD inflate has a measurable advantage.
+# libz-ng-sys is compiled from source; zlib-ng is a drop-in optimized
+# replacement for zlib with SIMD acceleration (SSE2/AVX2/NEON).
+flate2 = { version = "1", default-features = false, features = ["zlib-ng"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 memmap2 = "0.9"

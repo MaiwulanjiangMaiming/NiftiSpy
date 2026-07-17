@@ -1167,6 +1167,17 @@ export class LocalFileProxy {
       }
       const cachedData = (!isLocal && !isHttpRemote) ? entry.dataCache : null;
 
+      // If the full volume is already in the proxy-side VolumeCache (e.g. the
+      // user viewed this file before and it hasn't been evicted), subsample
+      // directly from the cached decoded voxel data.  This avoids 16 fresh
+      // HTTP Range requests and DataView decoding — pure memory copy, ~100x
+      // faster for a cached remote file.
+      let cachedVolume: { voxelData: any; min: number; max: number } | null = null;
+      if (isHttpRemote && this.volumeCache) {
+        const cv = this.volumeCache.get(uriStr);
+        if (cv) cachedVolume = { voxelData: cv.voxelData, min: cv.min, max: cv.max };
+      }
+
       // ── Fetch each source z-slice and extract every f-th voxel ──
       // Bounded concurrency: 16 parallel range requests. For a 256³ volume
       // at factor=4, this is 64 slices → 4 batches → ~4 RTTs total.
@@ -1175,6 +1186,25 @@ export class LocalFileProxy {
 
       const fetchAndExtractSlice = async (outZ: number): Promise<void> => {
         const srcZ = outZ * f;
+        const outSliceBase = outZ * outNy * outNx;
+
+        // ── Fast path: subsample from cached decoded volume data ──
+        // VolumeCache stores voxels as a typed array with slope/inter already
+        // applied, so we can index directly without DataView decoding.
+        if (cachedVolume) {
+          const vd = cachedVolume.voxelData;
+          for (let outY = 0; outY < outNy; outY++) {
+            const srcY = outY * f;
+            const srcRowBase = srcZ * ny * nx + srcY * nx;
+            const outRowBase = outSliceBase + outY * outNx;
+            for (let outX = 0; outX < outNx; outX++) {
+              output[outRowBase + outX] = vd[srcRowBase + outX * f];
+            }
+          }
+          return;
+        }
+
+        // ── Slow path: fetch raw bytes and decode via DataView ──
         const sliceStart = voxOffset + srcZ * nx * ny * bpv;
         const sliceEnd = sliceStart + sliceByteSize; // exclusive
 
@@ -1188,7 +1218,6 @@ export class LocalFileProxy {
         }
 
         const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
-        const outSliceBase = outZ * outNy * outNx;
 
         for (let outY = 0; outY < outNy; outY++) {
           const srcY = outY * f;

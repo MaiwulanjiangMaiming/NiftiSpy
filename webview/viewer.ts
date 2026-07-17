@@ -2139,7 +2139,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const result = await loadVolumeViaWorker(loadKey, img.url, img.url.endsWith('.gz'), (msg) => {
+        const result = await loadVolumeViaWorker(loadKey, img.url, (img.name && img.name.endsWith('.gz')) || img.url.endsWith('.gz'), (msg) => {
           if (msg.type === 'previewVolume' && index === activeImageIdx && !img.data) {
             // Low-res preview arrived — render immediately so the user sees
             // something while the full-resolution download continues.
@@ -4750,6 +4750,13 @@ function handleDirectPreview(msg: any): void {
 }
 
 function handleCachedVolume(msg: any): void {
+  // Webview performance.now() origin differs from extension host origin,
+  // so we cannot subtract extension sendTime from webview receiveTime.
+  // Instead, we measure the webview-internal interval (receive → render done)
+  // and report it back. Extension reports its own decompress/serial time.
+  const receiveTime = performance.now();
+  const extTiming = msg.perfExtTiming || null;
+  const voxelBytes = msg.perfVoxelBytes || 0;
   const wasPartialPreview = sliceIdx.axial === 0 && header && header.nz > 1;
   header = msg.header;
   computeViewFlips();
@@ -4770,14 +4777,19 @@ function handleCachedVolume(msg: any): void {
 
   const datatype = msg.datatype || 16;
   let voxelBuffer: ArrayBuffer | null = null;
+  let voxOffset = 0;   // byte offset within voxelBuffer where voxel data starts
   if (msg.voxelData instanceof ArrayBuffer) {
     voxelBuffer = msg.voxelData;
+    voxOffset = msg.voxOffset || 0;
   } else if (msg.voxelData?.buffer instanceof ArrayBuffer) {
+    // Legacy path: caller passed a typed-array view. Slice it out.
     const view = msg.voxelData;
     voxelBuffer = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    voxOffset = 0;
   } else if (Array.isArray(msg.voxelData)) {
     const f32 = new Float32Array(msg.voxelData);
     voxelBuffer = f32.buffer.slice(f32.byteOffset, f32.byteOffset + f32.byteLength);
+    voxOffset = 0;
   } else if (msg.voxelData && typeof msg.voxelData === 'object' && msg.voxelData.byteLength !== undefined) {
     try {
       const keys = Object.keys(msg.voxelData);
@@ -4785,21 +4797,29 @@ function handleCachedVolume(msg: any): void {
         const arr = new Uint8Array(keys.length);
         for (let i = 0; i < keys.length; i++) arr[i] = msg.voxelData[i];
         voxelBuffer = arr.buffer;
+        voxOffset = 0;
       }
     } catch {}
   }
 
   if (voxelBuffer) {
+    // Use the voxelLength if provided to compute element count precisely;
+    // otherwise infer from (buffer - voxOffset) / elemSize.
+    const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
+    const voxelBytes = msg.voxelLength !== undefined
+      ? msg.voxelLength
+      : voxelBuffer.byteLength - voxOffset;
+    const elemCount = (voxelBytes / elemSize) | 0;
     switch (datatype) {
-      case 2: volumeData = new Uint8Array(voxelBuffer); break;
-      case 4: volumeData = new Int16Array(voxelBuffer); break;
-      case 8: volumeData = new Int32Array(voxelBuffer); break;
-      case 16: volumeData = new Float32Array(voxelBuffer); break;
-      case 64: volumeData = new Float64Array(voxelBuffer); break;
-      case 256: volumeData = new Int8Array(voxelBuffer); break;
-      case 512: volumeData = new Uint16Array(voxelBuffer); break;
-      case 768: volumeData = new Uint32Array(voxelBuffer); break;
-      default: volumeData = new Float32Array(voxelBuffer); break;
+      case 2: volumeData = new Uint8Array(voxelBuffer, voxOffset, elemCount); break;
+      case 4: volumeData = new Int16Array(voxelBuffer, voxOffset, elemCount); break;
+      case 8: volumeData = new Int32Array(voxelBuffer, voxOffset, elemCount); break;
+      case 16: volumeData = new Float32Array(voxelBuffer, voxOffset, elemCount); break;
+      case 64: volumeData = new Float64Array(voxelBuffer, voxOffset, elemCount); break;
+      case 256: volumeData = new Int8Array(voxelBuffer, voxOffset, elemCount); break;
+      case 512: volumeData = new Uint16Array(voxelBuffer, voxOffset, elemCount); break;
+      case 768: volumeData = new Uint32Array(voxelBuffer, voxOffset, elemCount); break;
+      default: volumeData = new Float32Array(voxelBuffer, voxOffset, elemCount); break;
     }
     fullVolumeLoaded = true;
 
@@ -4894,6 +4914,24 @@ function handleCachedVolume(msg: any): void {
 
   if (!volumeData) {
     scheduleActiveImageLoad(0);
+  }
+
+  // ── Performance report ──
+  // Measure wall-clock time for: postMessage transfer + view creation +
+  // SharedArrayBuffer setup + render. Post back to extension so it can
+  // correlate with its own decompress/downcast/cache timings and emit
+  // a full breakdown to the NiftiSpy Performance output channel.
+  if (extTiming) {
+    const renderDoneTime = performance.now();
+    const viewSetupMs = +(renderDoneTime - receiveTime).toFixed(1);
+    vscode.postMessage({
+      type: 'perfReport',
+      fileName,
+      voxelBytes,
+      isGzip: !!extTiming.isGzip,
+      viewSetupMs,
+      ext: extTiming,
+    });
   }
 }
 
@@ -5750,6 +5788,14 @@ function setupInteraction() {
     if (!helpBtn?.contains(e.target as Node) && !helpPopup?.contains(e.target as Node)) {
       helpPopup?.classList.remove('show');
     }
+  });
+
+  const btnIssue = document.getElementById('btn-issue') as HTMLButtonElement;
+  btnIssue?.addEventListener('click', () => {
+    // Ask the extension host to open the external URL. VS Code will show its
+    // standard "open external website" confirmation and then launch the system
+    // default browser.
+    vscode.postMessage({ type: 'openExternal', url: 'https://github.com/MaiwulanjiangMaiming/NiftiSpy/issues' });
   });
 
   sidebarToggle?.addEventListener('click', () => {
