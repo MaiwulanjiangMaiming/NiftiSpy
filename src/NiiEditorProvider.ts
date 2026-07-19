@@ -110,7 +110,15 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private logPerf(line: string): void {
     if (this.perfChannel) {
       this.perfChannel.appendLine(line);
-      this.perfChannel.show(true);
+      // Only auto-reveal the output panel when the user has opted in.
+      // Default is false so the published extension never pops the panel
+      // on every volume load; enable via "niftispy.showPerfReport": true.
+      const show = vscode.workspace
+        .getConfiguration('niftispy')
+        .get<boolean>('showPerfReport', false);
+      if (show) {
+        this.perfChannel.show(true);
+      }
     }
   }
 

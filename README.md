@@ -77,6 +77,20 @@ npm run build:native
 
 This builds the Rust crate and copies the resulting binding to `native/index.node`.
 
+### Multi-Core Parallel Gzip Decompression (v2.2.0)
+
+For local `.nii.gz` files, NiftiSpy 2.2.0 ships a multi-core parallel decompression backend built on [`rusty-rapidgzip`](https://crates.io/crates/rusty-rapidgzip) (libdeflate-based). A 3-stage pipeline (speculative DEFLATE block-boundary scan → multi-core decode → ordered serialize) runs on all available CPU cores via a libuv worker thread, so the extension host stays responsive.
+
+Benchmark on a 342MB compressed / 465MB decompressed MRI volume (Apple Silicon, 12 cores):
+
+| Backend | Time | Throughput | Speedup |
+| --- | --- | --- | --- |
+| zlib streaming (Node.js) | ~1150 ms | ~400 MB/s | 1.0× |
+| libdeflate single-core (v2.1.4) | ~830 ms | ~560 MB/s | 1.4× |
+| **rusty-rapidgzip multi-core (v2.2.0)** | **~300 ms** | **~1550 MB/s** | **3.8×** |
+
+The binary is keyed by platform and architecture (`niftispy_native.darwin-arm64.node`, `niftispy_native.linux-x64-gnu.node`, `niftispy_native.win32-x64-msvc.node`) and selected automatically at runtime. Falls back to the legacy wasm-pack build when a platform binary is absent. Byte-for-byte verified against the zlib reference.
+
 ## Usage
 
 1. Open a `.nii`, `.nii.gz`, or `.hdr` file.
@@ -189,7 +203,7 @@ npm run package
 
 ## Version
 
-- Current release: `2.1.3`
+- Current release: `2.2.0`
 
 For release notes, see [CHANGELOG.md](CHANGELOG.md).
 
