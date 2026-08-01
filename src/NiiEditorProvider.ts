@@ -127,9 +127,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       const ext = msg.ext || {};
       const stream = ext.stream || {};
       const voxelMB = ((msg.voxelBytes || 0) / (1024 * 1024)).toFixed(1);
+      const envTag = ext.isRemoteSSH ? ' [Remote-SSH]' : '';
       const lines: string[] = [];
       lines.push('┌─────────────────────────────────────────────────────────────┐');
-      lines.push(`│ NiftiSpy Load Performance Report  —  ${new Date().toLocaleTimeString()}`);
+      lines.push(`│ NiftiSpy Load Performance Report  —  ${new Date().toLocaleTimeString()}${envTag}`);
       lines.push(`│ File: ${msg.fileName || '(unknown)'}`);
       lines.push(`│ Format: ${msg.isGzip ? '.nii.gz' : '.nii'}   Voxel data: ${voxelMB} MB`);
       lines.push('├─────────────────────────────────────────────────────────────┤');
@@ -660,11 +661,33 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             const PARALLEL_THRESHOLD_MB = 50;     // > 50MB → native parallel (rusty-rapidgzip)
             const fileSizeMB = fileSize / (1024 * 1024);  // fileSize from stat at L334
 
+            // Detect Remote-SSH: when extension host runs on a remote server,
+            // postMessage crosses the network. Early preview (z=0 slice during
+            // decompression) becomes more valuable than raw decompress speed,
+            // because the user sees the first image while the full volume is
+            // still transferring over the network.
+            //   Local:      parallel (300ms, no preview) > streaming (1150ms, preview at 50ms)
+            //               because transfer is instant, decompress time dominates.
+            //   Remote-SSH: streaming (preview at 50ms) > parallel (preview at 300ms)
+            //               because transfer takes seconds; seeing an image early matters
+            //               more than saving 850ms on decompress.
+            //   Exception: very large files (>200MB) where the 850ms decompress gap
+            //   is significant even vs network transfer time.
+            const isRemoteSSH = !!vscode.env.remoteName;
+            const REMOTE_PARALLEL_THRESHOLD_MB = 200;  // only use parallel on huge files when remote
+
             let result: { rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null = null;
             let pathUsed: 'parallel' | 'oneshot' | 'streaming' | 'js-oneshot' = 'streaming';
 
+            // Determine the parallel threshold based on environment:
+            //   Local: > 50MB → parallel (decompress speed matters)
+            //   Remote-SSH: > 200MB → parallel (only huge files justify losing early preview)
+            const effectiveParallelThresholdMB = isRemoteSSH
+              ? REMOTE_PARALLEL_THRESHOLD_MB
+              : PARALLEL_THRESHOLD_MB;
+
             // 1. Large file + native parallel → rusty-rapidgzip (multi-core)
-            if (fileSize > 0 && fileSizeMB > PARALLEL_THRESHOLD_MB
+            if (fileSize > 0 && fileSizeMB > effectiveParallelThresholdMB
                 && native?.fastDecompressGzipParallelAsync) {
               try {
                 result = await this.parallelLocalGzLoad(webview, fsPath, signal);
@@ -676,7 +699,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             }
 
             // 2. Medium file + native oneshot → libdeflate (single-core, no stream)
-            if (!result && fileSize > 0 && fileSizeMB <= PARALLEL_THRESHOLD_MB
+            //    In Remote-SSH, only use oneshot for medium files (< threshold) where
+            //    the decompress is fast enough that early preview isn't critical.
+            if (!result && fileSize > 0 && fileSizeMB <= effectiveParallelThresholdMB
                 && (native?.fastDecompressGzipFileAsync || native?.fastDecompressGzipOneshot)) {
               try {
                 result = await this.oneshotLocalGzLoad(webview, fsPath, signal);
@@ -700,7 +725,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               }
             }
 
-            // 4. Fallback: streaming zlib (large file + native unavailable, or all above failed)
+            // 4. Fallback: streaming zlib
+            //    In Remote-SSH, this is the PREFERRED path for medium-to-large files
+            //    (10MB–200MB) because it provides early preview (z=0 slice at ~50ms)
+            //    while the full volume continues to decompress + transfer in background.
             if (!result) {
               result = await this.streamingLocalGzLoad(webview, fsPath, signal);
               pathUsed = 'streaming';
@@ -827,6 +855,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               postMessageSync: +(performance.now() - postMsgStart).toFixed(1),
               voxelBytes,
               isGzip,
+              isRemoteSSH,
               stream: streamTiming,
             },
           });
