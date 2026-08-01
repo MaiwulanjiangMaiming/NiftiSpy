@@ -368,7 +368,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         if (isRemote && entryId) {
           this.startPreviewLoad(entryId, webview, webviewId, uri, abortController.signal);
         } else if (!isRemote) {
-          this.startLocalLoad(webview, webviewId, uri, abortController.signal);
+          this.startLocalLoad(webview, webviewId, uri, abortController.signal, fileSize, validationToken);
         }
       } else if (msg.type === 'perfReport') {
         this.handlePerfReport(msg);
@@ -405,6 +405,18 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           } else {
             // Local file: direct webview URI + postMessage (same as initial open).
             const imgUrl = webview.asWebviewUri(imgUri).toString();
+            // stat for size-aware dispatch + cache validation (mirrors initial open).
+            let imgFileSize = 0;
+            let imgValidationToken = '';
+            try {
+              if (imgUri.fsPath) {
+                const st = await fs.promises.stat(imgUri.fsPath);
+                imgFileSize = st.size;
+                imgValidationToken = `${st.mtimeMs}:${st.size}`;
+              }
+            } catch {
+              // stat may fail for unusual URIs; dispatch falls back to streaming
+            }
             webview.postMessage({
               type: 'newImage',
               fileUrl: imgUrl,
@@ -412,7 +424,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               isGzip: imgIsGzip,
               isRemote: false,
             });
-            this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal);
+            this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal, imgFileSize, imgValidationToken);
           }
         }
       } else if (msg.type === 'exportSlice') {
@@ -575,7 +587,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     webview: vscode.Webview,
     webviewId: string,
     uri: vscode.Uri,
-    signal: AbortSignal
+    signal: AbortSignal,
+    fileSize: number = 0,
+    validationToken: string = ''
   ): Promise<void> {
     const uriKey = uri.toString();
     const cached = this.volumeCache.get(uriKey);
@@ -629,8 +643,32 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           let rawData: Uint8Array;
           let header: any;
           let streamStats: { min: number; max: number } | null = null;
+          // Hoisted out of the isGzip block so the finalize path's
+          // perfExtTiming (which runs for both .nii and .nii.gz) can read it.
+          const isRemoteSSH = !!vscode.env.remoteName;
 
           if (isGzip) {
+            // ── Remote-SSH fast path: ship the COMPRESSED bytes to the webview ──
+            // In Remote-SSH the Extension Host runs on the remote server while the
+            // Webview runs locally; webview.postMessage() crosses the SSH tunnel.
+            // Sending the full DECOMPRESSED volume over SSH is the dominant cost
+            // (e.g. 50MB .nii.gz → ~200MB decompressed → ~1.6s @ 1Gbps), dwarfing
+            // the ~150ms decompress itself. Instead, send only the compressed
+            // bytes (3-5x smaller) and let the webview decompress locally with
+            // the browser-native DecompressionStream. This is also platform-
+            // agnostic — no native module needed on the remote host.
+            //   4.8MB file: ~300ms → ~60ms (5x).  50MB file: ~1.75s → ~600ms (3x).
+            if (vscode.env.remoteName) {
+              let compressedSent = false;
+              try {
+                await this.remoteSshCompressedLoad(webview, fsPath, fileSize, validationToken, signal);
+                compressedSent = true;
+              } catch (err) {
+                this.logPerf(`[remote-ssh-compressed] failed, falling back to ext-side decompress: ${String(err)}`);
+              }
+              if (compressedSent) return;
+              // else fall through to the normal parallel/oneshot/streaming tree
+            }
             // ── Strategy: prefer native libdeflate oneshot, fall back to streaming.
             //    Benchmarked on recon_hr.nii.gz (342MB→465MB), Apple Silicon:
             //      native libdeflate oneshot:  ~550-650ms (700-850 MB/s) ← BEST
@@ -673,7 +711,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             //               more than saving 850ms on decompress.
             //   Exception: very large files (>200MB) where the 850ms decompress gap
             //   is significant even vs network transfer time.
-            const isRemoteSSH = !!vscode.env.remoteName;
             const REMOTE_PARALLEL_THRESHOLD_MB = 200;  // only use parallel on huge files when remote
 
             let result: { rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null = null;
@@ -1257,6 +1294,54 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     }
 
     return { rawData, header, stats, timing };
+  }
+
+  /**
+   * Remote-SSH compressed transfer: read the .nii.gz file WITHOUT
+   * decompressing on the extension host, and ship the compressed bytes
+   * to the webview. The webview decompresses locally with the browser-
+   * native DecompressionStream, avoiding a postMessage of the full
+   * DECOMPRESSED volume across the SSH tunnel (3-5x network saving).
+   *
+   * The extension host does zero inflate work — it only does one fs read.
+   * This is platform-agnostic: works on any remote (Linux/Win/Mac)
+   * regardless of native module availability, because decompression runs
+   * in the webview's browser engine.
+   */
+  private async remoteSshCompressedLoad(
+    webview: vscode.Webview,
+    fsPath: string,
+    fileSize: number,
+    validationToken: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    const tStart = performance.now();
+    // 1. Single read of the COMPRESSED file — no gunzip on the ext host.
+    const compressed = await fs.promises.readFile(fsPath);
+    if (signal.aborted) return;
+    const tReadEnd = performance.now();
+
+    // 2. Ship compressed bytes to the webview. The webview runs locally,
+    //    so DecompressionStream inflate uses the local CPU (fast, idle),
+    //    and only the small compressed payload crosses the SSH tunnel.
+    const postMsgStart = performance.now();
+    webview.postMessage({
+      type: 'compressedVolume',
+      compressedData: compressed.buffer,
+      fileName: path.basename(fsPath),
+      fileSize,
+      validationToken,
+      perfExtTiming: {
+        fsRead: +((tReadEnd - tStart).toFixed(1)),
+        postMessageSync: +(performance.now() - postMsgStart).toFixed(1),
+        totalLoad: +((tReadEnd - tStart).toFixed(1)),
+        isRemoteSSH: true,
+        compressedBytes: compressed.byteLength,
+        // Sentinel so handlePerfReport can label this path distinctly
+        // from the in-extension decompression paths.
+        path: 'remote-ssh-compressed',
+      },
+    });
   }
 
   /**

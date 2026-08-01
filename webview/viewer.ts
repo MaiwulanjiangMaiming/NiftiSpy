@@ -1,4 +1,4 @@
-import { NiiHeader, DATATYPE_NAMES } from './nii-parser';
+import { NiiHeader, DATATYPE_NAMES, parseNiiHeader } from './nii-parser';
 import { WebGPURenderer } from './webgpuRenderer';
 import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
 import { deriveFileHash, getVolumeCacheDB, makeTypedArrayFromBuffer } from './SliceCacheDB';
@@ -4553,6 +4553,19 @@ window.addEventListener('message', async (e) => {
     return;
   }
 
+  if (msg.type === 'compressedVolume') {
+    // Remote-SSH fast path: extension host shipped the COMPRESSED .nii.gz
+    // bytes (small) instead of the decompressed volume (large). We
+    // decompress locally with the browser-native DecompressionStream,
+    // which runs in the renderer's internal thread pool (non-blocking),
+    // then reuse handleCachedVolume for rendering. This avoids pushing
+    // the full decompressed volume across the SSH tunnel.
+    directPreviewReceived = true;
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+    void handleCompressedVolume(msg);
+    return;
+  }
+
   if (msg.type === 'cachedVolume') {
     directPreviewReceived = true;
     if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
@@ -4747,6 +4760,216 @@ function handleDirectPreview(msg: any): void {
       if ((err as any)?.name !== 'AbortError') loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
     });
   }
+}
+
+/**
+ * Remote-SSH compressed-volume handler.
+ *
+ * The extension host (running on the remote server) read the .nii.gz file
+ * WITHOUT decompressing and shipped the compressed bytes here via
+ * postMessage. We decompress locally with the browser-native
+ * DecompressionStream (runs in the renderer's internal thread pool,
+ * non-blocking), then hand the decompressed volume to the existing
+ * handleCachedVolume rendering pipeline.
+ *
+ * This avoids pushing the full DECOMPRESSED volume across the SSH tunnel
+ * — only the 3-5x smaller compressed payload crosses the network.
+ */
+async function handleCompressedVolume(msg: any): Promise<void> {
+  const receiveTime = performance.now();
+  const compressed = new Uint8Array(msg.compressedData as ArrayBuffer);
+  const extTiming = msg.perfExtTiming || {};
+
+  // Feature detection: DecompressionStream is available in all modern
+  // Chromium/WebView2 builds (VS Code's webview engine). If absent
+  // (ancient runtime), fall back to the HTTP-proxy preview path.
+  const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
+  if (!hasNativeDecompress) {
+    fallbackToHttpPreview();
+    return;
+  }
+
+  loadingText.textContent = 'Decompressing volume...';
+  updateProgress(0.3, 'Decompressing volume...');
+
+  // Read gzip ISIZE (uncompressed size, little-endian uint32 in the last
+  // 4 bytes) to pre-allocate the output buffer. This avoids the O(n)
+  // chunks-array + final concat memcpy that dominates large-file loads.
+  let preAlloc: Uint8Array | null = null;
+  let writeOffset = 0;
+  if (compressed.length >= 8) {
+    const tail = compressed.length - 4;
+    const isize =
+      (compressed[tail]) |
+      (compressed[tail + 1] << 8) |
+      (compressed[tail + 2] << 16) |
+      (compressed[tail + 3] >>> 0);
+    // Sanity: 1KB..4GB, and not absurdly larger than compressed * 50
+    if (isize >= 1024 && isize <= 0xffffffff && isize < compressed.length * 50) {
+      try { preAlloc = new Uint8Array(isize); } catch { /* OOM → fall back to chunks */ }
+    }
+  }
+  const chunks: Uint8Array[] = [];
+  let totalLen = 0;
+
+  // Browser-native streaming inflate. The actual DEFLATE work runs off
+  // the main thread in the renderer's compression service, so UI stays
+  // responsive; we only do lightweight memcpy + header parse per chunk.
+  const ds = new (self as any).DecompressionStream('gzip');
+  const resp = new Response(compressed);
+  const decompressedStream = resp.body!.pipeThrough(ds);
+  const reader = (decompressedStream as ReadableStream<Uint8Array>).getReader();
+
+  let header: NiiHeader | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = value as Uint8Array;
+
+    if (preAlloc) {
+      if (writeOffset + chunk.byteLength <= preAlloc.length) {
+        preAlloc.set(chunk, writeOffset);
+        writeOffset += chunk.byteLength;
+      } else {
+        // Overflow (ISIZE lied or multi-stream) → fall back to chunk list
+        if (writeOffset > 0) chunks.push(preAlloc.subarray(0, writeOffset));
+        chunks.push(chunk);
+        preAlloc = null;
+      }
+    } else {
+      chunks.push(chunk);
+    }
+    totalLen += chunk.byteLength;
+
+    // Parse header once we have enough bytes (NIfTI v1=348, v2=544).
+    if (!header && totalLen >= 544) {
+      const view = preAlloc ? preAlloc.subarray(0, Math.min(totalLen, preAlloc.length))
+        : concatUint8Chunks(chunks);
+      header = parseNiiHeader(view.buffer as ArrayBuffer, true);
+      if (header) updateProgress(0.5, 'Reading volume data...');
+    }
+  }
+
+  if (!header) {
+    fallbackToHttpPreview();
+    return;
+  }
+
+  // Assemble the full decompressed buffer
+  let full: Uint8Array;
+  if (preAlloc) {
+    full = (writeOffset === totalLen) ? preAlloc : preAlloc.subarray(0, totalLen);
+  } else {
+    full = concatUint8Chunks(chunks, totalLen);
+  }
+
+  // Stats (min/max) via typed-array fast path with sampling — mirrors
+  // the extension host's computeVoxelStats so window/level matches.
+  const stats = computeVolumeStatsWebview(full, header);
+
+  // Float64 → Float32 downcast (visualization only; halves memory).
+  // full is always backed by a regular ArrayBuffer (we allocate it via
+  // new Uint8Array(isize) or concatUint8Chunks), so the cast is sound.
+  let voxelBuffer: ArrayBuffer = full.buffer as ArrayBuffer;
+  let voxOffset = header.voxOffset;
+  let datatype = header.datatype;
+  let bytesPerVoxel = header.bytesPerVoxel;
+  if (datatype === 64) {
+    const n = header.nx * header.ny * header.nz;
+    const src = new Float64Array(full.buffer, full.byteOffset + header.voxOffset, n);
+    const f32 = new Float32Array(n);
+    for (let i = 0; i < n; i++) f32[i] = src[i];
+    voxelBuffer = f32.buffer;
+    voxOffset = 0;
+    datatype = 16;
+    bytesPerVoxel = 4;
+  }
+
+  updateProgress(0.7, 'Rendering...');
+
+  // Reuse the existing rendering pipeline by constructing a message
+  // with the same shape handleCachedVolume expects.
+  const nFinal = header.nx * header.ny * header.nz;
+  handleCachedVolume({
+    header: { ...header, datatype, bytesPerVoxel, bitpix: bytesPerVoxel * 8, voxOffset },
+    voxelData: voxelBuffer,
+    voxOffset,
+    voxelLength: nFinal * bytesPerVoxel,
+    datatype,
+    globalMin: stats.min,
+    globalMax: stats.max,
+    slope: header.scl_slope || 1,
+    inter: header.scl_inter || 0,
+    sliceIdx: {
+      axial: Math.floor(header.nz / 2),
+      coronal: Math.floor(header.ny / 2),
+      sagittal: Math.floor(header.nx / 2),
+    },
+    perfExtTiming: {
+      ...extTiming,
+      webviewDecompressMs: +((performance.now() - receiveTime).toFixed(1)),
+    },
+    perfVoxelBytes: nFinal * bytesPerVoxel,
+  });
+}
+
+/** Concatenate an array of Uint8Array chunks into one contiguous buffer. */
+function concatUint8Chunks(chunks: Uint8Array[], totalLen?: number): Uint8Array {
+  const total = totalLen ?? chunks.reduce((s, c) => s + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
+/**
+ * Compute volume min/max with typed-array fast path + sampling.
+ * Mirrors the extension host's computeVoxelStats so display stats match.
+ */
+function computeVolumeStatsWebview(rawData: Uint8Array, header: NiiHeader): { min: number; max: number } {
+  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
+  const n = nx * ny * nz;
+  const slope = scl_slope || 1;
+  const inter = scl_inter || 0;
+  const le = littleEndian;
+  const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
+  const byteOff = rawData.byteOffset + voxOffset;
+  const needsConversion = slope !== 1 || inter !== 0;
+  let min = Infinity, max = -Infinity;
+  const sampleStep = Math.max(1, Math.floor(n / 50000));
+
+  // Fast path: typed-array views for little-endian, aligned, in-range data
+  if (le && (byteOff % elemSize === 0) && (byteOff + n * elemSize <= rawData.buffer.byteLength)) {
+    if (!needsConversion) {
+      switch (datatype) {
+        case 2: { const a = new Uint8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 4: { const a = new Int16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 8: { const a = new Int32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 16: { const a = new Float32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 64: { const a = new Float64Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 256: { const a = new Int8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 512: { const a = new Uint16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 768: { const a = new Uint32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i]; if (v < min) min = v; if (v > max) max = v; } break; }
+      }
+    } else {
+      switch (datatype) {
+        case 2: { const a = new Uint8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 4: { const a = new Int16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 8: { const a = new Int32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 16: { const a = new Float32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 64: { const a = new Float64Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 256: { const a = new Int8Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 512: { const a = new Uint16Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+        case 768: { const a = new Uint32Array(rawData.buffer, byteOff, n); for (let i = 0; i < n; i += sampleStep) { const v = a[i] * slope + inter; if (v < min) min = v; if (v > max) max = v; } break; }
+      }
+    }
+  }
+
+  if (min === Infinity || max === -Infinity) { min = 0; max = 1; }
+  if (min === max) max = min + 1;
+  if (!isFinite(min) || !isFinite(max)) { min = 0; max = 1; }
+  return { min, max };
 }
 
 function handleCachedVolume(msg: any): void {
