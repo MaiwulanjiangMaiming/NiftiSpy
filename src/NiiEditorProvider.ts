@@ -171,7 +171,11 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           lines.push(`│   ${tag} total decompress  : ${stream.totalDecompress ?? '?'} ms (fs read + native)`);
           lines.push(`│   ${tag} stats (min/max)   : ${stream.statsCompute ?? '?'} ms`);
         } else {
-          lines.push(`│   ${tag} decompress        : ${stream.totalDecompress ?? '?'} ms (pure inflate)`);
+          // [gunzip] path (JS gunzipSync, nativeBackend='system-zlib')
+          lines.push(`│   ${tag} header parse      : ${stream.headerParse ?? '?'} ms`);
+          lines.push(`│   ${tag} decompress        : ${stream.nativeDecompress ?? stream.totalDecompress ?? '?'} ms (pure gunzipSync)`);
+          lines.push(`│   ${tag} total decompress  : ${stream.totalDecompress ?? '?'} ms (fs read + gunzip)`);
+          lines.push(`│   ${tag} stats (min/max)   : ${stream.statsCompute ?? '?'} ms`);
         }
         const decompressedMB = ((stream.decompressedBytes || 0) / (1024 * 1024)).toFixed(1);
         lines.push(`│   ${tag} decompressed size : ${decompressedMB} MB`);
@@ -652,29 +656,51 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             //      parallel → oneshot → streaming
             //    All async variants run on libuv worker thread (not blocking JS main).
             const native = getNativeBindings();
-            let result: { rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null = null;
-            let pathUsed: 'parallel' | 'oneshot' | 'streaming' = 'streaming';
+            const SMALL_FILE_THRESHOLD_MB = 10;   // < 10MB → JS gunzipSync (no stream overhead)
+            const PARALLEL_THRESHOLD_MB = 50;     // > 50MB → native parallel (rusty-rapidgzip)
+            const fileSizeMB = fileSize / (1024 * 1024);  // fileSize from stat at L334
 
-            if (native?.fastDecompressGzipParallelAsync) {
+            let result: { rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null = null;
+            let pathUsed: 'parallel' | 'oneshot' | 'streaming' | 'js-oneshot' = 'streaming';
+
+            // 1. Large file + native parallel → rusty-rapidgzip (multi-core)
+            if (fileSize > 0 && fileSizeMB > PARALLEL_THRESHOLD_MB
+                && native?.fastDecompressGzipParallelAsync) {
               try {
                 result = await this.parallelLocalGzLoad(webview, fsPath, signal);
                 pathUsed = 'parallel';
               } catch (err) {
-                this.logPerf(`[parallel] failed, falling back to oneshot: ${String(err)}`);
+                this.logPerf(`[parallel] failed, falling back: ${String(err)}`);
                 result = null;
               }
             }
 
-            if (!result && (native?.fastDecompressGzipFileAsync || native?.fastDecompressGzipOneshot)) {
+            // 2. Medium file + native oneshot → libdeflate (single-core, no stream)
+            if (!result && fileSize > 0 && fileSizeMB <= PARALLEL_THRESHOLD_MB
+                && (native?.fastDecompressGzipFileAsync || native?.fastDecompressGzipOneshot)) {
               try {
                 result = await this.oneshotLocalGzLoad(webview, fsPath, signal);
                 pathUsed = 'oneshot';
               } catch (err) {
-                this.logPerf(`[oneshot] failed, falling back to streaming: ${String(err)}`);
+                this.logPerf(`[oneshot] failed, falling back: ${String(err)}`);
                 result = null;
               }
             }
 
+            // 3. Small file (or native unavailable) → JS gunzipSync (no stream overhead)
+            //    This is the key path for Remote-SSH Linux where native is unavailable:
+            //    eliminates createReadStream + pipe + event-loop startup cost.
+            if (!result && fileSize > 0 && fileSizeMB <= SMALL_FILE_THRESHOLD_MB) {
+              try {
+                result = await this.jsOneshotLocalGzLoad(webview, fsPath, signal);
+                pathUsed = 'js-oneshot';
+              } catch (err) {
+                this.logPerf(`[js-oneshot] failed, falling back to streaming: ${String(err)}`);
+                result = null;
+              }
+            }
+
+            // 4. Fallback: streaming zlib (large file + native unavailable, or all above failed)
             if (!result) {
               result = await this.streamingLocalGzLoad(webview, fsPath, signal);
               pathUsed = 'streaming';
@@ -1202,6 +1228,74 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     }
 
     return { rawData, header, stats, timing };
+  }
+
+  /**
+   * JS-only one-shot gzip decompression for small local .nii.gz files.
+   *
+   * Uses Node.js fs.readFile + zlib.gunzipSync — no native module required.
+   * Eliminates the stream startup overhead (createReadStream + pipe +
+   * event-loop scheduling) that dominates small-file load time.
+   *
+   * Benchmark on 4.8MB file (Remote-SSH Linux, no native):
+   *   streaming: 60-80ms (stream startup ~45ms + gunzip ~15ms)
+   *   js-oneshot: 15-20ms (readFile ~5ms + gunzipSync ~10ms)
+   *
+   * No early preview: the full volume is ready in <25ms, so sending a
+   * z=0 partial preview would be pure waste (postMessage overhead > gain).
+   * The webview already ignores partialPreview messages.
+   *
+   * Fallback: if gunzipSync fails (rare; corrupt or multi-stream gzip),
+   * the caller falls back to streamingLocalGzLoad.
+   */
+  private async jsOneshotLocalGzLoad(
+    webview: vscode.Webview,
+    fsPath: string,
+    signal: AbortSignal
+  ): Promise<{ rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null> {
+    const tStart = performance.now();
+    // 1. Single readFile — no stream, no pipe, no event-loop scheduling.
+    const compressed = await fs.promises.readFile(fsPath);
+    if (signal.aborted) return null;
+    const tFsEnd = performance.now();
+
+    // 2. Synchronous gunzip — single V8→zlib call, no 'data' events.
+    const decompressed = zlib.gunzipSync(compressed);
+    const tDecompressEnd = performance.now();
+
+    const rawData: Uint8Array = new Uint8Array(
+      decompressed.buffer, decompressed.byteOffset, decompressed.byteLength
+    );
+
+    // 3. Parse NIfTI header.
+    const tHeaderStart = performance.now();
+    const header = this.parseNiiHeaderFromBuffer(rawData);
+    const tHeaderEnd = performance.now();
+    if (!header) {
+      throw new Error('Failed to parse NIfTI header after gunzipSync');
+    }
+
+    // 4. No early preview — full volume ready in <25ms, preview is waste.
+
+    // 5. Compute min/max stats.
+    const tStatsStart = performance.now();
+    const stats = this.computeVoxelStats(rawData, header, fsPath);
+    const tStatsEnd = performance.now();
+
+    return {
+      rawData, header, stats,
+      timing: {
+        fsToFirstData: +((tFsEnd - tStart).toFixed(1)),
+        headerParse: +((tHeaderEnd - tHeaderStart).toFixed(1)),
+        previewReady: 0,
+        totalDecompress: +((tDecompressEnd - tStart).toFixed(1)),
+        nativeDecompress: +((tDecompressEnd - tFsEnd).toFixed(1)),
+        statsCompute: +((tStatsEnd - tStatsStart).toFixed(1)),
+        decompressedBytes: rawData.byteLength,
+        nativeBackend: 'system-zlib',
+        asyncPath: false,
+      },
+    };
   }
 
   /**

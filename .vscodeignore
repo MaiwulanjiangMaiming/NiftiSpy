@@ -13,6 +13,7 @@ native/target/**
 native/Cargo.lock
 native/Cargo.toml
 native/build.rs
+native/index.node
 native-wasm/target/**
 native-wasm/Cargo.lock
 native-wasm/Cargo.toml

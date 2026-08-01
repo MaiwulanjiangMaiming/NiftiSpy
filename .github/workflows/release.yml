@@ -4,7 +4,54 @@ on:
     tags: ['v*']
 
 jobs:
+  build-native:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: linux-x64-gnu   }
+          - { os: ubuntu-22.04-arm, target: linux-arm64-gnu }
+          - { os: macos-latest,     target: darwin-arm64    }
+          - { os: macos-13,         target: darwin-x64      }
+          - { os: windows-latest,   target: win32-x64-msvc  }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build native module
+        run: cargo build --release --manifest-path native/Cargo.toml
+      - name: Stage platform-specific binary
+        shell: bash
+        run: |
+          ARTIFACT=""
+          for f in niftispy_native.node \
+                   libniftispy_native.dylib libniftispy_native.so \
+                   niftispy_native.dll; do
+            if [ -f "native/target/release/$f" ]; then
+              ARTIFACT="native/target/release/$f"; break
+            fi
+          done
+          if [ -z "$ARTIFACT" ]; then echo "No artifact found"; exit 1; fi
+          cp "$ARTIFACT" "niftispy_native.${{ matrix.target }}.node"
+      - name: Smoke test
+        shell: bash
+        run: |
+          printf 'niftispy-test' | gzip > test.gz
+          node -e "
+            const n = require('./niftispy_native.${{ matrix.target }}.node');
+            n.fastDecompressGzipFileAsync('test.gz').then(buf => {
+              if (buf.toString() !== 'niftispy-test') process.exit(1);
+              console.log('OK');
+            }).catch(e => { console.error(e); process.exit(1); });
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: niftispy_native.${{ matrix.target }}.node
+          if-no-files-found: error
+
   package-and-publish:
+    needs: [build-native]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,8 +61,25 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: .
+      - name: Verify all platform binaries present
+        shell: bash
+        run: |
+          for t in linux-x64-gnu linux-arm64-gnu darwin-arm64 darwin-x64 win32-x64-msvc; do
+            test -f "niftispy_native.$t.node" || { echo "MISSING: $t"; exit 1; }
+          done
+          rm -f native/index.node
       - run: npx vsce package --no-dependencies
       - uses: actions/upload-artifact@v4
         with:
           name: vsix
           path: '*.vsix'
+      # Uncomment the following lines to auto-publish on tag push.
+      # Requires VSCE_PAT secret to be set in repository settings.
+      # - run: npx vsce publish --no-dependencies --pat ${{ secrets.VSCE_PAT }}
+      #   env:
+      #     VSCE_PAT: ${{ secrets.VSCE_PAT }}

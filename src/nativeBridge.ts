@@ -159,15 +159,25 @@ function loadBindings(): NativeBindings | null {
   try {
     const dynamicRequire = createRequire(__filename);
     // Prefer platform-specific napi-rs binary (rusty-rapidgzip parallel build):
-    //   niftispy_native.darwin-arm64.node  (macOS Apple Silicon)
-    //   niftispy_native.darwin-x64.node    (macOS Intel)
-    //   niftispy_native.linux-x64-gnu.node (Linux x86_64)
-    //   niftispy_native.win32-x64-msvc.node(Windows x86_64)
+    //   niftispy_native.darwin-arm64.node      (macOS Apple Silicon)
+    //   niftispy_native.darwin-x64.node        (macOS Intel)
+    //   niftispy_native.linux-x64-gnu.node     (Linux x86_64, glibc)
+    //   niftispy_native.linux-arm64-gnu.node   (Linux ARM64, glibc)
+    //   niftispy_native.win32-x64-msvc.node    (Windows x86_64, MSVC)
     // Falls back to native/index.node (wasm-pack legacy build) if not found.
-    const platformName = `${process.platform}-${process.arch}`;
+    const platform = process.platform;
+    const arch = process.arch;
+    // libc suffix: linux→gnu, win32→msvc, darwin→(none, macOS has one libc)
+    const libc = platform === 'linux' ? 'gnu' : platform === 'win32' ? 'msvc' : '';
+    // Candidates ordered most-specific → least-specific:
+    //   linux-x64-gnu  →  linux-x64  (in case a binary was built without libc suffix)
+    //   win32-x64-msvc →  win32-x64
+    //   darwin-arm64   (no libc variant needed)
+    const platformVariants = libc
+      ? [`${platform}-${arch}-${libc}`, `${platform}-${arch}`]
+      : [`${platform}-${arch}`];
     const candidates = [
-      `../niftispy_native.${platformName}.node`,
-      `../niftispy_native.${process.platform}-${process.arch}-gnu.node`,
+      ...platformVariants.map(v => `../niftispy_native.${v}.node`),
       '../native/index.node',  // legacy fallback (wasm-pack, no parallel support)
     ];
     let rawBindings: RawNativeBindings | null = null;

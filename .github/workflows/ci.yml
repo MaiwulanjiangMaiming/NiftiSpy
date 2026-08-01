@@ -26,20 +26,55 @@ jobs:
   build-native:
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - { os: ubuntu-latest,    target: linux-x64-gnu   }
+          - { os: ubuntu-22.04-arm, target: linux-arm64-gnu }
+          - { os: macos-latest,     target: darwin-arm64    }
+          - { os: macos-13,         target: darwin-x64      }
+          - { os: windows-latest,   target: win32-x64-msvc  }
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.x
-          cache: npm
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release --manifest-path native/Cargo.toml
-      - run: node scripts/build-native.js
+      - name: Build native module
+        run: cargo build --release --manifest-path native/Cargo.toml
+      - name: Stage platform-specific binary
+        shell: bash
+        run: |
+          # Locate the cargo output artifact (platform-dependent extension)
+          ARTIFACT=""
+          for f in niftispy_native.node \
+                   libniftispy_native.dylib libniftispy_native.so \
+                   niftispy_native.dll; do
+            if [ -f "native/target/release/$f" ]; then
+              ARTIFACT="native/target/release/$f"; break
+            fi
+          done
+          if [ -z "$ARTIFACT" ]; then echo "No artifact found in target/release"; exit 1; fi
+          cp "$ARTIFACT" "niftispy_native.${{ matrix.target }}.node"
+          echo "Staged niftispy_native.${{ matrix.target }}.node"
+      - name: Smoke test (load + decompress)
+        shell: bash
+        run: |
+          printf 'niftispy-test' | gzip > test.gz
+          node -e "
+            const n = require('./niftispy_native.${{ matrix.target }}.node');
+            n.fastDecompressGzipFileAsync('test.gz').then(buf => {
+              const s = buf.toString();
+              if (s !== 'niftispy-test') { console.error('mismatch:', s); process.exit(1); }
+              console.log('functional OK');
+            }).catch(e => { console.error(e); process.exit(1); });
+          "
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: niftispy_native.${{ matrix.target }}.node
+          if-no-files-found: error
+          retention-days: 7
 
   package:
-    needs: [build]
+    needs: [build, build-native]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +84,22 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      # Download all 5 platform binaries and place them at repo root,
+      # exactly where nativeBridge.ts looks them up.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: .
+      - name: Verify all platform binaries present
+        shell: bash
+        run: |
+          for t in linux-x64-gnu linux-arm64-gnu darwin-arm64 darwin-x64 win32-x64-msvc; do
+            test -f "niftispy_native.$t.node" || { echo "MISSING: niftispy_native.$t.node"; exit 1; }
+          done
+          echo "All 5 platform binaries present"
+          # Remove the stale dev-only legacy file so we don't ship a wrong-arch binary
+          rm -f native/index.node
       - run: npx vsce package --no-dependencies
       - uses: actions/upload-artifact@v4
         with:
