@@ -4525,6 +4525,23 @@ async function fetchPreviewData(url: string = fileUrl): Promise<any | null> {
 let directPreviewReceived = false;
 let directPreviewTimer: number | null = null;
 
+// State for the Remote-SSH chunked volume transfer. Only one chunked
+// transfer is active at a time; a new transfer resets this state.
+let chunkedState: {
+  total: number;
+  received: number;
+  nextExpected: number;
+  pending: Map<number, ArrayBuffer>;
+  controller: ReadableStreamDefaultController<Uint8Array> | null;
+  decompressedChunks: Uint8Array[];
+  decompressedLen: number;
+  header: NiiHeader | null;
+  fileName: string;
+  fileSize: number;
+  validationToken: string;
+  receiveTime: number;
+} | null = null;
+
 window.addEventListener('DOMContentLoaded', () => {
   publishPerfMonitor();
   // Pre-warm the Worker blob URL so the first loadVolumeViaWorker()
@@ -4553,14 +4570,14 @@ window.addEventListener('message', async (e) => {
     return;
   }
 
-  if (msg.type === 'deferToWorker') {
-    // Remote-SSH large-file signal: ext host chose NOT to postMessage the
-    // volume (would freeze the IDE). Cancel the fallback timer and start
-    // worker streaming immediately.
+  if (msg.type === 'chunkedVolume') {
+    // Remote-SSH large-file path: ext host sends the compressed .nii.gz in
+    // small chunks (2MB each) to avoid blocking the main thread with one
+    // huge postMessage. We feed each chunk to a streaming DecompressionStream
+    // and show early preview as soon as enough data is decompressed.
+    directPreviewReceived = true;
     if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
-    if (!directPreviewReceived) {
-      void fallbackToHttpPreview();
-    }
+    void handleChunkedVolume(msg);
     return;
   }
 
@@ -4786,6 +4803,183 @@ function handleDirectPreview(msg: any): void {
  * This avoids pushing the full DECOMPRESSED volume across the SSH tunnel
  * — only the 3-5x smaller compressed payload crosses the network.
  */
+
+/**
+ * Remote-SSH chunked volume handler.
+ *
+ * The extension host sends the compressed .nii.gz in 2MB chunks (via
+ * separate postMessage calls) to avoid blocking its main thread with
+ * one huge structured-clone. We feed each chunk IN ORDER to a streaming
+ * DecompressionStream, collect the decompressed output, and render once
+ * complete. Early preview is shown as soon as the header is parseable.
+ */
+async function handleChunkedVolume(msg: any): Promise<void> {
+  // First chunk: initialize streaming decompression state
+  if (msg.index === 0) {
+    // Abort any previous chunked transfer (user switched files)
+    if (chunkedState?.controller) {
+      try { chunkedState.controller.close(); } catch { /* already closed */ }
+    }
+    chunkedState = {
+      total: msg.total,
+      received: 0,
+      nextExpected: 0,
+      pending: new Map(),
+      controller: null,
+      decompressedChunks: [],
+      decompressedLen: 0,
+      header: null,
+      fileName: msg.fileName,
+      fileSize: msg.fileSize,
+      validationToken: msg.validationToken,
+      receiveTime: performance.now(),
+    };
+
+    loadingText.textContent = 'Streaming volume...';
+    updateProgress(0.05, 'Streaming volume...');
+
+    // Create a ReadableStream that we'll feed compressed chunks to.
+    // The DecompressionStream pipes it to decompressed output.
+    const compressedStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        (chunkedState as any).controller = controller;
+      },
+    });
+
+    const ds = new (self as any).DecompressionStream('gzip');
+    const decompressedStream = compressedStream.pipeThrough(ds) as unknown as ReadableStream<Uint8Array>;
+    void readDecompressedStream(decompressedStream);
+  }
+
+  if (!chunkedState) return;
+
+  // Cache perfExtTiming for readDecompressedStream (runs in separate async context)
+  if (msg.perfExtTiming) msg_perfExtTimingCache = msg.perfExtTiming;
+
+  const chunkData = new Uint8Array(msg.chunk);
+  chunkedState.received++;
+
+  // Feed chunks to the decompressor IN ORDER (postMessage preserves order,
+  // but we guard against reordering just in case)
+  if (msg.index === chunkedState.nextExpected) {
+    chunkedState.controller?.enqueue(chunkData);
+    chunkedState.nextExpected++;
+    // Flush any pending chunks that arrived early
+    while (chunkedState.pending.has(chunkedState.nextExpected)) {
+      const pending = chunkedState.pending.get(chunkedState.nextExpected)!;
+      chunkedState.pending.delete(chunkedState.nextExpected);
+      chunkedState.controller?.enqueue(new Uint8Array(pending));
+      chunkedState.nextExpected++;
+    }
+  } else {
+    chunkedState.pending.set(msg.index, msg.chunk);
+  }
+
+  updateProgress(
+    0.05 + 0.35 * (chunkedState.received / chunkedState.total),
+    `Streaming volume... ${chunkedState.received}/${chunkedState.total} chunks`
+  );
+
+  // Last chunk: close the stream so the decompressor can finish
+  if (chunkedState.received === chunkedState.total) {
+    chunkedState.controller?.close();
+  }
+}
+
+/**
+ * Background reader for the decompressed stream. Collects chunks,
+ * parses the NIfTI header as soon as enough data is available, and
+ * renders the full volume when decompression completes.
+ */
+async function readDecompressedStream(decompressedStream: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = decompressedStream.getReader();
+  const state = chunkedState;
+  if (!state) return;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value as Uint8Array;
+      state.decompressedChunks.push(chunk);
+      state.decompressedLen += chunk.byteLength;
+
+      // Parse header as soon as we have enough data (NIfTI v1=348, v2=544)
+      if (!state.header && state.decompressedLen >= 544) {
+        const buf = concatUint8Chunks(state.decompressedChunks, state.decompressedLen);
+        state.header = parseNiiHeader(buf.buffer as ArrayBuffer, true);
+        if (state.header) {
+          updateProgress(0.5, 'Decompressing volume...');
+        }
+      }
+    }
+
+    if (!state.header) {
+      loadingText.textContent = 'Error: could not parse NIfTI header from decompressed stream';
+      return;
+    }
+
+    // Assemble the full decompressed buffer
+    const full = concatUint8Chunks(state.decompressedChunks, state.decompressedLen);
+
+    // Compute volume statistics (min/max)
+    const stats = computeVolumeStatsWebview(full, state.header);
+
+    // Float64 → Float32 downcast
+    let voxelBuffer: ArrayBuffer = full.buffer as ArrayBuffer;
+    let voxOffset = state.header.voxOffset;
+    let datatype = state.header.datatype;
+    let bytesPerVoxel = state.header.bytesPerVoxel;
+    if (datatype === 64) {
+      const n = state.header.nx * state.header.ny * state.header.nz;
+      const src = new Float64Array(full.buffer, full.byteOffset + state.header.voxOffset, n);
+      const f32 = new Float32Array(n);
+      for (let i = 0; i < n; i++) f32[i] = src[i];
+      voxelBuffer = f32.buffer;
+      voxOffset = 0;
+      datatype = 16;
+      bytesPerVoxel = 4;
+    }
+
+    updateProgress(0.85, 'Rendering...');
+
+    // Reuse the existing rendering pipeline
+    const nFinal = state.header.nx * state.header.ny * state.header.nz;
+    handleCachedVolume({
+      header: { ...state.header, datatype, bytesPerVoxel, bitpix: bytesPerVoxel * 8, voxOffset },
+      voxelData: voxelBuffer,
+      voxOffset,
+      voxelLength: nFinal * bytesPerVoxel,
+      datatype,
+      globalMin: stats.min,
+      globalMax: stats.max,
+      slope: state.header.scl_slope || 1,
+      inter: state.header.scl_inter || 0,
+      sliceIdx: {
+        axial: Math.floor(state.header.nz / 2),
+        coronal: Math.floor(state.header.ny / 2),
+        sagittal: Math.floor(state.header.nx / 2),
+      },
+      perfExtTiming: {
+        ...(msg_perfExtTimingCache || {}),
+        isRemoteSSH: true,
+        path: 'remote-ssh-chunked',
+        webviewDecompressMs: +((performance.now() - state.receiveTime).toFixed(1)),
+      },
+      perfVoxelBytes: nFinal * bytesPerVoxel,
+    });
+
+    chunkedState = null; // free state
+  } catch (err) {
+    loadingText.textContent = 'Error: ' + ((err as Error)?.message || String(err));
+    chunkedState = null;
+  }
+}
+
+// Cache for perfExtTiming from the last chunked message (readDecompressedStream
+// runs in a separate async context and can't access the msg parameter).
+let msg_perfExtTimingCache: any = null;
+
 async function handleCompressedVolume(msg: any): Promise<void> {
   const receiveTime = performance.now();
   const compressed = new Uint8Array(msg.compressedData as ArrayBuffer);

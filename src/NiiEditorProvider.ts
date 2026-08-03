@@ -648,53 +648,34 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const isRemoteSSH = !!vscode.env.remoteName;
 
           if (isGzip) {
-            // ── Remote-SSH: avoid postMessage of large buffers ──
-            // In Remote-SSH the Extension Host runs on the remote server while
-            // the Webview runs locally; webview.postMessage() crosses the SSH
-            // tunnel. postMessage serializes its argument via structured clone
-            // SYNCHRONOUSLY on the ext-host main thread, and a large ArrayBuffer
-            // (e.g. 142MB .nii.gz) blocks the main thread for hundreds of ms
-            // AND saturates the RPC channel for the duration of the SSH transfer
-            // (~7 min at 2.6 Mbps). During that time the ext host cannot service
-            // any other request (worker HTTP fetch, command palette, UI), so the
-            // whole IDE freezes.
+            // ── Remote-SSH: chunked compressed transfer ──
+            // postMessage serializes its argument via structured clone SYNCHRONOUSLY
+            // on the ext-host main thread. One large ArrayBuffer (e.g. 142MB) blocks
+            // the main thread for hundreds of ms AND saturates the RPC channel for
+            // the entire SSH transfer, freezing the IDE.
             //
-            // Size-aware dispatch:
-            //  - SMALL files (<= REMOTE_SSH_COMPRESSED_MAX_MB): ship compressed
-            //    bytes via postMessage. Serialized clone of a few MB takes only
-            //    a few ms on the main thread (acceptable) and one round trip
-            //    beats the HTTP range-request overhead of the streaming path.
-            //  - LARGE files: do NOTHING on the ext host. Return immediately so
-            //    the main thread stays free. The webview's directPreviewTimer
-            //    (400 ms, set in the 'config' handler) fires fallbackToHttpPreview,
-            //    which drives the slice worker to stream the file via its
-            //    asWebviewUri URL + DecompressionStream — zero ext-host main-
-            //    thread work, no large postMessage, no IDE freeze.
+            // Fix: read the compressed file in small chunks (2MB) and postMessage
+            // each chunk separately. Each serialization takes ~10-20ms (not blocking),
+            // and we yield to the event loop between chunks so other extensions, UI,
+            // and command palette stay responsive. The webview feeds chunks to a
+            // streaming DecompressionStream and shows early preview as data arrives.
+            //
+            // This avoids the "worker fetch of asWebviewUri URLs is unreliable across
+            // VS Code versions" problem documented at the asWebviewUri assignment.
             if (vscode.env.remoteName) {
-              const REMOTE_SSH_COMPRESSED_MAX_MB = 4;
+              const REMOTE_SSH_ONESHOT_MAX_MB = 4;
               const fileMB = fileSize / (1024 * 1024);
-              if (fileSize > 0 && fileMB <= REMOTE_SSH_COMPRESSED_MAX_MB) {
+              if (fileSize > 0 && fileMB <= REMOTE_SSH_ONESHOT_MAX_MB) {
+                // Small file: one-shot compressed postMessage (fast, minimal overhead)
                 try {
                   await this.remoteSshCompressedLoad(webview, fsPath, fileSize, validationToken, signal);
                   return;
                 } catch (err) {
-                  this.logPerf(`[remote-ssh-compressed] small-file postMessage failed: ${String(err)}`);
-                  // fall through to streaming-return below
+                  this.logPerf(`[remote-ssh] oneshot failed, falling back to chunked: ${String(err)}`);
                 }
-              } else {
-                this.logPerf(`[remote-ssh] large file (${fileMB.toFixed(1)} MB) — deferring to webview worker streaming, no ext-host postMessage`);
-                // Lightweight signal (a few dozen bytes — no structured-clone
-                // cost, no RPC saturation) so the webview starts streaming
-                // immediately instead of waiting out the 400 ms fallback timer.
-                webview.postMessage({ type: 'deferToWorker' });
               }
-              // For large files (or small-file failure): ext host does nothing.
-              // Webview's directPreviewTimer (or the deferToWorker signal above)
-              // drives fallbackToHttpPreview → slice worker streams via its
-              // asWebviewUri URL + DecompressionStream.
-              // CRITICAL: must NOT fall through to the parallel/oneshot/streaming
-              // tree below — that path decompresses on the ext host and postMessages
-              // the (even larger) decompressed volume, causing the same freeze.
+              // Large file (or small-file failure): chunked transfer
+              await this.remoteSshChunkedLoad(webview, fsPath, fileSize, validationToken, signal);
               return;
             }
             // ── Strategy: prefer native libdeflate oneshot, fall back to streaming.
@@ -1370,6 +1351,70 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         path: 'remote-ssh-compressed',
       },
     });
+  }
+
+  /**
+   * Remote-SSH chunked transfer: read the compressed .nii.gz in small
+   * chunks and postMessage each separately. This avoids the synchronous
+   * structured-clone cost of one large ArrayBuffer (which blocks the
+   * ext-host main thread and freezes the IDE), while still delivering
+   * the compressed bytes (3-5x smaller than decompressed) to the webview
+   * for local DecompressionStream inflation.
+   *
+   * Each chunk: ~2MB → ~10-20ms serialization, then setImmediate yields
+   * to the event loop so other extensions/UI/command palette stay live.
+   * The webview feeds chunks to a streaming DecompressionStream and
+   * shows early preview as soon as enough data arrives.
+   */
+  private async remoteSshChunkedLoad(
+    webview: vscode.Webview,
+    fsPath: string,
+    fileSize: number,
+    validationToken: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per postMessage
+    const totalChunks = Math.max(1, Math.ceil(fileSize / CHUNK_SIZE));
+    const tStart = performance.now();
+
+    // Use createReadStream for efficient chunked reading
+    const stream = fs.createReadStream(fsPath, { highWaterMark: CHUNK_SIZE });
+    let chunkIndex = 0;
+
+    try {
+      for await (const chunk of stream) {
+        if (signal.aborted) { stream.destroy(); return; }
+
+        // Extract a clean ArrayBuffer (Node Buffer may have byteOffset)
+        const ab = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
+
+        await webview.postMessage({
+          type: 'chunkedVolume',
+          chunk: ab,
+          index: chunkIndex,
+          total: totalChunks,
+          fileName: path.basename(fsPath),
+          fileSize,
+          validationToken,
+          perfExtTiming: {
+            isRemoteSSH: true,
+            path: 'remote-ssh-chunked',
+            compressedBytes: fileSize,
+          },
+        });
+
+        chunkIndex++;
+
+        // Yield to the event loop so other extensions, UI, and command
+        // palette can run between chunks. Without this, the postMessage
+        // serialization queue still dominates the main thread.
+        await new Promise<void>(r => setImmediate(r));
+      }
+
+      this.logPerf(`[remote-ssh-chunked] sent ${chunkIndex}/${totalChunks} chunks for ${path.basename(fsPath)} in ${+(performance.now() - tStart).toFixed(0)}ms`);
+    } finally {
+      stream.destroy();
+    }
   }
 
   /**
