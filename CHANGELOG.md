@@ -2,6 +2,21 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.2.1] - 2026-08-03
+
+### Fixed — Remote-SSH IDE Freeze
+- **Stopped IDE freeze on large `.nii.gz` over Remote-SSH**: a single `postMessage` of a large `ArrayBuffer` (e.g. 142MB) serialized via structured clone on the extension-host main thread and saturated the RPC channel for the entire SSH transfer, freezing the whole IDE. Files larger than 4MB now use chunked transfer: the compressed file is read in 2MB chunks, each `postMessage`d separately with a `setImmediate` yield between chunks so other extensions, the UI, and the command palette stay responsive.
+- **Streaming decompression in the webview**: chunks are fed in order to a browser-native `DecompressionStream`, with early progress shown as data arrives. Only the compressed payload crosses the SSH tunnel (3–5× smaller than the decompressed volume).
+- **Race condition on file switch**: opening a second file mid-transfer previously let the stale `readDecompressedStream` overwrite the new volume on completion. A generation counter now aborts stale readers before render.
+
+### Added — Debug Mode Toggle
+- **Interactive debug toggle in the status bar**: perf reports now default to OFF. Click the `$(bug) NiftiSpy Debug` status bar item (or run `NiftiSpy: Toggle Debug Mode` from the command palette) to turn debug mode on/off. State persists across sessions via `workspaceState`. The `niftispy.showPerfReport` setting is retained but only seeds the initial value at startup.
+
+### Changed — Remote-SSH Dispatch
+- **Size-aware Remote-SSH routing**: small files (≤4MB) keep the one-shot compressed `postMessage` fast path; large files use the chunked streaming path. Local file loading is unchanged.
+
+---
+
 ## [2.2.0] - 2026-07-18
 
 ### Performance — Multi-Core Parallel Gzip Decompression
