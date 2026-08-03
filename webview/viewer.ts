@@ -4553,6 +4553,17 @@ window.addEventListener('message', async (e) => {
     return;
   }
 
+  if (msg.type === 'deferToWorker') {
+    // Remote-SSH large-file signal: ext host chose NOT to postMessage the
+    // volume (would freeze the IDE). Cancel the fallback timer and start
+    // worker streaming immediately.
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+    if (!directPreviewReceived) {
+      void fallbackToHttpPreview();
+    }
+    return;
+  }
+
   if (msg.type === 'compressedVolume') {
     // Remote-SSH fast path: extension host shipped the COMPRESSED .nii.gz
     // bytes (small) instead of the decompressed volume (large). We

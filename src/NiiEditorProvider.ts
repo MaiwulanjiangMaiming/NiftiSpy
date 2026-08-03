@@ -648,26 +648,54 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const isRemoteSSH = !!vscode.env.remoteName;
 
           if (isGzip) {
-            // ── Remote-SSH fast path: ship the COMPRESSED bytes to the webview ──
-            // In Remote-SSH the Extension Host runs on the remote server while the
-            // Webview runs locally; webview.postMessage() crosses the SSH tunnel.
-            // Sending the full DECOMPRESSED volume over SSH is the dominant cost
-            // (e.g. 50MB .nii.gz → ~200MB decompressed → ~1.6s @ 1Gbps), dwarfing
-            // the ~150ms decompress itself. Instead, send only the compressed
-            // bytes (3-5x smaller) and let the webview decompress locally with
-            // the browser-native DecompressionStream. This is also platform-
-            // agnostic — no native module needed on the remote host.
-            //   4.8MB file: ~300ms → ~60ms (5x).  50MB file: ~1.75s → ~600ms (3x).
+            // ── Remote-SSH: avoid postMessage of large buffers ──
+            // In Remote-SSH the Extension Host runs on the remote server while
+            // the Webview runs locally; webview.postMessage() crosses the SSH
+            // tunnel. postMessage serializes its argument via structured clone
+            // SYNCHRONOUSLY on the ext-host main thread, and a large ArrayBuffer
+            // (e.g. 142MB .nii.gz) blocks the main thread for hundreds of ms
+            // AND saturates the RPC channel for the duration of the SSH transfer
+            // (~7 min at 2.6 Mbps). During that time the ext host cannot service
+            // any other request (worker HTTP fetch, command palette, UI), so the
+            // whole IDE freezes.
+            //
+            // Size-aware dispatch:
+            //  - SMALL files (<= REMOTE_SSH_COMPRESSED_MAX_MB): ship compressed
+            //    bytes via postMessage. Serialized clone of a few MB takes only
+            //    a few ms on the main thread (acceptable) and one round trip
+            //    beats the HTTP range-request overhead of the streaming path.
+            //  - LARGE files: do NOTHING on the ext host. Return immediately so
+            //    the main thread stays free. The webview's directPreviewTimer
+            //    (400 ms, set in the 'config' handler) fires fallbackToHttpPreview,
+            //    which drives the slice worker to stream the file via its
+            //    asWebviewUri URL + DecompressionStream — zero ext-host main-
+            //    thread work, no large postMessage, no IDE freeze.
             if (vscode.env.remoteName) {
-              let compressedSent = false;
-              try {
-                await this.remoteSshCompressedLoad(webview, fsPath, fileSize, validationToken, signal);
-                compressedSent = true;
-              } catch (err) {
-                this.logPerf(`[remote-ssh-compressed] failed, falling back to ext-side decompress: ${String(err)}`);
+              const REMOTE_SSH_COMPRESSED_MAX_MB = 4;
+              const fileMB = fileSize / (1024 * 1024);
+              if (fileSize > 0 && fileMB <= REMOTE_SSH_COMPRESSED_MAX_MB) {
+                try {
+                  await this.remoteSshCompressedLoad(webview, fsPath, fileSize, validationToken, signal);
+                  return;
+                } catch (err) {
+                  this.logPerf(`[remote-ssh-compressed] small-file postMessage failed: ${String(err)}`);
+                  // fall through to streaming-return below
+                }
+              } else {
+                this.logPerf(`[remote-ssh] large file (${fileMB.toFixed(1)} MB) — deferring to webview worker streaming, no ext-host postMessage`);
+                // Lightweight signal (a few dozen bytes — no structured-clone
+                // cost, no RPC saturation) so the webview starts streaming
+                // immediately instead of waiting out the 400 ms fallback timer.
+                webview.postMessage({ type: 'deferToWorker' });
               }
-              if (compressedSent) return;
-              // else fall through to the normal parallel/oneshot/streaming tree
+              // For large files (or small-file failure): ext host does nothing.
+              // Webview's directPreviewTimer (or the deferToWorker signal above)
+              // drives fallbackToHttpPreview → slice worker streams via its
+              // asWebviewUri URL + DecompressionStream.
+              // CRITICAL: must NOT fall through to the parallel/oneshot/streaming
+              // tree below — that path decompresses on the ext host and postMessages
+              // the (even larger) decompressed volume, causing the same freeze.
+              return;
             }
             // ── Strategy: prefer native libdeflate oneshot, fall back to streaming.
             //    Benchmarked on recon_hr.nii.gz (342MB→465MB), Apple Silicon:
