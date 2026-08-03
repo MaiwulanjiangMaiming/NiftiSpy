@@ -103,6 +103,13 @@
       { "key": "alt+s", "command": "niftispy.setViewSagittal", "when": "activeCustomEditorId == 'niftispy.nifti'" },
       { "key": "alt+r", "command": "niftispy.resetView", "when": "activeCustomEditorId == 'niftispy.nifti'" }
     ],
+    "commands": [
+      {
+        "command": "niftispy.toggleDebugMode",
+        "title": "NiftiSpy: Toggle Debug Mode",
+        "category": "NiftiSpy"
+      }
+    ],
     "configuration": {
       "title": "NiftiSpy",
       "properties": {
@@ -171,7 +178,7 @@
         "niftispy.showPerfReport": {
           "type": "boolean",
           "default": false,
-          "description": "Automatically reveal the 'NiftiSpy Performance' output panel after each volume load. Off by default to avoid distracting end users; turn on for profiling."
+          "description": "Initial state of debug mode. Once the extension is active, click the $(bug) NiftiSpy Debug status bar item to toggle perf reports on/off interactively. This setting is read only once at startup."
         }
       }
     }

@@ -57,6 +57,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('niftispy.setViewCoronal', () => postToActiveWebview({ type: 'keyboard', action: 'setViewCoronal' })),
     vscode.commands.registerCommand('niftispy.setViewSagittal', () => postToActiveWebview({ type: 'keyboard', action: 'setViewSagittal' })),
     vscode.commands.registerCommand('niftispy.resetView', () => postToActiveWebview({ type: 'keyboard', action: 'resetView' })),
+    vscode.commands.registerCommand('niftispy.toggleDebugMode', () => provider.toggleDebugMode()),
   );
 
   // Register NIfTI editor

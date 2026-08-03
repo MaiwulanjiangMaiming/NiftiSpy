@@ -95,8 +95,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private chunkProgressItem: vscode.StatusBarItem | null = null;
   private nativeStatusBarItem: vscode.StatusBarItem | null = null;
   private cacheStatusBarItem: vscode.StatusBarItem | null = null;
+  private debugStatusBarItem: vscode.StatusBarItem | null = null;
   private nativeFallbackWarned = false;
   private perfChannel: vscode.OutputChannel | null = null;
+  // Debug mode: when on, perf reports are written to the OutputChannel AND
+  // the panel is auto-revealed. Toggled by clicking the $(bug) status bar item.
+  // Persists across sessions via workspaceState. Initial value also honors
+  // the "niftispy.showPerfReport" setting for backward compatibility.
+  private debugMode = false;
 
   constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
     this.volumeCache = volumeCache;
@@ -105,20 +111,50 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     this.updateCacheStatusBar();
     this.cacheStatusBarItem.show();
     this.perfChannel = vscode.window.createOutputChannel('NiftiSpy Performance');
+
+    // Restore debug mode: prefer workspaceState (button toggle), fall back to
+    // the showPerfReport setting for users who already had it enabled.
+    const saved = this.context.workspaceState.get<boolean | undefined>('niftispy.debugMode', undefined);
+    if (saved !== undefined) {
+      this.debugMode = saved;
+    } else {
+      this.debugMode = vscode.workspace.getConfiguration('niftispy').get<boolean>('showPerfReport', false);
+    }
+
+    // Debug toggle button in the status bar
+    this.debugStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 96);
+    this.updateDebugStatusBar();
+    this.debugStatusBarItem.command = 'niftispy.toggleDebugMode';
+    this.debugStatusBarItem.show();
+  }
+
+  /** Toggle debug mode on/off (bound to status bar click command). */
+  public toggleDebugMode(): void {
+    this.debugMode = !this.debugMode;
+    this.context.workspaceState.update('niftispy.debugMode', this.debugMode);
+    this.updateDebugStatusBar();
+    if (this.debugMode && this.perfChannel) {
+      this.perfChannel.show(true);
+      this.logPerf(`┌─ NiftiSpy debug mode ON — perf reports will appear here ─`);
+    }
+  }
+
+  private updateDebugStatusBar(): void {
+    if (!this.debugStatusBarItem) return;
+    this.debugStatusBarItem.text = this.debugMode ? '$(bug) NiftiSpy Debug: ON' : '$(bug) NiftiSpy Debug';
+    this.debugStatusBarItem.tooltip = this.debugMode
+      ? 'NiftiSpy debug mode is ON. Click to turn off (hide perf reports).'
+      : 'NiftiSpy debug mode is OFF. Click to turn on and show perf reports on each volume load.';
   }
 
   private logPerf(line: string): void {
-    if (this.perfChannel) {
-      this.perfChannel.appendLine(line);
-      // Only auto-reveal the output panel when the user has opted in.
-      // Default is false so the published extension never pops the panel
-      // on every volume load; enable via "niftispy.showPerfReport": true.
-      const show = vscode.workspace
-        .getConfiguration('niftispy')
-        .get<boolean>('showPerfReport', false);
-      if (show) {
-        this.perfChannel.show(true);
-      }
+    if (!this.perfChannel) return;
+    // Always append to the channel buffer (cheap), but only auto-reveal
+    // the panel when debug mode is on. This way, if a user turns on debug
+    // mode AFTER loading a file, they can still scroll up to see history.
+    this.perfChannel.appendLine(line);
+    if (this.debugMode) {
+      this.perfChannel.show(true);
     }
   }
 
@@ -232,6 +268,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     // Dispose all status bar items
     this.cacheStatusBarItem?.dispose();
     this.nativeStatusBarItem?.dispose();
+    this.debugStatusBarItem?.dispose();
     this.perfChannel?.dispose();
     this.chunkProgressItem?.dispose();
     for (const [, item] of this.gzipIndexStatusItems) {
