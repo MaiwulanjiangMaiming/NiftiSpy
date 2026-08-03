@@ -4540,7 +4540,9 @@ let chunkedState: {
   fileSize: number;
   validationToken: string;
   receiveTime: number;
+  generation: number;  // incremented on each new transfer; stale readers check this
 } | null = null;
+let chunkedGeneration = 0;
 
 window.addEventListener('DOMContentLoaded', () => {
   publishPerfMonitor();
@@ -4833,6 +4835,7 @@ async function handleChunkedVolume(msg: any): Promise<void> {
       fileSize: msg.fileSize,
       validationToken: msg.validationToken,
       receiveTime: performance.now(),
+      generation: ++chunkedGeneration,
     };
 
     loadingText.textContent = 'Streaming volume...';
@@ -4895,11 +4898,14 @@ async function readDecompressedStream(decompressedStream: ReadableStream<Uint8Ar
   const reader = decompressedStream.getReader();
   const state = chunkedState;
   if (!state) return;
+  const myGeneration = state.generation;
 
   try {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
+      // Stale check: user switched files, abandon this decompression
+      if (!chunkedState || chunkedState.generation !== myGeneration) return;
       const chunk = value as Uint8Array;
       state.decompressedChunks.push(chunk);
       state.decompressedLen += chunk.byteLength;
@@ -4913,6 +4919,9 @@ async function readDecompressedStream(decompressedStream: ReadableStream<Uint8Ar
         }
       }
     }
+
+    // Final stale check before rendering
+    if (!chunkedState || chunkedState.generation !== myGeneration) return;
 
     if (!state.header) {
       loadingText.textContent = 'Error: could not parse NIfTI header from decompressed stream';
