@@ -289,7 +289,10 @@ export function streamingGunzipPreviewVolume(
   signal?: AbortSignal,
 ): Promise<VolumePreviewResult> {
   return new Promise((resolve, reject) => {
-    const f = Math.max(2, Math.min(8, Math.floor(factor) || 4));
+    // Clamp must match the proxy's slow-link tiering (up to 32 on VPN links):
+    // an inner [2,8] cap silently downgrades factor=16/32 requests back to 8,
+    // which re-downloads 4x more of the gzip stream than the caller intended.
+    const f = Math.max(2, Math.min(32, Math.floor(factor) || 4));
     const gunzip = zlib.createGunzip();
     const chunks: Buffer[] = [];
     let totalSize = 0;

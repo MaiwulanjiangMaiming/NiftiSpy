@@ -12,6 +12,15 @@ interface WebGPUVolumeState {
 
 export class WebGPURenderer {
   private device: GPUDevice | null = null;
+  // `canvas` is the DISPLAY canvas; `gpuCanvas` is the private canvas that
+  // owns the webgpu context. The webgpu context must NEVER be acquired on
+  // the display canvas itself: context types are mutually exclusive per
+  // canvas — once 'webgpu' is acquired, getContext('2d') returns null
+  // forever, which would kill the canvas2d fallback, compare mode, the
+  // prefetch blit and the WebGL renderer's blit path. Frames are rendered
+  // into `gpuCanvas` and blitted onto the display canvas' 2D context.
+  private canvas: HTMLCanvasElement | null = null;
+  private gpuCanvas: HTMLCanvasElement | null = null;
   private context: GPUCanvasContext | null = null;
   private format: GPUTextureFormat = 'rgba8unorm';
   private pipeline: GPURenderPipeline | null = null;
@@ -47,6 +56,10 @@ struct Uniforms {
   volumeSize: vec3u,
   flipX: u32,
   flipY: u32,
+  slope: f32,
+  inter: f32,
+  dataMin: f32,
+  dataRange: f32,
   _pad0: u32,
 };
 
@@ -81,8 +94,14 @@ fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
   }
 
   let rawValue = textureSample(volumeTexture, volumeSampler, uvw).r;
+  // windowLevel/windowWidth arrive in NORMALIZED [0,1] space (same
+  // convention as the WebGL/CPU painters): apply slope/inter, normalize by
+  // the volume range, then window. Windowing raw voxel values against the
+  // [0,1] range saturated every nonzero voxel to white.
+  let scaledValue = rawValue * uniforms.slope + uniforms.inter;
+  let norm = (scaledValue - uniforms.dataMin) / max(uniforms.dataRange, 1e-6);
   let lo = uniforms.windowLevel - uniforms.windowWidth * 0.5;
-  let t = clamp((rawValue - lo) / uniforms.windowWidth, 0.0, 1.0);
+  let t = clamp((norm - lo) / uniforms.windowWidth, 0.0, 1.0);
   let color = textureSample(lutTexture, volumeSampler, vec2f(t, 0.5));
   return color;
 }
@@ -126,7 +145,7 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  async init(canvas: HTMLCanvasElement): Promise<boolean> {
+  async init(displayCanvas: HTMLCanvasElement): Promise<boolean> {
     try {
       if (!('gpu' in navigator)) return false;
 
@@ -136,8 +155,13 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       this.device = await adapter.requestDevice();
       if (!this.device) return false;
 
-      this.context = canvas.getContext('webgpu') as GPUCanvasContext | null;
-      if (!this.context) return false;
+      const gpuCanvas = document.createElement('canvas');
+      const context = gpuCanvas.getContext('webgpu') as GPUCanvasContext | null;
+      if (!context) return false;
+
+      this.canvas = displayCanvas;
+      this.gpuCanvas = gpuCanvas;
+      this.context = context;
 
       this.format = (navigator as any).gpu.getPreferredCanvasFormat();
       this.context.configure({
@@ -146,9 +170,22 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
         alphaMode: 'premultiplied',
       });
 
+      // Mark the renderer dead on device loss; the next
+      // getOrCreateWebGPURenderer() builds a fresh one and re-uploads the
+      // 3D volume texture.
+      this.device.lost.then((info: GPUDeviceLostInfo) => {
+        if (!this.ready) return;
+        console.warn('[NiftiSpy] WebGPU device lost:', info.reason || info.message);
+        this.destroy();
+      });
+
+      // r32float volumes can only be LINEAR-sampled when the adapter
+      // exposes the optional 'float32-filterable' feature; without it a
+      // linear sampler is a validation error and the draw silently fails.
+      const filterable = adapter.features?.has?.('float32-filterable') ?? false;
       this.sampler = this.device.createSampler({
-        magFilter: 'linear',
-        minFilter: 'linear',
+        magFilter: filterable ? 'linear' : 'nearest',
+        minFilter: filterable ? 'linear' : 'nearest',
         addressModeU: 'clamp-to-edge',
         addressModeV: 'clamp-to-edge',
         addressModeW: 'clamp-to-edge',
@@ -173,7 +210,10 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     });
     this.device.queue.writeBuffer(this.posBuffer, 0, positions);
 
-    const texCoords = new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]);
+    // Vertex order bl,br,tl,tr with texCoords (0,0),(1,0),(0,1),(1,1):
+    // texture row 0 lands at the canvas BOTTOM, matching the CPU painter
+    // and the WebGL paths (the old layout rendered a vertical flip).
+    const texCoords = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]);
     this.texCoordBuffer = this.device.createBuffer({
       size: texCoords.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
@@ -240,7 +280,9 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
 
     // Persistent uniform buffers — updated via writeBuffer each frame
     this.sliceUniformBuffer = this.device.createBuffer({
-      size: 40, // 10 × u32 (matches Uniforms struct: 4 f32 + 3 u32 + 2 u32 + 1 u32 = 40 bytes)
+      // 16 u32 = 64 bytes: matches the Uniforms struct (4 f32 + vec3u + 2 u32
+      // + 4 f32 slope/inter/dataMin/dataRange + pad), 16-byte aligned.
+      size: 64,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
@@ -257,44 +299,37 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
   uploadVolume3D(data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array, nx: number, ny: number, nz: number): boolean {
     if (!this.device || !this.pipeline) return false;
 
+    // writeTexture requires bytesPerRow to be a multiple of 256. We upload
+    // everything as r32float (see below), so rows are nx*4 bytes: only
+    // volumes whose nx is a multiple of 64 qualify. Anything else fails
+    // fast here — the caller falls back to the WebGL slice renderer.
+    const bytesPerRow = nx * 4;
+    if (bytesPerRow % 256 !== 0) return false;
+
     this.volumeState?.texture.destroy();
 
-    // Map TypedArray to GPU texture format
-    let format: GPUTextureFormat;
-    let bytesPerRow: number;
-    if (data instanceof Int16Array) {
-      format = 'r16sint';
-      bytesPerRow = nx * 2;
-    } else if (data instanceof Uint16Array) {
-      format = 'r16uint';
-      bytesPerRow = nx * 2;
-    } else if (data instanceof Int8Array) {
-      format = 'r8sint';
-      bytesPerRow = nx;
-    } else if (data instanceof Uint8Array) {
-      format = 'r8uint';
-      bytesPerRow = nx;
-    } else if (data instanceof Int32Array) {
-      format = 'r32sint';
-      bytesPerRow = nx * 4;
-    } else if (data instanceof Uint32Array) {
-      format = 'r32uint';
-      bytesPerRow = nx * 4;
+    // ALWAYS upload as r32float: the WGSL shader declares texture_3d<f32>
+    // and samples via textureSample, which cannot read integer formats —
+    // the old r16sint/r8sint uploads failed validation and drew nothing.
+    // Integer volumes are converted here (slope/inter stay in the shader).
+    let f32: Float32Array;
+    if (data instanceof Float32Array) {
+      f32 = data;
     } else {
-      format = 'r32float';
-      bytesPerRow = nx * 4;
+      f32 = new Float32Array(data.length);
+      for (let i = 0; i < data.length; i++) f32[i] = data[i];
     }
 
     const texture = this.device.createTexture({
       size: { width: nx, height: ny, depthOrArrayLayers: nz },
-      format,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.STORAGE_BINDING,
+      format: 'r32float',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       dimension: '3d',
     });
 
     this.device.queue.writeTexture(
       { texture },
-      data as ArrayBufferView,
+      f32 as ArrayBufferView,
       { bytesPerRow, rowsPerImage: ny },
       { width: nx, height: ny, depthOrArrayLayers: nz }
     );
@@ -354,16 +389,26 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     windowWidth: number,
     colormap: string,
     flipX: boolean,
-    flipY: boolean
+    flipY: boolean,
+    slope: number = 1,
+    inter: number = 0,
+    dataMin: number = 0,
+    dataRange: number = 1
   ): boolean {
-    if (!this.device || !this.context || !this.pipeline || !this.volumeState || !this.sliceUniformBuffer) return false;
+    if (!this.device || !this.context || !this.pipeline || !this.volumeState || !this.sliceUniformBuffer || !this.gpuCanvas || !this.canvas) return false;
+
+    // Render into the private GPU canvas (sized to the display canvas, whose
+    // pixel size is managed by paintSlice/paintSlice3D); the frame is blitted
+    // onto the display canvas' 2D context at the end.
+    if (this.gpuCanvas.width !== this.canvas.width) this.gpuCanvas.width = this.canvas.width;
+    if (this.gpuCanvas.height !== this.canvas.height) this.gpuCanvas.height = this.canvas.height;
 
     // Apply colormap LUT if changed
     if (colormap && colormap !== 'gray') {
       this.applyColormapLut(colormap);
     }
 
-    const uniformData = new ArrayBuffer(40);
+    const uniformData = new ArrayBuffer(64);
     const view = new DataView(uniformData);
     view.setFloat32(0, windowLevel, true);
     view.setFloat32(4, windowWidth, true);
@@ -374,7 +419,12 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     view.setUint32(24, nz, true);
     view.setUint32(28, flipX ? 1 : 0, true);
     view.setUint32(32, flipY ? 1 : 0, true);
-    view.setUint32(36, 0, true);
+    // Offsets follow WGSL uniform layout: vec3u sits at 16..28, so flipX
+    // lands at 28 (align 4) and the trailing f32s run 36..52.
+    view.setFloat32(36, slope, true);
+    view.setFloat32(40, inter, true);
+    view.setFloat32(44, dataMin, true);
+    view.setFloat32(48, dataRange || 1, true);
 
     this.device.queue.writeBuffer(this.sliceUniformBuffer, 0, uniformData);
 
@@ -398,6 +448,20 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     renderPass.end();
 
     this.device.queue.submit([commandEncoder.finish()]);
+    return this.blitToDisplay();
+  }
+
+  private blitToDisplay(): boolean {
+    // Copy the GPU frame onto the display canvas' 2D context (1:1). Reset the
+    // transform first: the 2D context is shared with other 2D painters which
+    // save/restore transforms, and a leftover transform would skew the blit.
+    const display = this.canvas;
+    const gpuCanvas = this.gpuCanvas;
+    if (!display || !gpuCanvas) return false;
+    const ctx = display.getContext('2d');
+    if (!ctx) return false;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(gpuCanvas, 0, 0);
     return true;
   }
 
@@ -490,6 +554,10 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     return result;
   }
 
+  hasVolume3D(): boolean {
+    return !!this.volumeState;
+  }
+
   clearVolume3D(): void {
     this.volumeState?.texture.destroy();
     this.volumeState = null;
@@ -497,14 +565,20 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
 
   destroy(): void {
     this.volumeState?.texture.destroy();
+    this.volumeState = null;
     this.lutTexture?.destroy();
+    this.lutTexture = null;
     this.posBuffer?.destroy();
     this.texCoordBuffer?.destroy();
     this.histogramBuffer?.destroy();
     this.histogramReadBuffer?.destroy();
     this.sliceUniformBuffer?.destroy();
     this.histUniformBuffer?.destroy();
+    this.context?.unconfigure();
     this.device?.destroy();
+    this.context = null;
+    this.gpuCanvas = null;
+    this.canvas = null;
     this.ready = false;
   }
 }

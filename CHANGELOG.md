@@ -2,6 +2,49 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.3.0] - 2026-08-30
+
+### Added — Image Registration (Align / To MNI)
+- **Intensity-based affine registration engine** (`webview/regWorker.ts`, new): a dedicated Web Worker running 9-DOF rigid+scale affine registration (translation + rotation + per-axis anisotropic scaling, no shear) in the ITK-SNAP style:
+  - Physical-mm multi-resolution pyramid (≈8/5/3.5 mm levels) with per-level downsampling on BOTH images, so thin axes of anisotropic volumes (e.g. 1×1×5 mm) are never over-compressed.
+  - Initialization from background-suppressed weighted centroids (COM-to-COM) plus world-space bounding-box extents for the initial scale (correct for oblique acquisitions / storage-axis swaps).
+  - Automatic similarity metric selection: NCC when the initial pose is already close (|r| ≥ 0.45), otherwise mutual information (32-bin joint histogram).
+  - Pattern-search optimizer (cyclic coordinate search, step ×0.55 contraction, evaluation + wall-clock budgets) with deterministic multi-start jitter; per-axis log-scale clamping (0.55×–1.8×) and an overlap-coverage penalty guard against MI "shrink-to-peak" degenerate solutions.
+  - **Transform-only output**: the result is a 4×4 world→moving-voxel affine matrix. The moving image is NEVER resampled or rewritten — its original full resolution is preserved (like ITK-SNAP's registration tool).
+- **🧠 To MNI**: register the active image to an MNI template. The template path is remembered via the new `niftispy.mniTemplatePath` setting; a custom template can be picked per-run (📂 Custom Template…). After registration the template is added to the image list and automatically opened in overlay compare (template as base, source as overlay). Live progress bar + cancel support.
+- **⇄ Align… in Compare mode**: pick a reference image; the other compare image is registered to it (reference sent as a pre-decoded volume, no file needed) and overlay mode opens automatically on completion.
+- **Resolution-preserving display-time sampling**: aligned images are rendered by sampling the original full-resolution moving data through the stored transform; the display grid uses the finer in-plane spacing of the two images (up to 4096 px). Hover value readouts are alignment-aware.
+- **Compare image selection**: image-list entries now have checkboxes (up to two); the Compare button uses the checked pair instead of hard-coded first-two images.
+
+### Added — Remote-SSH HTTP Fast Path & Network Hardening
+- **Direct HTTP loading over forwarded ports** (`tryRemoteSshHttpLoad`): on Remote-SSH, files are served through the local proxy with `vscode.env.asExternalUri` port forwarding and fetched directly by the webview worker (native TCP stream, full tunnel bandwidth, download/decompress overlap), replacing the per-2MB-chunk RPC round-trip path. Automatic fallback to chunked transfer if the direct fetch fails.
+- **Idle-fetch watchdog in the worker**: all fetch phases (TTFB, body streaming, decompression streaming, parallel range pool) get an idle timeout (default 20 s, adaptive 5–30 s from measured RTT) with retry + exponential backoff — a frozen VPN/SSH tunnel now fails over to retry instead of hanging the load forever.
+
+### Fixed — Rendering & Interaction
+- **MIP view fully rewritten — smooth roll-free trackball**: replaced the Euler-angle incremental integration (which mixed roll into the axes and left the volume wildly tilted after a few gestures) with a screen-space arcball: each gesture is a single rotation around the screen-plane axis perpendicular to the drag, composed against the pose captured at drag start, so direction is always consistent with the screen and no roll can accumulate. `computeMIP` now raycasts through a 3×3-rotated world-mm box with square output pixels (true proportions for anisotropic volumes, replacing the `dz/√(dx·dy)` aspect approximation). Dragging renders a reduced-quality preview coalesced to one render per display frame (~10× cheaper); full quality is recomputed on release.
+- **Overlay mode geometry**: overlay slices now use the same full-container canvas + physical-aspect frame + centering + pan as single-image mode, fixing images drawn outside the viewport and broken panning/click positioning. Canvas CSS size is re-synced every frame (fixes images drifting out of the container after layout changes). Per-image flip handling instead of a global flip state.
+- **Side-by-side click mapping** (four independent bugs): unified physical-aspect mapping box for both halves; click inverse-mapping honors each painter's flips; the third axis is mapped through world coordinates when the two volumes differ in extent/origin; aligned right-half clicks use the base image's voxel mapping (previously rejected by bounds checks).
+- **Header info panel now follows image switching** (previously stuck on the first-opened image).
+- **WebGL slice renderer fixed for integer volumes and windowing**: integer data now uses proper R8I/R16I/R32I(+UI) textures with isampler/usampler program variants (previously produced an INVALID_OPERATION, an incomplete texture, and an all-gray image); shaders normalize by data range before window/level; `gl.getError()` checks are unconditional; `UNPACK_ALIGNMENT=1` fixes sheared rows for odd widths; vertical polarity of the GPU path matches the CPU path.
+- **GPU backends no longer lock the display canvas**: WebGL2, WebGPU, and the volume raycaster render on private canvases and blit back to the 2D display canvas — previously acquiring a webgl2/webgpu context on the display canvas made `getContext('2d')` permanently return null, breaking canvas fallback, compare mode, and prefetch blits. Context/device loss now triggers self-rebuild on next use. Volume upload timing fixed (3D textures are actually created and uploaded; WebGPU uploads after async init).
+- **Stale-cache fixes on image switch**: the slice render cache and GPU 3D textures are cleared when switching images (previously the first visited slice could flash the previous image).
+- **Double-gzip removal**: `.gz` files served by the local proxy are no longer compressed a second time (saves 2–5 s CPU per 100 MB).
+- **Preview factor clamp**: internal [2,8] clamp silently downgraded factor=16/32 previews back to 8 (4× extra data on slow links); now [2,32].
+
+### Changed — Performance & Architecture
+- **rAF-coalesced slice scrolling**: wheel/slider redraws are coalesced to one render per axis per display frame; slice-render cache hits blit directly instead of re-running normalize+colormap; crosshair updates use cached container sizes (no forced layout in the scroll hot path).
+- **Compare render caches**: per-image slice canvases (colormap/W/L-keyed) and aligned-resample results are cached with timestamp eviction.
+- **Pipelined Remote-SSH chunked transfer**: 4 MB chunks with a 6-deep in-flight window (~6× throughput vs. awaiting each chunk round-trip); non-gzip chunks pass through raw.
+- **Adaptive download tuning**: 256 KB default probe that doubles as a bandwidth measurement feeding slice-quality adaptation from the first load; preview factor tiers chosen from measured bandwidth (gzip: 32/16/8 by link speed); parallel gzip pool supports resumable rounds with dead-link detection.
+- **Unified GPU architecture**: all GPU paths (WebGL2 slices, WebGPU slices, volume raycasting) render offscreen and blit to the 2D display canvas; the display canvas always keeps a plain 2D context.
+
+### Removed — Dead & Broken Paths
+- **OffscreenCanvas worker rendering** (worker + viewer): `transferControlToOffscreen()` irreversibly transfers canvas ownership, after which `getContext('2d')` returns null and every main-thread painter dies. The path had never worked; removed in favor of the unified private-canvas + blit architecture.
+- **Half-finished WebGPU raycasting path** in `volumeRaycaster.ts` (compute-pass result was never displayed) and the async WebGPU upgrade for `auto` backend (integer-volume incompatibilities); slice rendering stays on the equally fast WebGL2 path.
+- **HTTP/2 support in LocalFileProxy**: browsers cannot do h2c (cleartext HTTP/2), so every webview request was rejected with a protocol error; HTTP/1.1 only.
+
+---
+
 ## [2.2.1] - 2026-08-03
 
 ### Fixed — Remote-SSH IDE Freeze

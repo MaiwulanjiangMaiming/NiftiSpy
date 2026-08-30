@@ -58,9 +58,6 @@ function setFileHashForCache(fileName: string, fileSize: number): void {
 
 let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; datatype: number } | null = null;
 
-// OffscreenCanvas rendering state
-const offscreenCanvases = new Map<string, { canvas: OffscreenCanvas; gl: WebGL2RenderingContext | null }>();
-
 self.onmessage = async (e: MessageEvent) => {
   const { id, type, url, isGzip, directUrl } = e.data;
   try {
@@ -83,10 +80,6 @@ self.onmessage = async (e: MessageEvent) => {
         inter: e.data.inter ?? 0,
         datatype: e.data.datatype ?? 16,
       };
-    } else if (type === 'initOffscreenCanvas') {
-      handleInitOffscreenCanvas(e.data);
-    } else if (type === 'renderRequest') {
-      handleRenderRequest(e.data);
     } else if (type === 'setFileHash') {
       setFileHashForCache(e.data.fileName || '', e.data.fileSize || 0);
     } else if (type === 'invalidateCache') {
@@ -102,18 +95,6 @@ self.onmessage = async (e: MessageEvent) => {
     }
   }
 };
-
-function handleInitOffscreenCanvas(data: { axis: string; canvas: OffscreenCanvas }): void {
-  const { axis, canvas } = data;
-  try {
-    const gl = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true }) as WebGL2RenderingContext | null;
-    if (gl) {
-      offscreenCanvases.set(axis, { canvas, gl });
-    }
-  } catch {
-    // OffscreenCanvas WebGL2 context creation failed; skip
-  }
-}
 
 // Track validation tokens per file hash for cache invalidation
 const validationTokens = new Map<string, string>();
@@ -167,13 +148,6 @@ async function handleInvalidateCache(data: { fileName?: string; fileSize?: numbe
   }
 }
 
-function handleRenderRequest(data: { axis: string; sliceIndex: number; windowLevel: number; windowWidth: number; colormap: string; flipX: boolean; flipY: boolean }): void {
-  const { axis } = data;
-  // OffscreenCanvas rendering not yet implemented — signal failure
-  // so main thread falls back to direct rendering
-  self.postMessage({ type: 'renderComplete', axis, fallback: true });
-}
-
 function abortError(): Error {
   const err = new Error('Aborted');
   err.name = 'AbortError';
@@ -212,7 +186,10 @@ async function fetchWithRetry(url: string, options?: RequestInit, retries: numbe
   for (let attempt = 0; attempt < retries; attempt++) {
     throwIfAborted(signal);
     try {
-      const resp = await fetch(url, { ...options, signal });
+      // Headers phase is watchdog-protected: a frozen VPN never rejects the
+      // fetch promise, so without this every caller could hang at TTFB.
+      // TimeoutError lands in the retry path below (it is not an AbortError).
+      const resp = await fetchHeadersWatchdog(url, options || {}, DEFAULT_IDLE_TIMEOUT_MS, signal);
       if (resp.ok || resp.status === 206) return resp;
       const shouldRetryStatus = resp.status === 408 || resp.status === 425 || resp.status === 429 || resp.status >= 500;
       if (shouldRetryStatus && attempt < retries - 1) {
@@ -233,6 +210,170 @@ async function fetchWithRetry(url: string, options?: RequestInit, retries: numbe
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Idle watchdog (slow/stalled-link protection)
+//
+// A VPN that "freezes" (silent packet loss, tunnel renegotiation) never
+// errors the fetch — it just stops delivering bytes, hanging a chunk fetch
+// for 15+ minutes. A pure total-duration timeout cannot distinguish
+// "slow but flowing" from "dead", so on slow links it would kill healthy
+// transfers and trigger retry storms. The idle watchdog instead aborts only
+// when NO bytes arrived for `idleMs` — a flowing transfer is never killed,
+// a silent one dies within seconds.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_IDLE_TIMEOUT_MS = 20000;
+
+function clampIdleTimeout(rttMs: number): number {
+  return Math.min(30000, Math.max(5000, rttMs * 8));
+}
+
+function makeIdleError(): DOMException {
+  return new DOMException('idle timeout', 'TimeoutError');
+}
+
+/**
+ * One reader.read() bounded by `idleMs` of silence. Rejects with
+ * TimeoutError when the stream produces no chunk in time. Used by both
+ * readBodyWithWatchdog (whole-body aggregation) and the streaming loaders
+ * (incremental parse loops that cannot aggregate).
+ */
+async function readStreamChunkWithWatchdog(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleMs: number,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(makeIdleError()), idleMs);
+  });
+  try {
+    return await Promise.race([reader.read(), timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Read a Response body with a resettable idle watchdog: every successful
+ * read() resets the timer. Rejects with TimeoutError when the stream goes
+ * silent for `idleMs`. External AbortSignal still wins (AbortError).
+ * `onProgress` receives the cumulative byte count after each chunk.
+ */
+async function readBodyWithWatchdog(
+  resp: Response,
+  idleMs: number,
+  signal?: AbortSignal,
+  onProgress?: (received: number) => void,
+): Promise<Uint8Array> {
+  if (!resp.body) return new Uint8Array(await resp.arrayBuffer());
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    throwIfAborted(signal);
+    let result: ReadableStreamReadResult<Uint8Array>;
+    try {
+      result = await readStreamChunkWithWatchdog(reader, idleMs);
+    } catch (err) {
+      try { await reader.cancel(); } catch { /* stream already gone */ }
+      throw err;
+    }
+    if (result.done) break;
+    chunks.push(result.value);
+    total += result.value.byteLength;
+    onProgress?.(total);
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
+}
+
+/**
+ * Fetch with the HEADERS phase (TTFB) bounded by `idleMs` of silence.
+ * Accepts a full RequestInit (method/headers/body all forwarded); any
+ * signal inside init is superseded by the watchdog controller, which
+ * itself bridges the external `signal`. Returns the raw Response — body
+ * reading stays the caller's job (usually via readBodyWithWatchdog).
+ * TimeoutError is thrown so callers can retry; AbortError propagates.
+ * Needed because a frozen VPN never errors the fetch promise, it just
+ * never resolves it.
+ */
+async function fetchHeadersWatchdog(
+  url: string,
+  init: RequestInit,
+  idleMs: number,
+  signal?: AbortSignal,
+): Promise<Response> {
+  let timedOut = false;
+  const ctrl = new AbortController();
+  const onExternalAbort = () => ctrl.abort(signal!.reason);
+  signal?.addEventListener('abort', onExternalAbort, { once: true });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort(makeIdleError());
+  }, idleMs);
+
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } catch (err: any) {
+    if (timedOut) throw makeIdleError();
+    throw err;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
+  }
+}
+
+/**
+ * Fetch one range with full idle-watchdog protection: the headers phase
+ * (TTFB) and every body read are each bounded by `idleMs` of silence.
+ * TimeoutError is thrown so callers can retry; AbortError propagates.
+ */
+async function fetchRangeWatchdog(
+  url: string,
+  headers: Record<string, string>,
+  idleMs: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
+  const resp = await fetchHeadersWatchdog(url, { headers }, idleMs, signal);
+
+  if (!resp.ok) {
+    try { await resp.body?.cancel(); } catch { /* ignore */ }
+    throw new Error(`HTTP ${resp.status}`);
+  }
+  return readBodyWithWatchdog(resp, idleMs, signal);
+}
+
+/**
+ * fetchRangeWatchdog + retry with backoff. TimeoutError and network errors
+ * are retryable; AbortError (user cancel) propagates immediately.
+ */
+async function fetchRangeBytesWithRetry(
+  url: string,
+  start: number,
+  end: number,
+  idleMs: number,
+  signal?: AbortSignal,
+  retries: number = MAX_RETRIES,
+): Promise<Uint8Array> {
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    throwIfAborted(signal);
+    try {
+      return await fetchRangeWatchdog(url, { Range: `bytes=${start}-${end}` }, idleMs, signal);
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw err;
+      lastErr = err;
+      if (attempt < retries - 1) {
+        await sleep(RETRY_DELAY_BASE * Math.pow(2, attempt));
+      }
+    }
+  }
+  throw lastErr || new Error('Range fetch failed after retries');
 }
 
 function getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number): string {
@@ -481,7 +622,9 @@ async function nativeDecompressWithEarlyPreview(
 
   while (true) {
     throwIfAborted(signal);
-    const { done, value } = await reader.read();
+    // Watchdog: the decompressed stream is network-fed — a stalled tunnel
+    // must surface as TimeoutError instead of an eternal pending read().
+    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
     if (done) break;
 
     const chunk = value!;
@@ -643,7 +786,9 @@ async function nativeDecompress(resp: Response, signal?: AbortSignal): Promise<U
 
   while (true) {
     throwIfAborted(signal);
-    const { done, value } = await reader.read();
+    // Watchdog: network-fed decompressed stream — a stalled tunnel must
+    // surface as TimeoutError instead of an eternal pending read().
+    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
     if (done) break;
     if (result) {
       // Write directly into pre-allocated buffer
@@ -727,21 +872,19 @@ async function downloadChunked(url: string, id: number, isGzip: boolean, signal?
           (async () => {
             try {
               throwIfAborted(signal);
-              const resp = await fetchWithRetry(url, {
-                headers: { Range: `bytes=${off}-${end}` },
-              }, MAX_RETRIES, signal);
-              if (resp.status === 206 || resp.status === 200) {
-                const chunkData = new Uint8Array(await resp.arrayBuffer());
-                result.set(chunkData, off);
-                received += chunkData.byteLength;
-                const progressBase = 0.02;
-                const progressRange = isGzip ? 0.3 : 0.7;
-                self.postMessage({
-                  id, type: 'progress',
-                  value: progressBase + (received / totalSize) * progressRange,
-                  stage: 'downloading',
-                });
-              }
+              // Watchdog-protected range fetch: chunk-level TimeoutError is
+              // retried internally, so a frozen VPN fails fast per chunk
+              // instead of hanging one of the pool slots forever.
+              const chunkData = await fetchRangeBytesWithRetry(url, off, end, DEFAULT_IDLE_TIMEOUT_MS, signal);
+              result.set(chunkData, off);
+              received += chunkData.byteLength;
+              const progressBase = 0.02;
+              const progressRange = isGzip ? 0.3 : 0.7;
+              self.postMessage({
+                id, type: 'progress',
+                value: progressBase + (received / totalSize) * progressRange,
+                stage: 'downloading',
+              });
             } catch (err: any) {
               if (err?.name === 'AbortError') { poolError = err; }
               else { poolError = err; }
@@ -774,34 +917,17 @@ async function downloadChunked(url: string, id: number, isGzip: boolean, signal?
 
   const contentLength = Number(resp.headers.get('Content-Length') || 0);
 
-  if (contentLength > 0 && resp.body) {
-    const reader = resp.body.getReader();
-
-    // Pre-allocate result buffer if contentLength is known
-    const result = new Uint8Array(contentLength);
-    let received = 0;
-
-    while (true) {
-      throwIfAborted(signal);
-      const { done, value } = await reader.read();
-      if (done) break;
-      result.set(value, received);
-      received += value.byteLength;
+  // Whole-body read with idle watchdog + progress reporting: a server that
+  // stalls mid-stream fails with TimeoutError instead of hanging forever.
+  return readBodyWithWatchdog(resp, DEFAULT_IDLE_TIMEOUT_MS, signal, (received) => {
+    if (contentLength > 0) {
       self.postMessage({
         id, type: 'progress',
         value: 0.02 + (received / contentLength) * (isGzip ? 0.3 : 0.7),
         stage: 'downloading',
       });
     }
-
-    // If actual received differs from contentLength, trim the buffer
-    if (received !== contentLength) {
-      return result.slice(0, received);
-    }
-    return result;
-  }
-
-  return new Uint8Array(await resp.arrayBuffer());
+  });
 }
 
 async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSignal, isGzip: boolean, preParsedHeader?: NiiHeader): Promise<void> {
@@ -1055,17 +1181,15 @@ function reportBandwidthSample(id: number, bytes: number, durationMs: number, rt
 // The goal is to keep enough bytes in flight to saturate the link without
 // creating head-of-line blocking or excessive small requests.
 //
-// For weak networks (low bandwidth or high RTT) we also return `waitForProbe`.
-// When true, the loader waits for the initial range probe to finish before
-// launching the parallel chunk pool. This prevents the pool from stealing
-// bandwidth from the probe and delaying the first preview on slow links.
+// Callers should pass PROBE-MEASURED bandwidth/RTT (ground truth for the
+// current link), falling back to session estimates. The pool is always
+// launched after the probe measurement, so these values are fresh.
 function computeAdaptiveParams(
   estimatedBps: number,
   estimatedRttMs: number,
   isRemote: boolean,
   totalSize: number,
-): { chunkSize: number; maxConcurrent: number; waitForProbe: boolean } {
-  const MIN_CHUNK = 2 * 1024 * 1024;
+): { chunkSize: number; maxConcurrent: number } {
   const MAX_CHUNK = 64 * 1024 * 1024;
   const LOCAL_CHUNK = 32 * 1024 * 1024;
   const LOCAL_CONCURRENT = 8;
@@ -1074,7 +1198,6 @@ function computeAdaptiveParams(
     return {
       chunkSize: Math.min(LOCAL_CHUNK, totalSize),
       maxConcurrent: LOCAL_CONCURRENT,
-      waitForProbe: false,
     };
   }
 
@@ -1083,11 +1206,18 @@ function computeAdaptiveParams(
   const rtt = estimatedRttMs > 0 ? estimatedRttMs : 80;
   const mbps = bps / (1024 * 1024);
 
+  // On slow links (<2 Mbps) shrink the minimum chunk to 512KB: a 2MB floor
+  // means 16-64s of wasted transfer on every failed-chunk retry. 512KB keeps
+  // the retry granularity proportional to the link speed.
+  const MIN_CHUNK = mbps < 2 ? 512 * 1024 : 2 * 1024 * 1024;
+
   // BDP in bytes (1 RTT worth of data). Multiply by 2 to keep the pipe full.
   const bdpBytes = Math.max(MIN_CHUNK, (bps * (rtt / 1000)) / 8 * 2);
 
   // Choose a target concurrency based on link quality. On weak links we keep
-  // concurrency low to avoid per-request RTT overhead and TCP congestion.
+  // concurrency low to avoid per-request RTT overhead and TCP congestion,
+  // and so background full-volume traffic cannot starve interactive slice
+  // and preview requests sharing the same tunnel.
   let targetConcurrent: number;
   if (mbps < 2 || rtt > 500) {
     targetConcurrent = 2;
@@ -1116,21 +1246,18 @@ function computeAdaptiveParams(
   const numChunks = Math.ceil(totalSize / chunkSize);
   const maxConcurrent = Math.max(1, Math.min(numChunks, targetConcurrent));
 
-  // On weak links, do not let the parallel pool compete with the probe.
-  // This prioritizes "time-to-first-preview" which matters most to users.
-  const waitForProbe = mbps < 10 || rtt > 300;
-
-  return { chunkSize: Math.floor(chunkSize), maxConcurrent, waitForProbe };
+  return { chunkSize: Math.floor(chunkSize), maxConcurrent };
 }
 
-// Choose the initial range-probe size. We keep this small (1 MB) so the first
-// preview arrives as fast as possible. 1 MB comfortably covers the NIfTI header
-// plus the first axial slice for typical 256^3 Float32 volumes (256 KB of
-// voxels). For unusually large first slices the parallel loader will fetch the
-// remaining data immediately after the probe; on high-bandwidth links that
-// second request is cheap, and on slow links preview latency matters most.
-function computeProbeSize(_estimatedBps: number, _estimatedRttMs: number): number {
-  return 1024 * 1024;
+// Choose the initial range-probe size. The probe doubles as (a) the first
+// preview data (header + first slices) and (b) the link measurement, so it
+// must be small on slow links — a fixed 1MB probe costs 8-16s before the
+// first image on a VPN. 256KB covers the NIfTI header plus 1-2 compressed
+// slices of a typical 256^2 int16 volume; anything larger is fetched by the
+// pool immediately after measurement. Only links KNOWN to be fast (session
+// history) get the 1MB probe to save one extra range request.
+function computeProbeSize(estimatedBps: number, _estimatedRttMs: number): number {
+  return estimatedBps >= 40 * 1024 * 1024 ? 1024 * 1024 : 256 * 1024;
 }
 
 async function parallelDownloadWithEarlyPreview(
@@ -1140,6 +1267,7 @@ async function parallelDownloadWithEarlyPreview(
   signal: AbortSignal,
   estimatedBps = 0,
   estimatedRttMs = 0,
+  firePreview?: (measuredBps: number) => void,
 ): Promise<Uint8Array> {
   const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
 
@@ -1148,11 +1276,36 @@ async function parallelDownloadWithEarlyPreview(
   // preview, slightly larger on high-RTT links to cover bigger first slices.
   const PROBE_SIZE = computeProbeSize(estimatedBps, estimatedRttMs);
 
+  // Probe fetch with idle-watchdog + one retry: on a stalled link the probe
+  // itself would otherwise hang before any measurement exists. The watchdog
+  // covers the headers phase (TTFB) — a frozen VPN never rejects the fetch
+  // promise, it just leaves it pending forever. fetchWithRetry alone has no
+  // such timeout, so it must not be used here.
+  let probeResp: Response | null = null;
   const probeStart = performance.now();
-  const probeResp = await fetchWithRetry(url, {
-    headers: { Range: `bytes=0-${PROBE_SIZE - 1}` },
-  }, MAX_RETRIES, signal);
+  for (let attempt = 0; attempt < 2 && !probeResp; attempt++) {
+    throwIfAborted(signal);
+    try {
+      probeResp = await fetchHeadersWatchdog(url, {
+        headers: { Range: `bytes=0-${PROBE_SIZE - 1}` },
+      }, DEFAULT_IDLE_TIMEOUT_MS, signal);
+      // Retry only on retryable statuses; hand back others for the caller's
+      // status checks below (200/206 handling).
+      const st = probeResp.status;
+      if (st !== 200 && st !== 206 && attempt === 0) {
+        try { await probeResp.body?.cancel(); } catch { /* ignore */ }
+        probeResp = null;
+        await sleep(RETRY_DELAY_BASE);
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError') throw err;
+      if (attempt === 1) throw err;
+      await sleep(RETRY_DELAY_BASE);
+    }
+  }
+  // TTFB of the probe ≈ one link round trip (used as the RTT estimate).
   const probeHeaderMs = performance.now() - probeStart;
+  if (!probeResp) throw new Error('Probe failed');
 
   // If server doesn't support ranges (returns 200), fall back to streaming
   if (probeResp.status === 200) {
@@ -1182,43 +1335,59 @@ async function parallelDownloadWithEarlyPreview(
 
   // Check if this is a remote source to tune chunk size.
   // Direct remote URLs (not localhost proxy) are always "remote".
-  // Proxy URLs may have X-Remote-Source header.
+  // Proxy URLs may have X-Remote-Source header — set by the proxy when it
+  // runs inside a remote extension host, marking that the request traversed
+  // the SSH tunnel (the URL still LOOKS like 127.0.0.1 from the local side).
   const isLocalhost = url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost');
   const isRemote = !isLocalhost || probeResp.headers.get('X-Remote-Source') === 'true';
 
-  const { chunkSize: CHUNK_SIZE, maxConcurrent: MAX_CONCURRENT, waitForProbe } = computeAdaptiveParams(
-    estimatedBps, estimatedRttMs, isRemote, totalSize,
+  // ── Measure the link BEFORE launching anything bandwidth-hungry ──
+  // The probe is the only ground truth for THIS link right now; stale
+  // session defaults (10Mbps) would pick 6MB+ chunks on a VPN.
+  const bodyStart = performance.now();
+  const probeBodyPromise = readBodyWithWatchdog(probeResp, DEFAULT_IDLE_TIMEOUT_MS, signal);
+  const probeData = await probeBodyPromise;
+  const bodyMs = Math.max(1, performance.now() - bodyStart);
+  const measuredBps = Math.min((probeData.byteLength / bodyMs) * 1000 * 8, 1024 * 1024 * 1024);
+  const measuredRttMs = Math.max(1, probeHeaderMs);
+  // Feed the viewer's estimator so slice-quality adaptation reacts from the
+  // very first load (interactive downsampling, preview factor choice).
+  reportBandwidthSample(id, probeData.byteLength, bodyMs, measuredRttMs);
+
+  // Now that the link is measured, fire the low-res preview fetch with a
+  // factor scaled to the REAL bandwidth (it must not stall the first image).
+  firePreview?.(measuredBps);
+
+  const { chunkSize: CHUNK_SIZE, maxConcurrent: MAX_CONCURRENT } = computeAdaptiveParams(
+    measuredBps || estimatedBps, measuredRttMs || estimatedRttMs, isRemote, totalSize,
   );
+  const idleMs = clampIdleTimeout(measuredRttMs || estimatedRttMs);
 
-  // Start reading the probe body. On healthy links we overlap the probe
-  // transfer with parallel chunk downloads. On weak links we wait for the
-  // probe first so the parallel pool does not steal bandwidth from the
-  // preview-critical probe.
-  let probeBodyPromise: Promise<Uint8Array> = probeResp.arrayBuffer().then(ab => new Uint8Array(ab));
-  if (waitForProbe) {
-    probeBodyPromise = Promise.resolve(await probeBodyPromise);
-  }
-
-  // If the entire file fits in the probe, just wait for the body and return it.
-  // This avoids starting (and then aborting) a parallel download pool for tiny
-  // files where the overhead would dominate.
+  // If the entire file fits in the probe, just return it.
   if (totalSize <= PROBE_SIZE) {
-    const probeData = await probeBodyPromise;
-    reportBandwidthSample(id, probeData.byteLength, Math.max(1, performance.now() - probeStart), probeHeaderMs);
     if (isGzip && hasNativeDecompress) {
       return nativeDecompressFromBuffer(probeData, signal);
     }
     return probeData;
   }
 
+  const settledProbe = Promise.resolve(probeData);
+
   // ── Step 2: For gzip — streaming decompress with ordered chunk feeding ──
   if (isGzip && hasNativeDecompress) {
-    return parallelGzipDownload(url, id, signal, totalSize, probeBodyPromise, PROBE_SIZE, CHUNK_SIZE, MAX_CONCURRENT);
+    return parallelGzipDownload(url, id, signal, totalSize, settledProbe, PROBE_SIZE, CHUNK_SIZE, MAX_CONCURRENT, idleMs);
   }
 
   // ── Step 3: For uncompressed — direct parallel download ──
-  return parallelNiiDownload(url, id, signal, totalSize, probeBodyPromise, PROBE_SIZE, CHUNK_SIZE, MAX_CONCURRENT);
+  return parallelNiiDownload(url, id, signal, totalSize, settledProbe, PROBE_SIZE, CHUNK_SIZE, MAX_CONCURRENT, idleMs);
 }
+
+// A pool round that makes no progress at all (every chunk failed) means the
+// link is down — retrying further is pointless. Otherwise, up to this many
+// rounds refetch ONLY the missing chunks (resume): the decompressor stream
+// and all completed-but-unfed chunks stay alive across rounds, so resume
+// costs zero extra memory and zero re-download of completed bytes.
+const MAX_POOL_ROUNDS = 3;
 
 /**
  * Parallel gzip download with streaming decompression.
@@ -1234,6 +1403,7 @@ async function parallelGzipDownload(
   probeSize: number,
   chunkSize: number,
   maxConcurrent: number,
+  idleMs: number,
 ): Promise<Uint8Array> {
   const ds = new (self as any).DecompressionStream('gzip');
   const writer = ds.writable.getWriter();
@@ -1288,6 +1458,9 @@ async function parallelGzipDownload(
   const MAX_PENDING = maxConcurrent * 2;
   let nextFeedIdx = 0;
   let downloadError: Error | null = null;
+  // Decompressor/write failures are fatal — refetching network bytes cannot
+  // fix a broken stream, so resume rounds must not be attempted for them.
+  let fatalStreamError: Error | null = null;
 
   // Batch feed: merge consecutive pending chunks into a single writer.write()
   // to reduce await overhead and improve throughput.
@@ -1295,94 +1468,101 @@ async function parallelGzipDownload(
   const feedIfReady = (): Promise<void> => {
     feedingChain = feedingChain.then(async () => {
       const batch: Uint8Array[] = [];
-      while (pending.has(nextFeedIdx) && !downloadError) {
+      while (pending.has(nextFeedIdx) && !fatalStreamError) {
         batch.push(pending.get(nextFeedIdx)!);
         pending.delete(nextFeedIdx);
         nextFeedIdx++;
       }
       if (batch.length === 0) return;
       // Merge batch into one write to reduce await overhead
+      const writeBatch = async (data: Uint8Array) => {
+        try { await writer.write(data); } catch (err) { fatalStreamError = err as Error; }
+      };
       if (batch.length === 1) {
-        try { await writer.write(batch[0]); } catch (err) { downloadError = err as Error; }
+        await writeBatch(batch[0]);
       } else {
         let totalLen = 0;
         for (const c of batch) totalLen += c.byteLength;
         const merged = new Uint8Array(totalLen);
         let off = 0;
         for (const c of batch) { merged.set(c, off); off += c.byteLength; }
-        try { await writer.write(merged); } catch (err) { downloadError = err as Error; }
+        await writeBatch(merged);
       }
     });
     return feedingChain;
   };
 
-  // Parallel download pool with back-pressure on pending + adaptive backoff.
-  // We start downloading chunks immediately (overlapping with the probe body)
-  // and buffer them in `pending` until the probe data has been fed.
-  let running = 0;
-  let nextIdx = 0;
+  // Chunks completed across ALL rounds (survives round boundaries → resume).
+  const fetchedIdx = new Set<number>();
   let received = remainingStart;
   let successCount = 0;
   let failureCount = 0;
   let effectiveMaxConcurrent = maxConcurrent;
 
-  const downloadPoolPromise = new Promise<void>((resolve, reject) => {
+  /**
+   * One pool round: fetch every chunk not yet in `fetchedIdx`. A failing
+   * chunk does NOT kill the round — in-flight chunks finish, then the round
+   * ends and the caller decides whether to resume with another round.
+   */
+  const runPoolRound = (firstGapIdx: number): Promise<void> => new Promise((resolve, reject) => {
+    let running = 0;
+    let launched = 0;
     const tryLaunch = (): void => {
-      while (running < effectiveMaxConcurrent && nextIdx < numChunks && !downloadError && pending.size < MAX_PENDING) {
-        const idx = nextIdx++;
+      while (running < effectiveMaxConcurrent && launched < numChunks && !fatalStreamError) {
+        const idx = launched++;
+        if (fetchedIdx.has(idx)) continue;
         const start = remainingStart + idx * chunkSize;
         const end = Math.min(start + chunkSize - 1, totalSize - 1);
+        // Back-pressure bounds out-of-order buffering, but never blocks a
+        // GAP chunk (idx <= first gap): gap chunks unblock the ordered feed
+        // the moment they land, so they cannot inflate `pending`.
+        if (pending.size >= MAX_PENDING && idx > firstGapIdx) break;
         running++;
 
         (async () => {
           const chunkStartTime = performance.now();
           try {
             throwIfAborted(signal);
-            const resp = await fetchWithRetry(url, {
-              headers: { Range: `bytes=${start}-${end}` },
-            }, MAX_RETRIES, signal);
-            if (resp.status === 206 || resp.status === 200) {
-              successCount++;
-              const data = new Uint8Array(await resp.arrayBuffer());
-              received += data.byteLength;
-              reportBandwidthSample(id, data.byteLength, Math.max(1, performance.now() - chunkStartTime));
-              // Throttled progress
-              const now = performance.now();
-              if (now - lastProgressTime > 50) {
-                lastProgressTime = now;
-                self.postMessage({
-                  id, type: 'progress',
-                  value: 0.02 + (received / totalSize) * 0.5,
-                  stage: 'downloading (parallel)',
-                });
-              }
-              pending.set(idx, data);
-              await feedIfReady();
-            } else {
-              throw new Error(`Unexpected status ${resp.status}`);
+            const data = await fetchRangeBytesWithRetry(url, start, end, idleMs, signal);
+            fetchedIdx.add(idx);
+            successCount++;
+            received += data.byteLength;
+            reportBandwidthSample(id, data.byteLength, Math.max(1, performance.now() - chunkStartTime));
+            // Throttled progress
+            const now = performance.now();
+            if (now - lastProgressTime > 50) {
+              lastProgressTime = now;
+              self.postMessage({
+                id, type: 'progress',
+                value: 0.02 + (received / totalSize) * 0.5,
+                stage: 'downloading (parallel)',
+              });
             }
+            pending.set(idx, data);
+            await feedIfReady();
           } catch (err: any) {
-            if (err?.name === 'AbortError') { downloadError = err; }
-            else {
-              failureCount++;
-              // Adaptive backoff: if failure rate is high, reduce concurrency
-              // to ease pressure on a struggling network and avoid cascading timeouts.
-              const totalAttempts = successCount + failureCount;
-              if (totalAttempts > 3 && failureCount / totalAttempts > 0.15) {
-                effectiveMaxConcurrent = Math.max(2, Math.floor(effectiveMaxConcurrent / 2));
-              }
-              if (!downloadError) downloadError = err;
+            if (err?.name === 'AbortError') {
+              downloadError = err;
+              reject(err);
+              return;
             }
+            failureCount++;
+            // Adaptive backoff: if failure rate is high, reduce concurrency
+            // to ease pressure on a struggling network and avoid cascading timeouts.
+            const totalAttempts = successCount + failureCount;
+            if (totalAttempts > 3 && failureCount / totalAttempts > 0.15) {
+              effectiveMaxConcurrent = Math.max(2, Math.floor(effectiveMaxConcurrent / 2));
+            }
+            if (!downloadError) downloadError = err;
           }
           running--;
-          if (downloadError) { reject(downloadError); return; }
-          if (nextIdx >= numChunks && running === 0) {
+          if (launched >= numChunks && running === 0) {
             resolve();
           }
           else tryLaunch();
         })();
       }
-      if (numChunks === 0) {
+      if (launched >= numChunks && running === 0) {
         resolve();
       }
     };
@@ -1394,7 +1574,29 @@ async function parallelGzipDownload(
     // before the probe are buffered in `pending` and will be fed right after.
     const probeData = await probeDataPromise;
     await writer.write(probeData);
-    await downloadPoolPromise;
+    for (let round = 0; ; round++) {
+      // Lowest missing index = the head of the ordered feed gap. Chunks at
+      // or below it bypass the back-pressure gate (they drain `pending`).
+      let firstGapIdx = numChunks;
+      for (let i = 0; i < numChunks; i++) {
+        if (!fetchedIdx.has(i)) { firstGapIdx = i; break; }
+      }
+      const progressBefore = fetchedIdx.size;
+      await runPoolRound(firstGapIdx);
+      if (fatalStreamError) throw fatalStreamError;
+      if (fetchedIdx.size >= numChunks) break;
+      // Incomplete round — decide whether resuming is worthwhile.
+      const lastErr = downloadError;
+      downloadError = null;
+      if (round + 1 >= MAX_POOL_ROUNDS) {
+        throw lastErr || new Error('Download failed after resume rounds');
+      }
+      if (fetchedIdx.size === progressBefore) {
+        // Zero progress in a full round: the link is effectively dead.
+        throw lastErr || new Error('Download stalled: no progress');
+      }
+      await sleep(RETRY_DELAY_BASE * 2);
+    }
     await writer.close();
     await decompressPromise;
   } catch (err) {
@@ -1424,6 +1626,7 @@ async function parallelNiiDownload(
   probeSize: number,
   chunkSize: number,
   maxConcurrent: number,
+  idleMs: number,
 ): Promise<Uint8Array> {
   // Pre-allocate exact buffer — no growth needed for uncompressed
   const result = new Uint8Array(totalSize);
@@ -1452,23 +1655,18 @@ async function parallelNiiDownload(
           const chunkStartTime = performance.now();
           try {
             throwIfAborted(signal);
-            const resp = await fetchWithRetry(url, {
-              headers: { Range: `bytes=${start}-${end}` },
-            }, MAX_RETRIES, signal);
-            if (resp.status === 206 || resp.status === 200) {
-              successCount++;
-              const data = new Uint8Array(await resp.arrayBuffer());
-              result.set(data, start);
-              reportBandwidthSample(id, data.byteLength, Math.max(1, performance.now() - chunkStartTime));
-              const received = start + data.byteLength;
-              self.postMessage({
-                id, type: 'progress',
-                value: 0.02 + (received / totalSize) * 0.85,
-                stage: 'downloading (parallel)',
-              });
-            } else {
-              throw new Error(`Unexpected status ${resp.status}`);
-            }
+            // Watchdog-protected range fetch (headers + body): a frozen VPN
+            // must fail fast so the pool can retry/resume instead of hanging.
+            const data = await fetchRangeBytesWithRetry(url, start, end, idleMs, signal);
+            successCount++;
+            result.set(data, start);
+            reportBandwidthSample(id, data.byteLength, Math.max(1, performance.now() - chunkStartTime));
+            const received = start + data.byteLength;
+            self.postMessage({
+              id, type: 'progress',
+              value: 0.02 + (received / totalSize) * 0.85,
+              stage: 'downloading (parallel)',
+            });
           } catch (err: any) {
             if (err?.name === 'AbortError') { poolError = err; }
             else {
@@ -1523,7 +1721,9 @@ async function streamingGzipLoadFromResponse(
 
   while (true) {
     throwIfAborted(signal);
-    const { done, value } = await reader.read();
+    // Watchdog: network-fed decompressed stream — a stalled tunnel must
+    // surface as TimeoutError instead of an eternal pending read().
+    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
     if (done) break;
 
     if (writeOffset + value.byteLength > result.length) {
@@ -1565,7 +1765,9 @@ async function streamingNiiLoadFromResponse(
 
   while (true) {
     throwIfAborted(signal);
-    const { done, value } = await reader.read();
+    // Watchdog: raw network stream — a stalled tunnel must surface as
+    // TimeoutError instead of an eternal pending read().
+    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
     if (done) break;
 
     if (result) {
@@ -1628,14 +1830,20 @@ async function streamingNiiLoadFromResponse(
  * Returns true if a preview was emitted, false if the endpoint was
  * unavailable or the fetch failed (caller falls back to existing flow).
  */
-async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: AbortSignal, estimatedBps = 0): Promise<boolean> {
+async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: AbortSignal, estimatedBps = 0, isGzip = false): Promise<boolean> {
   // Convert /file/{id} → /preview-volume/{id}?factor=N
   // Only proxy URLs (localhost) have this endpoint. Direct remote URLs don't.
   if (!proxyUrl.includes('/file/')) return false;
-  // Adaptive factor: on slow links (<5 MB/s) use factor=8 (1/512 data) so the
-  // preview arrives much faster; on fast links use factor=4 (1/64 data) for
-  // better quality since the transfer time difference is negligible.
-  const factor = (estimatedBps > 0 && estimatedBps < 5 * 1024 * 1024 * 8) ? 8 : 4;
+  // Adaptive factor, split by compression type:
+  // - .nii.gz: the proxy must stream-decompress sequentially, so the preview
+  //   cost scales with the compressed bytes transferred. On VPN-class links
+  //   (<2 MB/s) request factor=32 (~3% of the stream) so the first image
+  //   lands in seconds; mid links get 16; fast links get 8.
+  // - .nii: range-parallel subsampling, cheap — keep 8 on slow / 4 on fast.
+  // estimatedBps is bits/sec. 0 = unknown, treated as mid-tier.
+  const slow = estimatedBps > 0 && estimatedBps < 2 * 1024 * 1024 * 8;
+  const mid = estimatedBps === 0 || estimatedBps < 5 * 1024 * 1024 * 8;
+  const factor = isGzip ? (slow ? 32 : mid ? 16 : 8) : (mid ? 8 : 4);
   const previewUrl = proxyUrl.replace('/file/', '/preview-volume/') + `?factor=${factor}`;
 
   try {
@@ -1719,37 +1927,43 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
     // The proxy exposes /preview-volume/{id}?factor=N which streams the
     // remote file, subsamples every N-th voxel, and returns a complete
     // low-res Float32 volume. For .nii it uses parallel Range requests;
-    // for .nii.gz it stream-decompresses just enough slices (factor=8 →
-    // 12.5% of the file) and closes the connection early.  This gives a
-    // full three-view preview in ~1-3 s for a 100 MB remote file.
-    // Falls back silently if the endpoint is unavailable.
+    // for .nii.gz it stream-decompresses just enough slices (factor=16 →
+    // ~6% of the compressed stream on VPN-class links) and closes the
+    // connection early.  This gives a full three-view preview in ~1-3 s
+    // for a 100 MB remote file.  Falls back silently if the endpoint is
+    // unavailable.
     //
-    // KEY OPTIMIZATION: fire the preview fetch concurrently with the full
-    // download instead of awaiting it serially.  The preview goes through
-    // the localhost proxy (subsampling server-side) while the full download
-    // goes direct to the remote origin — they use different connections
-    // and overlap completely, saving 1-2 s of serial wait.
-    // The preview sends its own 'previewVolume' message when ready; if it
-    // arrives after processRawVolume, the redundant 'preview' message is
-    // simply ignored by the main thread (~5ms CPU waste, negligible).
-    tryFetchPreviewVolume(url, id, signal, estimatedBps).catch((err: any) => {
-      // AbortError is expected when the load is cancelled — swallow it to
-      // avoid an unhandled rejection (this promise is intentionally not awaited).
-      if (err?.name === 'AbortError') return;
-    });
+    // The preview is NOT fired here: the factor choice depends on the REAL
+    // link bandwidth, which is only known after the range probe inside the
+    // primary download path completes.  Firing early with a stale session
+    // estimate would pick factor=8 on a VPN and stall the first image.
+    // `firePreview` is invoked by parallelDownloadWithEarlyPreview right
+    // after measurement; all fallback paths (streaming / chunked) emit
+    // their own partial previews, so no path is left without one.
+    // The preview goes through the localhost proxy (subsampling
+    // server-side) while the full download goes direct to the remote
+    // origin — different connections, fully overlapped.
+    const firePreview = (measuredBps: number) => {
+      tryFetchPreviewVolume(url, id, signal, measuredBps, isGzip).catch((err: any) => {
+        // AbortError is expected when the load is cancelled — swallow it to
+        // avoid an unhandled rejection (this promise is intentionally not awaited).
+        if (err?.name === 'AbortError') return;
+      });
+    };
 
     const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
     let rawData: Uint8Array;
 
     // ── Primary path: parallel download with early preview ──
-    // This combines a 1MB range probe (for header + preview) with parallel
-    // range requests (for bandwidth saturation). For gzip, chunks are fed
-    // to a streaming decompressor in order, overlapping download + decompress.
-    // This is 3-8x faster than single-stream download on high-bandwidth links.
+    // This combines a small range probe (for link measurement + header +
+    // preview) with parallel range requests (for bandwidth saturation).
+    // For gzip, chunks are fed to a streaming decompressor in order,
+    // overlapping download + decompress. This is 3-8x faster than
+    // single-stream download on high-bandwidth links.
     // Try direct remote URL first; if it fails (CORS, no Range), fall back
     // to the localhost proxy URL.
     try {
-      rawData = await parallelDownloadWithEarlyPreview(fetchUrl, id, isGzip, signal, estimatedBps, estimatedRttMs);
+      rawData = await parallelDownloadWithEarlyPreview(fetchUrl, id, isGzip, signal, estimatedBps, estimatedRttMs, firePreview);
       throwIfAborted(signal);
       self.postMessage({ id, type: 'progress', value: 0.9, stage: 'processing' });
     } catch (err: any) {
@@ -1844,7 +2058,9 @@ async function streamingGzipLoadWithEarlyPreview(url: string, id: number, signal
 
   while (true) {
     throwIfAborted(signal);
-    const { done, value } = await reader.read();
+    // Watchdog: network-fed decompressed stream — a stalled tunnel must
+    // surface as TimeoutError instead of an eternal pending read().
+    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
     if (done) break;
 
     const chunk = value!;
@@ -1975,7 +2191,9 @@ async function streamingNiiLoadWithEarlyPreview(url: string, id: number, signal:
 
   while (true) {
     throwIfAborted(signal);
-    const { done, value } = await reader.read();
+    // Watchdog: raw network stream — a stalled tunnel must surface as
+    // TimeoutError instead of an eternal pending read().
+    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
     if (done) break;
 
     const chunk = value!;

@@ -18,11 +18,12 @@ Open `.nii`, `.nii.gz`, and `.hdr` volumes directly inside VS Code. The extensio
 ## Highlights
 
 - Fast initial preview for large volumes
-- Axial, coronal, sagittal, and 3D MIP views
+- Axial, coronal, sagittal, and 3D MIP views (grab-to-rotate virtual trackball)
+- Intensity-based image registration (To MNI / Align to reference) with resolution-preserving overlay & side-by-side compare
 - Remote-friendly loading through a local proxy
 - Debounced full-volume loading to avoid slowdowns during rapid switching
-- Canvas-first rendering for broad compatibility, with WebGL and WebGPU fast paths
-- HTTP/2 multiplexed proxy for concurrent slice requests
+- Canvas-first rendering for broad compatibility, with WebGL fast paths
+- HTTP/1.1 local proxy with concurrent range-request slice fetching
 - IndexedDB disk cache for remote file slices
 - Progressive LOD loading for .nii.gz files
 - GZIP random-access index for on-demand slice extraction
@@ -203,7 +204,7 @@ npm run package
 
 ## Version
 
-- Current release: `2.2.0`
+- Current release: `2.3.0`
 
 For release notes, see [CHANGELOG.md](CHANGELOG.md).
 

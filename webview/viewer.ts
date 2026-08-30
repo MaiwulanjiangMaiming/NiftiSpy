@@ -26,6 +26,11 @@ interface VolumeImage {
   state: 'preview' | 'loading' | 'ready' | 'error';
   lastAccess: number;
   loadPromise?: Promise<void>;
+  selected?: boolean;   // user-checked for compare mode (exactly two allowed)
+  // ITK-SNAP-style stored registration: affine mapping world -> this volume's
+  // OWN voxel grid (row-major 4x4). The volume data itself is never resampled;
+  // compare rendering samples the original data through this transform.
+  align?: { m: number[]; ref: string };
 }
 
 type Axis = 'axial' | 'coronal' | 'sagittal';
@@ -121,6 +126,35 @@ let overlayOpacity = 0.5;
 let overlayColormap = 'hot';
 type CompareLayout = 'overlay' | 'sideBySide';
 let compareLayout: CompareLayout = 'overlay';
+// Indices of the two images taking part in compare mode, chosen via the
+// per-image checkboxes in the sidebar (exactly two must be checked).
+let compareIdxA = 0;
+let compareIdxB = 1;
+/** Compare-pair accessor with index clamping after removals. */
+function cmpImg(which: 0 | 1): VolumeImage | null {
+  if (images.length === 0) return null;
+  const a = Math.min(compareIdxA, images.length - 1);
+  const b = Math.min(compareIdxB, images.length - 1);
+  return images[which === 0 ? a : b] || null;
+}
+let toastTimer: number | null = null;
+/** Small transient toast for user-facing validation messages. */
+function showToast(text: string): void {
+  let el = document.getElementById('ns-toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'ns-toast';
+    el.style.cssText = 'position:fixed;left:50%;bottom:56px;transform:translateX(-50%);' +
+      'background:rgba(40,40,40,0.92);color:#fff;padding:8px 14px;border-radius:6px;' +
+      'font-size:12px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.35);' +
+      'pointer-events:none;opacity:0;transition:opacity 0.2s';
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.style.opacity = '1';
+  if (toastTimer) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => { el.style.opacity = '0'; }, 2400);
+}
 let colormap = 'gray';
 let fileUrl = '';
 let directUrl = '';  // Original remote URL for direct fetch (bypasses proxy)
@@ -128,6 +162,9 @@ let isGzip = false;
 let fileName = '';
 let crosshairVisible = true;
 let isRemoteSource = false;
+// WebviewId assigned by the extension host (used to route fallback
+// requests such as 'remoteHttpFallback' back to the right webview).
+let currentWebviewId = '';
 let fullVolumeLoaded = false;
 let interactionInitialized = false;
 // Low-res preview state (Stage 1: strided sub-sampling)
@@ -209,63 +246,13 @@ const perfMonitor = {
   evictions: 0,
 };
 
-// OffscreenCanvas support
-const offscreenCanvasSupported = typeof OffscreenCanvas !== 'undefined' &&
-  typeof HTMLCanvasElement !== 'undefined' &&
-  !!(HTMLCanvasElement.prototype as any).transferControlToOffscreen;
-
-const offscreenCanvasEnabled: Record<Axis, boolean> = { axial: false, coronal: false, sagittal: false };
-
-function tryEnableOffscreenCanvas(axis: Axis): boolean {
-  if (!offscreenCanvasSupported) return false;
-  const canvas = canvases[axis];
-  if (!canvas) return false;
-  // Only enable for WebGL2 3D texture path (the most CPU-intensive)
-  if (renderBackend !== 'webgl3d') return false;
-  try {
-    const offscreen = (canvas as any).transferControlToOffscreen() as OffscreenCanvas;
-    const worker = sliceWorkers[AXIS_TO_WORKER_IDX[axis]];
-    if (worker) {
-      worker.postMessage({ type: 'initOffscreenCanvas', axis, canvas: offscreen }, [offscreen]);
-      offscreenCanvasEnabled[axis] = true;
-      return true;
-    }
-  } catch {
-    // Graceful fallback: some browsers don't support transferControlToOffscreen
-    offscreenCanvasEnabled[axis] = false;
-  }
-  return false;
-}
-
-// Render Request Queue
-interface RenderRequest {
-  axis: Axis;
-  sliceIndex: number;
-  windowLevel: number;
-  windowWidth: number;
-  colormap: string;
-  flipX: boolean;
-  flipY: boolean;
-}
-
-const pendingRenderRequests = new Map<Axis, RenderRequest>();
-
-function enqueueRenderRequest(req: RenderRequest): void {
-  pendingRenderRequests.set(req.axis, req);
-  const worker = sliceWorkers[AXIS_TO_WORKER_IDX[req.axis]];
-  if (worker && offscreenCanvasEnabled[req.axis]) {
-    worker.postMessage({
-      type: 'renderRequest',
-      axis: req.axis,
-      sliceIndex: req.sliceIndex,
-      windowLevel: req.windowLevel,
-      windowWidth: req.windowWidth,
-      colormap: req.colormap,
-      flipX: req.flipX,
-      flipY: req.flipY,
-    });
-  }
-}
+// NOTE: worker-side OffscreenCanvas slice rendering was removed.
+// transferControlToOffscreen() irreversibly transfers ownership of the
+// display canvas away from the main thread: afterwards getContext('2d')
+// returns null forever and assigning canvas.width THROWS, so every main-
+// thread painter (canvas2d fallback, compare mode, prefetch blit, GL blit)
+// died mid-render and the viewport went blank while info panels kept
+// updating. All GPU backends now render into private canvases and blit.
 
 // FPS Counter
 const fpsCounter = {
@@ -331,7 +318,6 @@ function publishPerfMonitor() {
     activeVolumeLoadKey,
     scheduledActiveIndex,
     fps: fpsCounter.getFPS(),
-    offscreenCanvas: { ...offscreenCanvasEnabled },
     memory: {
       totalVolumeBytes,
       sharedBufferBytes,
@@ -357,11 +343,14 @@ const workerRequests = new Map<number, { resolve: (value: any) => void; reject: 
 const sliceQualityTimers: Partial<Record<Axis, number>> = {};
 let workerStreamListener: ((message: any) => void) | null = null;
 
+// Row-major 3x3 identity for the MIP virtual trackball (see computeMIP).
+const MIP_IDENTITY: number[] = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+
 const viewState = {
   axial: { zoom: 1, panX: 0, panY: 0 },
   coronal: { zoom: 1, panX: 0, panY: 0 },
   sagittal: { zoom: 1, panX: 0, panY: 0 },
-  mip: { rotationX: 0, rotationY: 0 },
+  mip: { rot: MIP_IDENTITY.slice() },
 };
 
 let maximizedView: string | null = null;
@@ -398,14 +387,18 @@ function applyRenderBackend(configValue: string): void {
   if (configValue === 'auto') {
     // Synchronous detection — ensures renderBackend is set before first render
     renderBackend = detectBestRenderBackendSync();
-    // Async WebGPU upgrade (non-blocking)
-    if (typeof navigator !== 'undefined' && navigator.gpu) {
-      navigator.gpu.requestAdapter().then(adapter => {
-        if (adapter && renderBackend !== 'webgpu') {
-          renderBackend = 'webgpu';
-        }
-      }).catch(() => {});
-    }
+    // NOTE: the former async "upgrade" to renderBackend='webgpu' was removed.
+    // The WebGPU slice path is fundamentally broken for integer volumes:
+    //  1. it uploads them as r16sint/r8sint textures, but the WGSL shader
+    //     declares texture_3d<f32> + textureSample — integer textures cannot
+    //     be sampled by textureSample, so every draw fails validation and
+    //     nothing renders (white viewport);
+    //  2. writeTexture bytesPerRow must be 256-aligned (nx*4 rarely is);
+    //  3. r32float linear sampling needs the optional 'float32-filterable'
+    //     feature;
+    //  4. the shader never applies slope/inter.
+    // Slice rendering stays on WebGL2 (R32F/R16I/... + isampler3D variants),
+    // which is equally fast for slice views.
   } else if (configValue === 'webgl') {
     renderBackend = detectBestRenderBackendSync();
   } else {
@@ -618,10 +611,36 @@ function injectPreconnectHint(url: string): void {
   }
 }
 
+// TRIANGLE_STRIP destination quad in NDC for a device-pixel rect on a canvas.
+// Matches the CPU painter's zoom/pan geometry (image rect centered in the
+// container + pan offsets); a missing dst covers the full canvas.
+function ndcQuad(canvas: HTMLCanvasElement, dst?: { x: number; y: number; w: number; h: number }): Float32Array {
+  const W = canvas.width || 1;
+  const H = canvas.height || 1;
+  const x0 = dst ? dst.x : 0;
+  const y0 = dst ? dst.y : 0;
+  const w = dst ? dst.w : W;
+  const h = dst ? dst.h : H;
+  const l = (x0 / W) * 2 - 1;
+  const r = ((x0 + w) / W) * 2 - 1;
+  const t = 1 - (y0 / H) * 2;
+  const b = 1 - ((y0 + h) / H) * 2;
+  // Vertex order matches the texCoord strip: (bl, br, tl, tr)
+  return new Float32Array([l, b, r, b, l, t, r, t]);
+}
+
 class WebGLRenderer {
   private gl: WebGL2RenderingContext | WebGLRenderingContext | null = null;
   private program: WebGLProgram | null = null;
   private program3D: WebGLProgram | null = null;
+  // Integer-volume shader variants: WebGL2's format/type table forbids
+  // uploading SHORT/BYTE client data into an R32F texture (INVALID_OPERATION,
+  // silently ignored by the old DEBUG-only error check), so integer volumes
+  // use sized integer internal formats (R16I/R16UI/...) which must be sampled
+  // via isampler3D/usampler3D — one linked program per sampler type.
+  private program3DInt: WebGLProgram | null = null;
+  private program3DUint: WebGLProgram | null = null;
+  private volume3DKind: 'float' | 'int' | 'uint' = 'float';
   private texture: WebGLTexture | null = null;
   private texture3D: WebGLTexture | null = null;
   private lutTexture: WebGLTexture | null = null;
@@ -660,6 +679,8 @@ class WebGLRenderer {
   private u3d_flipY: WebGLUniformLocation | null = null;
   private u3d_slope: WebGLUniformLocation | null = null;
   private u3d_inter: WebGLUniformLocation | null = null;
+  private u3d_dataMin: WebGLUniformLocation | null = null;
+  private u3d_dataRange: WebGLUniformLocation | null = null;
   private u3d_programCached: WebGLProgram | null = null;
   // Cached LUT data buffer
   private cachedLutData: Uint8Array = new Uint8Array(256 * 4);
@@ -704,11 +725,18 @@ uniform sampler2D u_image;
 uniform sampler2D u_lut;
 uniform float u_windowLevel;
 uniform float u_windowWidth;
+uniform float u_dataMin;
+uniform float u_dataRange;
 out vec4 fragColor;
 void main() {
   float rawValue = texture(u_image, v_texCoord).r;
+  // The 2D texture holds slope/inter-applied VOXEL values while
+  // windowLevel/windowWidth arrive in normalized [0,1] space (same
+  // convention as the CPU painter) — normalize before windowing or
+  // every nonzero voxel saturates to white.
+  float norm = (rawValue - u_dataMin) / max(u_dataRange, 1e-6);
   float lo = u_windowLevel - u_windowWidth * 0.5;
-  float t = clamp((rawValue - lo) / u_windowWidth, 0.0, 1.0);
+  float t = clamp((norm - lo) / u_windowWidth, 0.0, 1.0);
   vec4 color = texture(u_lut, vec2(t, 0.5));
   fragColor = color;
 }`;
@@ -722,10 +750,17 @@ void main() {
   v_texCoord = a_texCoord;
 }`;
 
-  private fragmentShader3D = `#version 300 es
+  private fragmentShader3DSource(kind: 'float' | 'int' | 'uint'): string {
+    // Integer internal formats (R16I/R16UI/...) are sampled through
+    // isampler3D/usampler3D; texture() then returns ivec4/uvec4, so the .r
+    // component must be cast to float explicitly.
+    const samplerType = kind === 'int' ? 'isampler3D' : kind === 'uint' ? 'usampler3D' : 'sampler3D';
+    const fetch = kind === 'float' ? 'texture(u_volume, uvw).r' : 'float(texture(u_volume, uvw).r)';
+    return `#version 300 es
 precision highp float;
+precision highp ${samplerType};
 in vec2 v_texCoord;
-uniform sampler3D u_volume;
+uniform ${samplerType} u_volume;
 uniform sampler2D u_colormap;
 uniform float u_windowLevel;
 uniform float u_windowWidth;
@@ -736,6 +771,8 @@ uniform int u_flipX;
 uniform int u_flipY;
 uniform float u_slope;
 uniform float u_inter;
+uniform float u_dataMin;
+uniform float u_dataRange;
 out vec4 fragColor;
 void main() {
   float fx = (u_flipX == 1) ? 1.0 - v_texCoord.x : v_texCoord.x;
@@ -748,60 +785,81 @@ void main() {
   } else {
     uvw = vec3(u_sliceIndex / u_volumeSize.x, fx, fy);
   }
-  float rawValue = texture(u_volume, uvw).r;
+  float rawValue = ${fetch};
   float scaledValue = rawValue * u_slope + u_inter;
+  // windowLevel/windowWidth arrive in NORMALIZED [0,1] space (same convention
+  // as the CPU painter: norm = (v - globalMin) / (globalMax - globalMin),
+  // t = (norm - lo) / width). Windowing raw voxel values against that
+  // [0,1] range saturated every nonzero voxel to white.
+  float norm = (scaledValue - u_dataMin) / max(u_dataRange, 1e-6);
   float lo = u_windowLevel - u_windowWidth * 0.5;
-  float t = clamp((scaledValue - lo) / u_windowWidth, 0.0, 1.0);
+  float t = clamp((norm - lo) / u_windowWidth, 0.0, 1.0);
   vec4 color = texture(u_colormap, vec2(t, 0.5));
   fragColor = color;
 }`;
+  }
 
-  private offscreen: OffscreenCanvas | null = null;
-  private offscreenCtx: WebGL2RenderingContext | WebGLRenderingContext | null = null;
+  private glCanvas: HTMLCanvasElement | null = null;
 
-  init(canvas: HTMLCanvasElement): boolean {
-    const tryOffscreen = !!(canvas as any).transferControlToOffscreen;
-    if (tryOffscreen) {
-      try {
-        const offscreenCanvas = (canvas as any).transferControlToOffscreen() as OffscreenCanvas;
-        const gl2 = offscreenCanvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true }) as WebGL2RenderingContext | null;
-        if (gl2) {
-          this.offscreen = offscreenCanvas;
-          this.offscreenCtx = gl2;
-          this.gl = gl2;
-          this.isWebGL2 = true;
-          this.supportsFloatTexture = true;
-          this.floatLinear = !!gl2.getExtension('OES_texture_float_linear');
-          if (this.setupProgram()) return true;
-          this.offscreen = null;
-          this.offscreenCtx = null;
-          this.gl = null;
-        }
-      } catch {
-        this.offscreen = null;
-        this.offscreenCtx = null;
-        this.gl = null;
-      }
-    }
-
-    const gl2 = canvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
+  init(_canvas: HTMLCanvasElement): boolean {
+    // Render into a PRIVATE GL canvas and blit into the display canvas'
+    // 2D context (see renderSlice / renderSlice3D). The GL context must
+    // NEVER be acquired on the display canvas itself:
+    //  - context types are mutually exclusive per canvas: once 'webgl2' is
+    //    acquired, canvas.getContext('2d') returns null forever, which would
+    //    break the canvas2d fallback, compare mode and the prefetch blit;
+    //  - the former transferControlToOffscreen() attempt irreversibly
+    //    transferred ownership of the display canvas, after which setting
+    //    canvas.width THREW - every render died mid-paint, leaving a blank
+    //    canvas while header/slice info panels kept updating normally.
+    const glCanvas = document.createElement('canvas');
+    const gl2 = glCanvas.getContext('webgl2', { premultipliedAlpha: false, preserveDrawingBuffer: true });
     if (gl2) {
+      this.glCanvas = glCanvas;
       this.gl = gl2;
       this.isWebGL2 = true;
       this.supportsFloatTexture = true;
       this.floatLinear = !!gl2.getExtension('OES_texture_float_linear');
-      return this.setupProgram();
+      if (this.setupProgram()) {
+        this.watchContextLoss();
+        return true;
+      }
+      this.glCanvas = null;
+      this.gl = null;
     }
-    const gl1 = canvas.getContext('webgl', { premultipliedAlpha: false, preserveDrawingBuffer: true });
+    const gl1 = glCanvas.getContext('webgl', { premultipliedAlpha: false, preserveDrawingBuffer: true });
     if (gl1) {
+      this.glCanvas = glCanvas;
       this.gl = gl1;
       this.isWebGL2 = false;
       this.floatLinear = false;
       this.supportsFloatTexture = !!gl1.getExtension('OES_texture_float');
-      if (!this.supportsFloatTexture) return false;
-      return this.setupProgram();
+      if (!this.supportsFloatTexture) {
+        this.glCanvas = null;
+        this.gl = null;
+        return false;
+      }
+      if (this.setupProgram()) {
+        this.watchContextLoss();
+        return true;
+      }
+      this.glCanvas = null;
+      this.gl = null;
     }
     return false;
+  }
+
+  private watchContextLoss(): void {
+    const glCanvas = this.glCanvas;
+    if (!glCanvas) return;
+    glCanvas.addEventListener('webglcontextlost', (e: Event) => {
+      e.preventDefault();
+      console.warn('[NiftiSpy] WebGL context lost on private render canvas');
+      this.destroy();
+      // glRenderers entry is discarded via isReady() === false on the next
+      // getOrCreateRenderer() call, which builds a fresh renderer and
+      // re-uploads the 3D volume texture.
+    });
   }
 
   private setupProgram(): boolean {
@@ -827,22 +885,28 @@ void main() {
     this.texCoordBuffer = gl.createBuffer();
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]), gl.STATIC_DRAW);
+    // Initial fill only — renderSlice/renderSlice3D replace this before
+    // every draw. Canonical layout: texcoord y=0 at the bottom vertices
+    // (image row 0 at the canvas bottom, matching the CPU painter).
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
 
     this.ready = true;
 
     if (this.isWebGL2) {
       const vs3d = this.compileShader(gl.VERTEX_SHADER, this.vertexShader3D);
-      const fs3d = this.compileShader(gl.FRAGMENT_SHADER, this.fragmentShader3D);
-      if (vs3d && fs3d) {
-        this.program3D = gl.createProgram()!;
-        gl.attachShader(this.program3D, vs3d);
-        gl.attachShader(this.program3D, fs3d);
-        gl.linkProgram(this.program3D);
-        if (!gl.getProgramParameter(this.program3D, gl.LINK_STATUS)) {
-          this.program3D = null;
-        }
-      }
+      const link3D = (kind: 'float' | 'int' | 'uint', existing: WebGLProgram | null): WebGLProgram | null => {
+        if (!vs3d) return existing;
+        const fs3d = this.compileShader(gl.FRAGMENT_SHADER, this.fragmentShader3DSource(kind));
+        if (!fs3d) return existing;
+        const prog = gl.createProgram()!;
+        gl.attachShader(prog, vs3d);
+        gl.attachShader(prog, fs3d);
+        gl.linkProgram(prog);
+        return gl.getProgramParameter(prog, gl.LINK_STATUS) ? prog : null;
+      };
+      this.program3D = link3D('float', this.program3D);
+      this.program3DInt = link3D('int', this.program3DInt);
+      this.program3DUint = link3D('uint', this.program3DUint);
     }
 
     return true;
@@ -862,13 +926,15 @@ void main() {
   }
 
   renderSlice(canvas: HTMLCanvasElement, sliceData: Float32Array, w: number, h: number,
-    lo: number, range: number, cmapName: string, flipX: boolean = false, flipY: boolean = false): boolean {
-    if (!this.ready || !this.gl || !this.program || !this.supportsFloatTexture) return false;
+    lo: number, range: number, cmapName: string, flipX: boolean = false, flipY: boolean = false,
+    dst?: { x: number; y: number; w: number; h: number }): boolean {
+    if (!this.ready || !this.gl || !this.program || !this.supportsFloatTexture || !this.glCanvas) return false;
     const gl = this.gl;
 
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvas.clientWidth * dpr;
-    canvas.height = canvas.clientHeight * dpr;
+    // The display canvas keeps its 2D context; GL renders into the private
+    // canvas sized to match, then the result is blitted 1:1 (see below).
+    if (this.glCanvas.width !== canvas.width) this.glCanvas.width = canvas.width;
+    if (this.glCanvas.height !== canvas.height) this.glCanvas.height = canvas.height;
     gl.viewport(0, 0, canvas.width, canvas.height);
 
     gl.useProgram(this.program);
@@ -919,8 +985,15 @@ void main() {
     if (this.isWebGL2) {
       const uWindowLevel = gl.getUniformLocation(this.program, 'u_windowLevel');
       const uWindowWidth = gl.getUniformLocation(this.program, 'u_windowWidth');
+      const uDataMin = gl.getUniformLocation(this.program, 'u_dataMin');
+      const uDataRange = gl.getUniformLocation(this.program, 'u_dataRange');
       gl.uniform1f(uWindowLevel, lo + range * 0.5);
       gl.uniform1f(uWindowWidth, range);
+      // The R32F texture holds raw (slope/inter-applied) voxel values; W/L
+      // is normalized — pass the volume range for the shader's normalize
+      // step (mirrors renderSlice3D and the CPU painter).
+      gl.uniform1f(uDataMin, globalMin);
+      gl.uniform1f(uDataRange, (globalMax - globalMin) || 1);
     } else {
       const uLo = gl.getUniformLocation(this.program, 'u_lo');
       const uHi = gl.getUniformLocation(this.program, 'u_hi');
@@ -933,21 +1006,64 @@ void main() {
     const aPos = gl.getAttribLocation(this.program, 'a_position');
     const aTex = gl.getAttribLocation(this.program, 'a_texCoord');
 
+    // Destination quad in NDC: the zoom/pan-aware image rectangle (device px)
+    // the CPU painter uses, or the full canvas when no dst is given. The GL
+    // canvas is cleared to opaque black first so the area outside the image
+    // matches the CPU path's background fill.
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    const quad = ndcQuad(canvas, dst);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.posBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.DYNAMIC_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, quad, gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(aPos);
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
     const tx0 = flipX ? 1 : 0, tx1 = flipX ? 0 : 1;
-    const ty0 = flipY ? 0 : 1, ty1 = flipY ? 1 : 0;
+    // ty polarity is INVERTED vs a naive screen-space mapping: the CPU
+    // painter's default (flipY=false) draws with a negative Y scale, putting
+    // image row 0 at the canvas BOTTOM. ty0/ty1 = 0/1 anchors texcoord y=0
+    // (row 0) at the bottom vertices, matching that; flipY=true mirrors it.
+    // The previous (flipY ? 0 : 1) polarity rendered every 2D frame
+    // vertically flipped relative to the CPU path.
+    const ty0 = flipY ? 1 : 0, ty1 = flipY ? 0 : 1;
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([tx0, ty0, tx1, ty0, tx0, ty1, tx1, ty1]), gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(aTex);
     gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     if (gl.getError() !== gl.NO_ERROR) return false;
+    return this.blitToDisplay(canvas);
+  }
+
+  private blitToDisplay(canvas: HTMLCanvasElement): boolean {
+    // Copy the GL result onto the display canvas' 2D context (1:1). Reset the
+    // transform first: the 2D context is shared with other 2D painters which
+    // save/restore transforms, and a leftover transform would skew the blit.
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(this.glCanvas!, 0, 0);
     return true;
+  }
+
+  // Map a JS TypedArray to a (internalFormat, clientType, samplerKind) triple.
+  // WebGL2's format/type table is strict: R32F only accepts FLOAT client data.
+  // The previous code uploaded integer arrays with glType=SHORT/BYTE into
+  // R32F, which raises INVALID_OPERATION — the texture stayed incomplete and
+  // every slice sampled as 0, painting a uniform wash. Integer volumes now
+  // use matching sized integer formats sampled via isampler3D/usampler3D
+  // (see fragmentShader3DSource).
+  private mapVolumeFormat(data: TypedArray, gl2: WebGL2RenderingContext):
+    { internalFormat: number; glType: number; kind: 'float' | 'int' | 'uint' } | null {
+    if (data instanceof Uint8Array) return { internalFormat: gl2.R8UI, glType: gl2.UNSIGNED_BYTE, kind: 'uint' };
+    if (data instanceof Int8Array) return { internalFormat: gl2.R8I, glType: gl2.BYTE, kind: 'int' };
+    if (data instanceof Uint16Array) return { internalFormat: gl2.R16UI, glType: gl2.UNSIGNED_SHORT, kind: 'uint' };
+    if (data instanceof Int16Array) return { internalFormat: gl2.R16I, glType: gl2.SHORT, kind: 'int' };
+    if (data instanceof Uint32Array) return { internalFormat: gl2.R32UI, glType: gl2.UNSIGNED_INT, kind: 'uint' };
+    if (data instanceof Int32Array) return { internalFormat: gl2.R32I, glType: gl2.INT, kind: 'int' };
+    if (data instanceof Float32Array) return { internalFormat: gl2.R32F, glType: gl2.FLOAT, kind: 'float' };
+    return null; // Unsupported type (e.g. Float64Array)
   }
 
   uploadVolume3D(data: TypedArray, nx: number, ny: number, nz: number): boolean {
@@ -957,17 +1073,13 @@ void main() {
     const max3DSize = gl2.getParameter(gl2.MAX_3D_TEXTURE_SIZE);
     if (nx > max3DSize || ny > max3DSize || nz > max3DSize) return false;
 
-    // Map JS TypedArray to WebGL type constant
-    let glType: number;
+    const fmt = this.mapVolumeFormat(data, gl2);
+    if (!fmt) return false;
+    const { internalFormat, glType, kind } = fmt;
     const bytesPerVoxel = data.BYTES_PER_ELEMENT;
-    if (data instanceof Uint8Array) glType = gl2.UNSIGNED_BYTE;
-    else if (data instanceof Int8Array) glType = gl2.BYTE;
-    else if (data instanceof Int16Array) glType = gl2.SHORT;
-    else if (data instanceof Uint16Array) glType = gl2.UNSIGNED_SHORT;
-    else if (data instanceof Int32Array) glType = gl2.INT;
-    else if (data instanceof Uint32Array) glType = gl2.UNSIGNED_INT;
-    else if (data instanceof Float32Array) glType = gl2.FLOAT;
-    else return false; // Unsupported type (e.g. Float64Array)
+    // Integer textures cannot be LINEAR-filtered; keep LINEAR for float
+    // volumes when the extension allows it.
+    const filter = (kind === 'float' && this.floatLinear) ? gl2.LINEAR : gl2.NEAREST;
 
     const estimatedBytes = nx * ny * nz * bytesPerVoxel;
     const maxTextureSize = gl2.getParameter(gl2.MAX_TEXTURE_SIZE);
@@ -996,25 +1108,27 @@ void main() {
 
     gl2.activeTexture(gl2.TEXTURE0);
     gl2.bindTexture(gl2.TEXTURE_3D, this.texture3D);
-    const filter = this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
     gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_MIN_FILTER, filter);
     gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_MAG_FILTER, filter);
     gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_S, gl2.CLAMP_TO_EDGE);
     gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_T, gl2.CLAMP_TO_EDGE);
     gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_R, gl2.CLAMP_TO_EDGE);
 
+    // Odd row widths (e.g. int8 volumes with odd nx) must not be padded to
+    // the default 4-byte row alignment, or rows shift and the image shears.
+    gl2.pixelStorei(gl2.UNPACK_ALIGNMENT, 1);
     try {
-      // Use R32F internal format so WebGL auto-converts integer data to float.
-      // This lets the shader use sampler3D (float) while uploading native types
-      // (half the bandwidth for int16, quarter for uint8 vs manual float32).
-      gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, nz, 0, gl2.RED, glType, data);
+      gl2.texImage3D(gl2.TEXTURE_3D, 0, internalFormat, nx, ny, nz, 0, gl2.RED, glType, data);
     } catch {
       gl2.deleteTexture(this.texture3D);
       this.texture3D = null;
       return false;
     }
 
-    if (DEBUG && gl2.getError() !== gl2.NO_ERROR) {
+    // Unconditional: a silent INVALID_OPERATION here leaves an incomplete
+    // texture that samples as 0 — the "uniform wash" bug. (Previously
+    // DEBUG-only, which is exactly why it went unnoticed.)
+    if (gl2.getError() !== gl2.NO_ERROR) {
       gl2.deleteTexture(this.texture3D);
       this.texture3D = null;
       return false;
@@ -1022,12 +1136,16 @@ void main() {
 
     this.volume3DReady = true;
     this.volume3DSize = nx * ny * nz;
+    this.volume3DKind = kind;
     this.chunkCount = 0;
     return true;
   }
 
   private uploadVolume3DChunked(data: TypedArray, nx: number, ny: number, nz: number): boolean {
     const gl2 = this.gl as WebGL2RenderingContext;
+    const fmt = this.mapVolumeFormat(data, gl2);
+    if (!fmt) return false;
+    const { internalFormat, glType, kind } = fmt;
     // Determine chunk size: split along Z axis
     const sliceSize = nx * ny;
     const bytesPerVoxel = data.BYTES_PER_ELEMENT;
@@ -1043,18 +1161,9 @@ void main() {
     this.chunkNy = ny;
     this.chunkNz = nz;
 
-    const filter = this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
-
-    // Map JS TypedArray to WebGL type constant
-    let glType: number;
-    if (data instanceof Uint8Array) glType = gl2.UNSIGNED_BYTE;
-    else if (data instanceof Int8Array) glType = gl2.BYTE;
-    else if (data instanceof Int16Array) glType = gl2.SHORT;
-    else if (data instanceof Uint16Array) glType = gl2.UNSIGNED_SHORT;
-    else if (data instanceof Int32Array) glType = gl2.INT;
-    else if (data instanceof Uint32Array) glType = gl2.UNSIGNED_INT;
-    else if (data instanceof Float32Array) glType = gl2.FLOAT;
-    else return false;
+    // Integer textures cannot be LINEAR-filtered.
+    const filter = (kind === 'float' && this.floatLinear) ? gl2.LINEAR : gl2.NEAREST;
+    gl2.pixelStorei(gl2.UNPACK_ALIGNMENT, 1);
 
     for (let c = 0; c < numChunks; c++) {
       const zStart = c * slicesPerChunk;
@@ -1073,7 +1182,7 @@ void main() {
       gl2.texParameteri(gl2.TEXTURE_3D, gl2.TEXTURE_WRAP_R, gl2.CLAMP_TO_EDGE);
 
       try {
-        gl2.texImage3D(gl2.TEXTURE_3D, 0, gl2.R32F, nx, ny, chunkDepth, 0, gl2.RED, glType, chunkData);
+        gl2.texImage3D(gl2.TEXTURE_3D, 0, internalFormat, nx, ny, chunkDepth, 0, gl2.RED, glType, chunkData);
       } catch {
         // Clean up already created chunk textures
         for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
@@ -1083,7 +1192,7 @@ void main() {
         return false;
       }
 
-      if (DEBUG && gl2.getError() !== gl2.NO_ERROR) {
+      if (gl2.getError() !== gl2.NO_ERROR) {
         for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
         this.texture3DChunks = [];
         this.chunkCount = 0;
@@ -1096,6 +1205,7 @@ void main() {
 
     this.volume3DReady = true;
     this.volume3DSize = nx * ny * nz;
+    this.volume3DKind = kind;
     return true;
   }
 
@@ -1112,16 +1222,25 @@ void main() {
   renderSlice3D(canvas: HTMLCanvasElement, axis: number, sliceIndex: number,
     nx: number, ny: number, nz: number, lo: number, range: number,
     cmapName: string, flipX: boolean = false, flipY: boolean = false,
-    slope: number = 1, inter: number = 0): boolean {
-    if (!this.volume3DReady || !this.program3D || !this.isWebGL2) return false;
+    slope: number = 1, inter: number = 0,
+    dst?: { x: number; y: number; w: number; h: number }): boolean {
+    if (!this.volume3DReady || !this.program3D || !this.isWebGL2 || !this.glCanvas) return false;
+    // Pick the program matching the uploaded volume's sampler type
+    // (sampler3D / isampler3D / usampler3D — see mapVolumeFormat).
+    const program = this.volume3DKind === 'int' ? this.program3DInt
+      : this.volume3DKind === 'uint' ? this.program3DUint
+        : this.program3D;
+    if (!program) return false;
     const gl2 = this.gl as WebGL2RenderingContext;
 
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = canvas.clientWidth * dpr;
-    canvas.height = canvas.clientHeight * dpr;
+    // GL renders into the private canvas (sized to the display canvas, whose
+    // pixel size is managed by paintSlice/paintSlice3D); result is blitted
+    // onto the display canvas' 2D context at the end.
+    if (this.glCanvas.width !== canvas.width) this.glCanvas.width = canvas.width;
+    if (this.glCanvas.height !== canvas.height) this.glCanvas.height = canvas.height;
     gl2.viewport(0, 0, canvas.width, canvas.height);
 
-    gl2.useProgram(this.program3D);
+    gl2.useProgram(program);
 
     // Bind the correct 3D texture (single or chunked)
     gl2.activeTexture(gl2.TEXTURE0);
@@ -1150,19 +1269,21 @@ void main() {
     gl2.bindTexture(gl2.TEXTURE_2D, this.colormapTexture);
 
     // Cache uniform locations (program may change between calls)
-    if (this.u3d_programCached !== this.program3D) {
-      this.u3d_volume = gl2.getUniformLocation(this.program3D, 'u_volume');
-      this.u3d_colormap = gl2.getUniformLocation(this.program3D, 'u_colormap');
-      this.u3d_windowLevel = gl2.getUniformLocation(this.program3D, 'u_windowLevel');
-      this.u3d_windowWidth = gl2.getUniformLocation(this.program3D, 'u_windowWidth');
-      this.u3d_sliceIndex = gl2.getUniformLocation(this.program3D, 'u_sliceIndex');
-      this.u3d_axis = gl2.getUniformLocation(this.program3D, 'u_axis');
-      this.u3d_volumeSize = gl2.getUniformLocation(this.program3D, 'u_volumeSize');
-      this.u3d_flipX = gl2.getUniformLocation(this.program3D, 'u_flipX');
-      this.u3d_flipY = gl2.getUniformLocation(this.program3D, 'u_flipY');
-      this.u3d_slope = gl2.getUniformLocation(this.program3D, 'u_slope');
-      this.u3d_inter = gl2.getUniformLocation(this.program3D, 'u_inter');
-      this.u3d_programCached = this.program3D;
+    if (this.u3d_programCached !== program) {
+      this.u3d_volume = gl2.getUniformLocation(program, 'u_volume');
+      this.u3d_colormap = gl2.getUniformLocation(program, 'u_colormap');
+      this.u3d_windowLevel = gl2.getUniformLocation(program, 'u_windowLevel');
+      this.u3d_windowWidth = gl2.getUniformLocation(program, 'u_windowWidth');
+      this.u3d_sliceIndex = gl2.getUniformLocation(program, 'u_sliceIndex');
+      this.u3d_axis = gl2.getUniformLocation(program, 'u_axis');
+      this.u3d_volumeSize = gl2.getUniformLocation(program, 'u_volumeSize');
+      this.u3d_flipX = gl2.getUniformLocation(program, 'u_flipX');
+      this.u3d_flipY = gl2.getUniformLocation(program, 'u_flipY');
+      this.u3d_slope = gl2.getUniformLocation(program, 'u_slope');
+      this.u3d_inter = gl2.getUniformLocation(program, 'u_inter');
+      this.u3d_dataMin = gl2.getUniformLocation(program, 'u_dataMin');
+      this.u3d_dataRange = gl2.getUniformLocation(program, 'u_dataRange');
+      this.u3d_programCached = program;
     }
     gl2.uniform1i(this.u3d_volume, 0);
     gl2.uniform1i(this.u3d_colormap, 1);
@@ -1175,22 +1296,40 @@ void main() {
     gl2.uniform1i(this.u3d_flipY, flipY ? 1 : 0);
     gl2.uniform1f(this.u3d_slope, slope);
     gl2.uniform1f(this.u3d_inter, inter);
+    // Data range for normalization: windowLevel/windowWidth are passed in
+    // normalized [0,1] space, so raw voxel values must be normalized with
+    // the volume's (slope/inter-applied) min/max before windowing — same
+    // math as the CPU painter.
+    gl2.uniform1f(this.u3d_dataMin, globalMin);
+    gl2.uniform1f(this.u3d_dataRange, (globalMax - globalMin) || 1);
 
-    const aPos = gl2.getAttribLocation(this.program3D, 'a_position');
-    const aTex = gl2.getAttribLocation(this.program3D, 'a_texCoord');
+    const aPos = gl2.getAttribLocation(program, 'a_position');
+    const aTex = gl2.getAttribLocation(program, 'a_texCoord');
 
+    // Destination quad: zoom/pan-aware image rect (device px), like the CPU
+    // painter; clear to opaque black so panned-out borders match its
+    // background fill.
+    gl2.clearColor(0, 0, 0, 1);
+    gl2.clear(gl2.COLOR_BUFFER_BIT);
+    const quad = ndcQuad(canvas, dst);
     gl2.bindBuffer(gl2.ARRAY_BUFFER, this.posBuffer);
-    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl2.DYNAMIC_DRAW);
+    gl2.bufferData(gl2.ARRAY_BUFFER, quad, gl2.DYNAMIC_DRAW);
     gl2.enableVertexAttribArray(aPos);
     gl2.vertexAttribPointer(aPos, 2, gl2.FLOAT, false, 0, 0);
 
     gl2.bindBuffer(gl2.ARRAY_BUFFER, this.texCoordBuffer);
-    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0, 1, 1, 1, 0, 0, 1, 0]), gl2.STATIC_DRAW);
+    // Vertex order bl,br,tl,tr with texCoords (0,0),(1,0),(0,1),(1,1):
+    // texture row 0 lands at the canvas BOTTOM, matching the CPU painter
+    // (drawImage with scaleY<0 puts image row 0 at the bottom for
+    // flipY=false). The old layout put row 0 at the top — a vertical flip
+    // versus every CPU-rendered frame.
+    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl2.STATIC_DRAW);
     gl2.enableVertexAttribArray(aTex);
     gl2.vertexAttribPointer(aTex, 2, gl2.FLOAT, false, 0, 0);
 
     gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
-    return gl2.getError() === gl2.NO_ERROR;
+    if (gl2.getError() !== gl2.NO_ERROR) return false;
+    return this.blitToDisplay(canvas);
   }
 
   createColormapTexture(cmapName: string): void {
@@ -1228,6 +1367,7 @@ void main() {
     this.deleteChunkedTextures();
     this.volume3DReady = false;
     this.volume3DSize = 0;
+    this.volume3DKind = 'float';
   }
 
   private updateLUT(cmapName: string): void {
@@ -1258,15 +1398,21 @@ void main() {
   destroy(): void {
     if (!this.gl) return;
     if (this.program) this.gl.deleteProgram(this.program);
+    if (this.program3D) this.gl.deleteProgram(this.program3D);
+    if (this.program3DInt) this.gl.deleteProgram(this.program3DInt);
+    if (this.program3DUint) this.gl.deleteProgram(this.program3DUint);
     if (this.texture) this.gl.deleteTexture(this.texture);
     if (this.lutTexture) this.gl.deleteTexture(this.lutTexture);
     if (this.colormapTexture) this.gl.deleteTexture(this.colormapTexture);
+    if (this.texture3D) this.gl.deleteTexture(this.texture3D);
     if (this.posBuffer) this.gl.deleteBuffer(this.posBuffer);
     if (this.texCoordBuffer) this.gl.deleteBuffer(this.texCoordBuffer);
     this.deleteChunkedTextures();
     this.stopSliceAnimation();
     this.ready = false;
+    this.volume3DReady = false;
     this.gl = null;
+    this.glCanvas = null;
   }
 
   // Smooth slice transition methods
@@ -1540,27 +1686,6 @@ function validateVolumeData(hdr: NiiHeader | null, data: Float32Array | null): b
   return data.length >= expectedLen;
 }
 
-// --- Error Recovery ---
-function handleWebGLContextLoss(canvas: HTMLCanvasElement, axis: Axis): void {
-  console.warn(`[NiftiSpy] WebGL context lost for ${axis}, attempting recovery...`);
-  const renderer = glRenderers[axis];
-  if (renderer) {
-    renderer.destroy();
-    delete glRenderers[axis];
-  }
-  // Attempt to reinitialize after a short delay
-  setTimeout(() => {
-    const newRenderer = new WebGLRenderer();
-    if (newRenderer.init(canvas)) {
-      glRenderers[axis] = newRenderer;
-      if (volumeData && header) {
-        tryUploadVolume3D();
-      }
-      renderAllViews();
-    }
-  }, 500);
-}
-
 function restartCrashedWorker(axis: Axis): void {
   const idx = AXIS_TO_WORKER_IDX[axis];
   const oldWorker = sliceWorkers[idx];
@@ -1724,12 +1849,6 @@ function attachWorkerRouter(worker: Worker) {
       bandwidthEstimator.addSample(msg.bytes || 0, msg.durationMs || 0);
       return;
     }
-    if (msg?.type === 'renderComplete') {
-      // Worker finished OffscreenCanvas rendering; clear pending request
-      const axis = msg.axis as Axis;
-      if (axis) pendingRenderRequests.delete(axis);
-      return;
-    }
     const streamHandler = workerStreamHandlers.get(msg.id);
     if (streamHandler) {
       streamHandler(msg);
@@ -1871,8 +1990,10 @@ function queueVolumeLoad<T>(key: string, task: () => Promise<T>, priority: Volum
 function evictInactiveImageData(preferredIndices: number[] = []) {
   const keep = new Set(preferredIndices);
   if (compareMode && images.length >= 2) {
-    keep.add(0);
-    keep.add(1);
+    // Protect the actual compare pair — not positions 0/1, which are
+    // unrelated when the user compared e.g. images 3 and 5.
+    keep.add(compareIdxA);
+    keep.add(compareIdxB);
   }
   const loaded = images
     .map((img, idx) => ({ img, idx }))
@@ -1922,18 +2043,19 @@ function tryUploadVolume3D() {
       ? Float32Array.from(volumeData)
       : volumeData as any;
     for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
-      const r = glRenderers[axis];
+      // Eagerly create the renderer BEFORE uploading: tryUploadVolume3D often
+      // runs from applyImageState before the first paint, and glRenderers used
+      // to be populated lazily inside paintSlice/paintSlice3D - so the upload
+      // loop below found no renderers and the 3D texture never reached the
+      // GPU until some later re-upload trigger.
+      const r = getOrCreateRenderer(axis);
       if (r) {
         if (!r.isVolume3DReady()) {
           r.uploadVolume3D(gpuData, nx, ny, nz);
         }
-        // Try enabling OffscreenCanvas for this axis (only for WebGL2 3D texture path)
-        if (r.isVolume3DReady() && !offscreenCanvasEnabled[axis]) {
-          tryEnableOffscreenCanvas(axis);
-        }
       }
       const wgr = webgpuRenderers[axis];
-      if (wgr && wgr.isReady()) {
+      if (wgr && wgr.isReady() && !wgr.hasVolume3D()) {
         wgr.uploadVolume3D(gpuData, nx, ny, nz);
       }
     }
@@ -1949,7 +2071,7 @@ function tryUploadVolume3D() {
       const gpuData = volumeData instanceof Float64Array
         ? Float32Array.from(volumeData)
         : volumeData as any;
-      volumeRaycaster.uploadVolume(gpuData, nx, ny, nz);
+      volumeRaycaster.uploadVolume(gpuData, nx, ny, nz, dataSlope, dataInter);
     }
   }
 }
@@ -1964,12 +2086,18 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
   globalMax = img.max;
   fileName = img.name;
   img.lastAccess = Date.now();
+  // Prefetched slice renders belong to the PREVIOUS image (cache key lacks
+  // image identity) - keep them and the first visited-slice blit would draw
+  // the old image's pixels. Cleared here; window/level and colormap already
+  // invalidate via the key itself.
+  sliceRenderCache.clear();
   // Clear old GPU 3D textures so the new volume's data gets uploaded.
   // Without this, isVolume3DReady() stays true from the previous image and
   // tryUploadVolume3D() skips the upload — rendering stale data after a switch.
   if (volumeData) {
     for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
       glRenderers[axis]?.clearVolume3D();
+      webgpuRenderers[axis]?.clearVolume3D();
     }
   }
   tryUploadVolume3D();
@@ -1978,6 +2106,9 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
     setCurrentSlice('coronal', new Float32Array(img.preview.coronal), img.header.nx, img.header.nz, 1);
     setCurrentSlice('sagittal', new Float32Array(img.preview.sagittal), img.header.ny, img.header.nz, 1);
   }
+  // Keep the header info panel in sync with the newly active image (it reads
+  // the global `header`, which was just swapped above).
+  if (headerPanelVisible) updateHeaderPanel();
 }
 
 async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void, directFetchUrl?: string): Promise<any> {
@@ -2360,51 +2491,132 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
   }
 }
 
-function computeMIP(rotX: number, rotY: number): Float32Array {
-  if (!header || !volumeData) return new Float32Array(0);
+interface MipResult {
+  data: Float32Array;
+  w: number;
+  h: number;
+}
+
+// ── 3x3 row-major helpers for the MIP virtual trackball ──────────────────
+
+function rotAxisAngle(ax: number, ay: number, az: number, angle: number): number[] {
+  const n = Math.hypot(ax, ay, az) || 1;
+  const x = ax / n, y = ay / n, z = az / n;
+  const c = Math.cos(angle), s = Math.sin(angle), t = 1 - c;
+  return [
+    t * x * x + c, t * x * y - s * z, t * x * z + s * y,
+    t * x * y + s * z, t * y * y + c, t * y * z - s * x,
+    t * x * z - s * y, t * y * z + s * x, t * z * z + c,
+  ];
+}
+
+function mul3(a: number[], b: number[]): number[] {
+  const o = new Array<number>(9).fill(0);
+  for (let i = 0; i < 3; i++) {
+    for (let j = 0; j < 3; j++) {
+      o[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+    }
+  }
+  return o;
+}
+
+function computeMIP(rot: number[], interactive = false): MipResult {
+  if (!header || !volumeData) return { data: new Float32Array(0), w: 0, h: 0 };
   const { nx, ny, nz, dx, dy, dz } = header;
-  const outW = nx;
-  const outH = ny;
+
+  // Half extents in world space (mm), volume centered at origin
+  const hx = ((nx - 1) * dx) / 2;
+  const hy = ((ny - 1) * dy) / 2;
+  const hz = ((nz - 1) * dz) / 2;
+
+  // View basis in world mm (columns of the accumulated rotation): right, up, depth
+  const Ux = rot[0], Uy = rot[1], Uz = rot[2];
+  const Vx = rot[3], Vy = rot[4], Vz = rot[5];
+  const Wx = rot[6], Wy = rot[7], Wz = rot[8];
+
+  // Screen (u,v) extents of the rotated box: project the 8 corners
+  let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+  for (let c = 0; c < 8; c++) {
+    const px = (c & 1 ? hx : -hx);
+    const py = (c & 2 ? hy : -hy);
+    const pz = (c & 4 ? hz : -hz);
+    const u = px * Ux + py * Uy + pz * Uz;
+    const v = px * Vx + py * Vy + pz * Vz;
+    if (u < uMin) uMin = u;
+    if (u > uMax) uMax = u;
+    if (v < vMin) vMin = v;
+    if (v > vMax) vMax = v;
+  }
+
+  // Square output pixels in mm so anisotropic volumes keep true proportions.
+  // Interactive (drag) mode renders at reduced resolution and ray step count
+  // — roughly 10x cheaper per frame — so dragging stays smooth; the final
+  // full-quality MIP is recomputed once the drag ends.
+  const minSp = Math.min(dx, dy, dz);
+  let pix = minSp;
+  const MAX_DIM = interactive ? 224 : 448;
+  const maxExt = Math.max(uMax - uMin, vMax - vMin);
+  if (maxExt / pix > MAX_DIM) pix = maxExt / MAX_DIM;
+
+  const outW = Math.max(1, Math.ceil((uMax - uMin) / pix));
+  const outH = Math.max(1, Math.ceil((vMax - vMin) / pix));
   const mip = new Float32Array(outW * outH);
   mip.fill(-Infinity);
 
-  const cosX = Math.cos(rotX), sinX = Math.sin(rotX);
-  const cosY = Math.cos(rotY), sinY = Math.sin(rotY);
+  const nxy = ny * nx;
+  const halfX = (nx - 1) / 2, halfY = (ny - 1) / 2, halfZ = (nz - 1) / 2;
 
-  const aspectX = dx, aspectY = dy, aspectZ = dz;
-  const maxAspect = Math.max(aspectX, aspectY, aspectZ);
-  const sx = aspectX / maxAspect, sy = aspectY / maxAspect, sz = aspectZ / maxAspect;
+  for (let j = 0; j < outH; j++) {
+    const v = vMin + (j + 0.5) * pix;
+    const rowOff = j * outW;
+    for (let i = 0; i < outW; i++) {
+      const u = uMin + (i + 0.5) * pix;
 
-  const step = Math.max(1, Math.floor(Math.min(nx, ny, nz) / 80));
-
-  for (let z = 0; z < nz; z += step) {
-    const zc = (z - nz / 2) * sz;
-    for (let y = 0; y < ny; y += step) {
-      const yc = (y - ny / 2) * sy;
-      for (let x = 0; x < nx; x += step) {
-        const xc = (x - nx / 2) * sx;
-
-        const x1 = xc * cosY + zc * sinY;
-        const z1 = -xc * sinY + zc * cosY;
-        const y1 = yc * cosX - z1 * sinX;
-
-        const px = Math.round(nx / 2 + x1 / sx);
-        const py = Math.round(ny / 2 + y1 / sy);
-
-        if (px >= 0 && px < outW && py >= 0 && py < outH) {
-          const v = volumeData[z * ny * nx + y * nx + x] * dataSlope + dataInter;
-          const idx = py * outW + px;
-          if (v > mip[idx]) mip[idx] = v;
+      // Ray origin: u*U + v*V; direction W. Slab test against the box.
+      const ox = u * Ux + v * Vx;
+      const oy = u * Uy + v * Vy;
+      const oz = u * Uz + v * Vz;
+      let t0 = -Infinity, t1 = Infinity, hit = true;
+      const ob = [ox, oy, oz];
+      const db = [Wx, Wy, Wz];
+      const hb = [hx, hy, hz];
+      for (let a = 0; a < 3; a++) {
+        if (Math.abs(db[a]) < 1e-9) {
+          if (Math.abs(ob[a]) > hb[a]) { hit = false; break; }
+        } else {
+          let ta = (-hb[a] - ob[a]) / db[a];
+          let tb = (hb[a] - ob[a]) / db[a];
+          if (ta > tb) { const tmp = ta; ta = tb; tb = tmp; }
+          if (ta > t0) t0 = ta;
+          if (tb < t1) t1 = tb;
         }
+      }
+      if (!hit || t0 > t1) continue;
+
+      // Cast step: at least min spacing, capped per-ray to bound cost
+      const span = t1 - t0;
+      const castStep = Math.max(minSp, span / (interactive ? 96 : 256));
+
+      for (let t = Math.max(t0, 0); t <= t1; t += castStep) {
+        const wx = ox + t * Wx, wy = oy + t * Wy, wz = oz + t * Wz;
+        let ix = Math.round(wx / dx + halfX);
+        let iy = Math.round(wy / dy + halfY);
+        let iz = Math.round(wz / dz + halfZ);
+        if (ix < 0) ix = 0; else if (ix >= nx) ix = nx - 1;
+        if (iy < 0) iy = 0; else if (iy >= ny) iy = ny - 1;
+        if (iz < 0) iz = 0; else if (iz >= nz) iz = nz - 1;
+        const val = volumeData[iz * nxy + iy * nx + ix] * dataSlope + dataInter;
+        const idx = rowOff + i;
+        if (val > mip[idx]) mip[idx] = val;
       }
     }
   }
 
-  for (let i = 0; i < mip.length; i++) {
-    if (mip[i] === -Infinity) mip[i] = globalMin;
+  for (let k = 0; k < mip.length; k++) {
+    if (mip[k] === -Infinity) mip[k] = globalMin;
   }
 
-  return mip;
+  return { data: mip, w: outW, h: outH };
 }
 
 const sliceImageDataCache: Record<string, ImageData> = {};
@@ -2691,12 +2903,26 @@ function preloadSlices(axis: 'axial' | 'coronal' | 'sagittal', currentIdx: numbe
 }
 
 function getOrCreateRenderer(axis: Axis): WebGLRenderer | null {
+  // GPU slice rendering is OPT-IN only (niftispy.renderBackend=webgl).
+  // The default 'auto' must keep using the CPU canvas2d painter: it is the
+  // only path that letterboxes each volume by its true physical aspect
+  // ratio and applies the per-image orientation flips, so every subject
+  // keeps its own size and orientation (ITK-SNAP-like). The GPU 3D-texture
+  // path stretches the volume texture across the full canvas and only
+  // honors the manual viewFlips — routed through it by default, every
+  // brain rendered identically sized/oriented.
   if (viewerConfig.renderBackend !== 'webgl' || !perfProfile.gpuAvailable) return null;
   const existing = glRenderers[axis];
   if (existing?.isReady()) return existing;
+  // Replace a dead renderer (e.g. after webglcontextlost destroyed it).
   const renderer = new WebGLRenderer();
   if (!renderer.init(canvases[axis])) return null;
   glRenderers[axis] = renderer;
+  // A fresh renderer has an empty 3D texture; re-upload in the background so
+  // the zero-CPU uniform-only slice path comes back after context loss.
+  if (volumeData && header) {
+    queueMicrotask(() => { tryUploadVolume3D(); });
+  }
   return renderer;
 }
 
@@ -2714,6 +2940,12 @@ async function getOrCreateWebGPURenderer(axis: Axis): Promise<WebGPURenderer | n
   const ok = await renderer.init(canvases[axis]);
   if (!ok) return null;
   webgpuRenderers[axis] = renderer;
+  // A fresh renderer has an empty 3D texture (init is async and usually
+  // completes long after tryUploadVolume3D ran); re-upload in the background
+  // so the WebGPU slice path actually becomes active.
+  if (volumeData && header) {
+    queueMicrotask(() => { tryUploadVolume3D(); });
+  }
   return renderer;
 }
 
@@ -2758,7 +2990,7 @@ function renderVolume3D(): void {
   viewMatrix[14] = -3.0 / volumeZoom;
   viewMatrix[15] = 1;
 
-  volumeRaycaster.render(viewMatrix, projMatrix, windowLevel - windowWidth * 0.5, windowWidth || 1);
+  volumeRaycaster.render(viewMatrix, projMatrix, windowLevel - windowWidth * 0.5, windowWidth || 1, globalMin, (globalMax - globalMin) || 1);
 }
 
 function setupVolumeInteraction(): void {
@@ -2862,7 +3094,8 @@ function paintSlice3D(axis: string, w: number, h: number, pixelW: number, pixelH
   const webgpuRenderer = webgpuRenderers[axis as Axis];
   if (renderBackend === 'webgpu' && webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
     axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz,
-    windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY
+    windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY,
+    dataSlope, dataInter, globalMin, (globalMax - globalMin) || 1
   )) {
     updateDirectionLabels(axis);
     updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
@@ -2919,9 +3152,14 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   // is expensive on every frame during scrolling/WL adjustment.
   const newW = dw * dpr;
   const newH = dh * dpr;
+  // CSS size MUST be synced every frame (the SBS painter already does this
+  // unconditionally). Gating it on a buffer-size change left stale CSS
+  // dimensions in place whenever the drawing buffer happened to be unchanged
+  // while the layout had moved on — the painted image then appeared shifted
+  // outside the container.
+  canvas.style.width = dw + 'px';
+  canvas.style.height = dh + 'px';
   if (canvas.width !== newW || canvas.height !== newH) {
-    canvas.style.width = dw + 'px';
-    canvas.style.height = dh + 'px';
     canvas.width = newW;
     canvas.height = newH;
   }
@@ -2937,28 +3175,11 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
   if (renderBackend !== 'canvas2d' && renderBackend !== 'webgl2d' && renderer && renderer.isVolume3DReady() && header) {
     const axisIdx = axis === 'axial' ? 0 : axis === 'coronal' ? 1 : 2;
 
-    // OffscreenCanvas path: delegate rendering to worker via render request queue
-    if (offscreenCanvasEnabled[axis as Axis]) {
-      enqueueRenderRequest({
-        axis: axis as Axis,
-        sliceIndex: sliceIdx[axis as Axis],
-        windowLevel: windowLevel - windowWidth * 0.5,
-        windowWidth: windowWidth || 1,
-        colormap,
-        flipX: flips.flipX,
-        flipY: flips.flipY,
-      });
-      updateDirectionLabels(axis);
-      updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
-      updateScaleBar(axis, pixelW, pixelH, zoom, cw);
-      updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
-      return;
-    }
-
     const webgpuRenderer = webgpuRenderers[axis as Axis];
     if (renderBackend === 'webgpu' && webgpuRenderer && webgpuRenderer.isReady() && webgpuRenderer.renderSlice3D(
       axisIdx, sliceIdx[axis as Axis], header.nx, header.ny, header.nz,
-      windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY
+      windowLevel - windowWidth * 0.5, windowWidth || 1, colormap, flips.flipX, flips.flipY,
+      dataSlope, dataInter, globalMin, (globalMax - globalMin) || 1
     )) {
       updateDirectionLabels(axis);
       updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
@@ -2984,6 +3205,42 @@ function paintSlice(axis: string, data: Float32Array, w: number, h: number, pixe
     updateScaleBar(axis, pixelW, pixelH, zoom, cw);
     updateMinimap(axis, w, h, zoom, panX, panY, cw, ch);
     return;
+  }
+
+  // ── Prefetch render-cache hit: skip the per-pixel normalize+colormap pass ──
+  // The prefetcher (requestIdleCallback) pre-renders neighboring slices into
+  // sliceRenderCache; until now that cache was write-only - scrolling back to
+  // a visited slice still paid the full CPU cost. Key includes colormap and
+  // window/level; the cache is cleared on image switch (applyImageState).
+  // Guard on volumeData: the cache is only populated in full-resolution mode
+  // (prefetch jobs require volumeData), and dims must match the current slice.
+  if (volumeData) {
+    const cachedCanvas = getCachedSliceRender(axis, sliceIdx[axis as Axis]);
+    if (cachedCanvas && cachedCanvas.width === w && cachedCanvas.height === h) {
+      const ctx = canvas.getContext('2d')!;
+      ctx.imageSmoothingEnabled = false;
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const imgLeft = (dw - cw) / 2 + panX;
+      const imgTop = (dh - ch) / 2 + panY;
+      const finalScaleX = flips.flipX ? -cw * dpr / w : cw * dpr / w;
+      const finalScaleY = flips.flipY ? ch * dpr / h : -ch * dpr / h;
+      const finalOffsetX = flips.flipX ? (imgLeft + cw) * dpr : imgLeft * dpr;
+      const finalOffsetY = flips.flipY ? imgTop * dpr : (imgTop + ch) * dpr;
+
+      ctx.save();
+      ctx.translate(finalOffsetX, finalOffsetY);
+      ctx.scale(finalScaleX, finalScaleY);
+      ctx.drawImage(cachedCanvas, 0, 0);
+      ctx.restore();
+
+      updateDirectionLabels(axis);
+      updateCrosshair(axis, w, h, zoom, panX, panY, cw, ch);
+      updateScaleBar(axis, pixelW, pixelH, zoom, cw);
+      updateMinimap(axis, w, h, zoom, panX, panY, cw, ch, data);
+      return;
+    }
   }
 
   const ctx = canvas.getContext('2d')!;
@@ -3255,6 +3512,31 @@ function getCoordLabelY(axis: string): { top: string; bottom: string } {
   }
 }
 
+// ── Container size cache: kill forced layouts in the scroll hot path ──
+// updateCrosshair runs up to 4x per scroll frame (paintSlice3D once +
+// updateAllCrosshairs 3x) and every call forced a synchronous layout via
+// getBoundingClientRect. Sizes only change on window/sidebar resize or
+// maximize toggle - all caught by a ResizeObserver.
+const containerSizeCache = new Map<string, { width: number; height: number }>();
+let containerSizeObserver: ResizeObserver | null = null;
+
+function getContainerSize(axis: string): { width: number; height: number } {
+  const cached = containerSizeCache.get(axis);
+  if (cached) return cached;
+  const container = canvases[axis as keyof typeof canvases]?.parentElement;
+  if (!container) return { width: 0, height: 0 };
+  if (!containerSizeObserver) {
+    try {
+      containerSizeObserver = new ResizeObserver(() => containerSizeCache.clear());
+    } catch { containerSizeObserver = null; }
+  }
+  containerSizeObserver?.observe(container);
+  const r = container.getBoundingClientRect();
+  const size = { width: r.width, height: r.height };
+  if (size.width > 0 && size.height > 0) containerSizeCache.set(axis, size);
+  return size;
+}
+
 function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, cw: number, ch: number) {
   const container = canvases[axis as keyof typeof canvases]?.parentElement;
   if (!container) return;
@@ -3263,8 +3545,22 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   const crosshairV = container.querySelector('.crosshair-v') as HTMLDivElement;
   if (!crosshair || !crosshairH || !crosshairV) return;
 
-  crosshair.style.display = crosshairVisible ? 'block' : 'none';
-  if (!crosshairVisible || !header) return;
+  // Side-by-side compare mode paints crosshairs INTO the canvas (one per
+  // image half, see paintSideBySideSlice, which also hides this DOM node).
+  // The DOM crosshair must stay hidden there: re-showing it — e.g. via
+  // updateAllCrosshairs() during a pan drag (updateSingleView compare
+  // branch) — rendered a SECOND, mispositioned crosshair (its position math
+  // assumes a single full-width image, not the SBS split layout) that only
+  // disappeared on the next full render (renderAllViews skips the call).
+  const sbsCompare = compareMode && compareLayout === 'sideBySide' && images.length >= 2;
+  crosshair.style.display = (crosshairVisible && !sbsCompare) ? 'block' : 'none';
+  // In compare mode the views are painted from the compare pair's geometry
+  // (img0), not the ACTIVE image — using the global header here put the
+  // crosshair at a different scale/position than the painted image whenever
+  // the user had switched the active image after entering compare.
+  const cmpActive = compareMode && images.length >= 2 ? cmpImg(0) : null;
+  const hActive = cmpActive ? cmpActive.header : header;
+  if (!crosshairVisible || sbsCompare || !hActive) return;
 
   const cursorX = sliceIdx.sagittal;
   const cursorY = sliceIdx.coronal;
@@ -3283,15 +3579,17 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
     sliceY = cursorZ;
   }
 
-  const nx_axis = axis === 'sagittal' ? header.ny : header.nx;
-  const ny_axis = axis === 'sagittal' ? header.nz : (axis === 'coronal' ? header.nz : header.ny);
+  const nx_axis = axis === 'sagittal' ? hActive.ny : hActive.nx;
+  const ny_axis = axis === 'sagittal' ? hActive.nz : (axis === 'coronal' ? hActive.nz : hActive.ny);
   const cx_norm = sliceX / (nx_axis - 1 || 1);
   const cy_norm = sliceY / (ny_axis - 1 || 1);
 
-  const containerRect = container.getBoundingClientRect();
+  // Cached container size (ResizeObserver-invalidated) - avoids a forced
+  // synchronous layout on every crosshair update in the scroll hot path.
+  const containerRect = getContainerSize(axis);
 
-  const pixelW = axis === 'axial' ? header.nx * header.dx : axis === 'coronal' ? header.nx * header.dx : header.ny * header.dy;
-  const pixelH = axis === 'axial' ? header.ny * header.dy : axis === 'coronal' ? header.nz * header.dz : header.nz * header.dz;
+  const pixelW = axis === 'axial' ? hActive.nx * hActive.dx : axis === 'coronal' ? hActive.nx * hActive.dx : hActive.ny * hActive.dy;
+  const pixelH = axis === 'axial' ? hActive.ny * hActive.dy : axis === 'coronal' ? hActive.nz * hActive.dz : hActive.nz * hActive.dz;
   const ar = pixelW / pixelH;
   let imgW: number, imgH: number;
   if (containerRect.width / containerRect.height > ar) { imgH = containerRect.height; imgW = imgH * ar; }
@@ -3302,7 +3600,9 @@ function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX:
   const imgLeft = (containerRect.width - imgW) / 2 + panX;
   const imgTop = (containerRect.height - imgH) / 2 + panY;
 
-  const flips = viewFlips[axis] || { flipX: false, flipY: false };
+  const flips = cmpActive
+    ? computeFlipsForHeader(hActive)[axis as 'axial' | 'coronal' | 'sagittal']
+    : (viewFlips[axis] || { flipX: false, flipY: false });
   const screenX = flips.flipX ? imgLeft + (1 - cx_norm) * imgW : imgLeft + cx_norm * imgW;
   const screenY = flips.flipY ? imgTop + cy_norm * imgH : imgTop + (1 - cy_norm) * imgH;
 
@@ -3468,7 +3768,10 @@ function renderAllViews() {
     });
   }
 
-  if (compareMode && images.length >= 2 && volumeData) {
+  if (compareMode && images.length >= 2) {
+    // The compare pair renders from its OWN image data — never gate this on
+    // the ACTIVE image's volumeData. Clicking an unloaded image in the picker
+    // must not collapse the overlay/SBS views into the single-image preview.
     renderCompareViews();
     return;
   }
@@ -3529,9 +3832,9 @@ function updateCoordInfoFromCenter() {
   const cz = sliceIdx.axial;
 
   if (compareMode && images.length >= 2) {
-    const img0 = images[0];
-    const img1 = images[1];
-    if (!img0.data || !img1.data) {
+    const img0 = cmpImg(0);
+    const img1 = cmpImg(1);
+    if (!img0?.data || !img1?.data) {
       coordEl.textContent = '';
       return;
     }
@@ -3589,8 +3892,9 @@ function extractSliceFromImage(img: VolumeImage, axis: 'axial' | 'coronal' | 'sa
 
 function renderCompareViews(changedAxis?: 'axial' | 'coronal' | 'sagittal') {
   if (images.length < 2) return;
-  const img0 = images[0];
-  const img1 = images[1];
+  const img0 = cmpImg(0);
+  const img1 = cmpImg(1);
+  if (!img0 || !img1) return;
   const h0 = img0.header;
   const h1 = img1.header;
 
@@ -3605,21 +3909,40 @@ function renderCompareViews(changedAxis?: 'axial' | 'coronal' | 'sagittal') {
   const axes: ('axial' | 'coronal' | 'sagittal')[] = changedAxis ? [changedAxis] : ['axial', 'coronal', 'sagittal'];
   for (const axis of axes) {
     const idx0 = axis === 'axial' ? sliceIdx.axial : axis === 'coronal' ? sliceIdx.coronal : sliceIdx.sagittal;
-    const slice0 = extractSliceFromImage(img0, axis, idx0);
-    const slice1 = extractSliceFromImage(img1, axis, img1Idx[axis]);
+    // Base slice: fall back to the low-res preview while the full volume is
+    // still loading (preview slices share the header's native slice dims).
+    const slice0 = img0.data
+      ? extractSliceFromImage(img0, axis, idx0)
+      : (img0.preview?.[axis] ?? new Float32Array(0));
+    // World-coordinate resampling is ONLY meaningful once img1 carries an
+    // align transform (Align button). Unaligned overlay simply stacks img1's
+    // native slice (like the SBS right half) — resampling an unregistered
+    // pair through world space blanks most of the layer when the two scans'
+    // origins/orientations differ.
+    const resample1 = !!img1.align;
+    const slice1r = resample1 && img1.data
+      ? resampleOverlaySlice(img0, img1, axis, idx0)
+      : null;
+    // img1 not yet loaded: skip the layer entirely (overlay), or show its
+    // native preview slice in the SBS right half.
+    const slice1 = slice1r ? slice1r.data
+      : img1.data ? extractSliceFromImage(img1, axis, img1Idx[axis])
+      : (img1.preview?.[axis] ?? new Float32Array(0));
     const w0 = axis === 'sagittal' ? h0.ny : h0.nx;
     const h0_ = axis === 'axial' ? h0.ny : h0.nz;
     const pw0 = axis === 'sagittal' ? h0.ny * h0.dy : h0.nx * h0.dx;
     const ph0 = axis === 'axial' ? h0.ny * h0.dy : h0.nz * h0.dz;
-    const w1 = axis === 'sagittal' ? h1.ny : h1.nx;
-    const h1_ = axis === 'axial' ? h1.ny : h1.nz;
-    const pw1 = axis === 'sagittal' ? h1.ny * h1.dy : h1.nx * h1.dx;
-    const ph1 = axis === 'axial' ? h1.ny * h1.dy : h1.nz * h1.dz;
+    // A resampled img1 slice spans img0's physical extent; only its pixel
+    // count differs from img0's grid when the aligned grid is finer.
+    const w1 = slice1r ? slice1r.w : (axis === 'sagittal' ? h1.ny : h1.nx);
+    const h1_ = slice1r ? slice1r.h : (axis === 'axial' ? h1.ny : h1.nz);
+    const pw1 = slice1r ? pw0 : (axis === 'sagittal' ? h1.ny * h1.dy : h1.nx * h1.dx);
+    const ph1 = slice1r ? ph0 : (axis === 'axial' ? h1.ny * h1.dy : h1.nz * h1.dz);
 
     if (compareLayout === 'sideBySide') {
-      paintSideBySideSlice(axis, slice0, slice1, w0, h0_, w1, h1_, pw0, ph0, pw1, ph1, img0, img1);
+      paintSideBySideSlice(axis, slice0, slice1, w0, h0_, w1, h1_, pw0, ph0, pw1, ph1, img0, img1, idx0, img1Idx[axis]);
     } else {
-      paintOverlaySlice(axis, slice0, slice1, w0, h0_, w1, h1_, pw0, ph0, pw1, ph1, img0, img1);
+      paintOverlaySlice(axis, slice0, slice1, w0, h0_, w1, h1_, pw0, ph0, pw1, ph1, img0, img1, idx0, img1Idx[axis]);
     }
 
     const overlayLabel = document.getElementById(`overlay-label-${axis}`);
@@ -3672,23 +3995,136 @@ function renderSliceToTempCanvas(data: Float32Array, w: number, h: number, imgMi
   return tc;
 }
 
+// ── Compare-mode slice canvas cache ──
+// renderCompareViews re-runs the per-pixel normalize+colormap pass for BOTH
+// images on every scroll frame (renderSliceToTempCanvas x2 per axis).
+// Cache the rendered canvases keyed by image uid + axis + slice index +
+// colormap + window/level so revisited slices blit instantly - the compare
+// counterpart of the single-image sliceRenderCache.
+const imageUidMap = new WeakMap<object, number>();
+let nextImageUid = 1;
+const compareSliceCanvasCache = new Map<string, { canvas: HTMLCanvasElement; timestamp: number }>();
+const COMPARE_CANVAS_CACHE_MAX = 24;
+
+function getImageUid(img: object): number {
+  let uid = imageUidMap.get(img);
+  if (uid === undefined) {
+    uid = nextImageUid++;
+    imageUidMap.set(img, uid);
+  }
+  return uid;
+}
+
+function renderSliceToTempCanvasCached(
+  img: VolumeImage, axis: string, sliceIndex: number,
+  data: Float32Array, w: number, h: number, useGlobalWindow?: boolean,
+): HTMLCanvasElement {
+  const key = `${getImageUid(img)}:${axis}:${sliceIndex}:${img.colormap}:` +
+    (useGlobalWindow ? `${windowWidth.toFixed(4)}:${windowLevel.toFixed(4)}` : 'auto');
+  const hit = compareSliceCanvasCache.get(key);
+  // Dimension guard: if the underlying volume data was replaced in place
+  // (LOD upgrade / reload) the slice geometry changes - a stale canvas would
+  // be blitted stretched. Evict and re-render instead.
+  if (hit && hit.canvas.width === w && hit.canvas.height === h) {
+    hit.timestamp = Date.now();
+    return hit.canvas;
+  }
+  if (hit) compareSliceCanvasCache.delete(key);
+  const tc = renderSliceToTempCanvas(data, w, h, img.min, img.max, img.colormap, useGlobalWindow);
+  compareSliceCanvasCache.set(key, { canvas: tc, timestamp: Date.now() });
+  if (compareSliceCanvasCache.size > COMPARE_CANVAS_CACHE_MAX) {
+    const entries = [...compareSliceCanvasCache.entries()].sort((a, b) => a[1].timestamp - b[1].timestamp);
+    for (let i = 0; i < entries.length - COMPARE_CANVAS_CACHE_MAX; i++) {
+      compareSliceCanvasCache.delete(entries[i][0]);
+    }
+  }
+  return tc;
+}
+
+// World-plane display grid for an ALIGNED img1 slice. The slice plane is
+// img0's (reference) axis slice spanning img0's physical extent, but it is
+// sampled at the finer of the two images' in-plane voxel steps. The moving
+// image therefore keeps its native resolution on screen (ITK-SNAP-style
+// display-time resampling only — its data is never rewritten), while the
+// stored align transform supplies position/rotation/scale.
+function alignedSliceGrid(
+  img0: VolumeImage, img1: VolumeImage,
+  axis: 'axial' | 'coronal' | 'sagittal',
+): { outW: number; outH: number; stepU: number; stepV: number } {
+  const h0 = img0.header;
+  // img1's world-space voxel size implied by the stored transform M
+  // (world mm -> moving voxels): one mm along world axis i maps to
+  // |column i of M| voxels, so the voxel pitch along that axis is 1/|col i|.
+  const m = img1.align!.m;
+  const c0 = Math.hypot(m[0], m[4], m[8]);
+  const c1 = Math.hypot(m[1], m[5], m[9]);
+  const c2 = Math.hypot(m[2], m[6], m[10]);
+  const s1 = [1 / (c0 || 1), 1 / (c1 || 1), 1 / (c2 || 1)];
+  let stepW: number, stepH: number, extW: number, extH: number;
+  if (axis === 'axial') {
+    stepW = Math.min(h0.dx, s1[0]); stepH = Math.min(h0.dy, s1[1]);
+    extW = h0.nx * h0.dx; extH = h0.ny * h0.dy;
+  } else if (axis === 'coronal') {
+    stepW = Math.min(h0.dx, s1[0]); stepH = Math.min(h0.dz, s1[2]);
+    extW = h0.nx * h0.dx; extH = h0.nz * h0.dz;
+  } else {
+    stepW = Math.min(h0.dy, s1[1]); stepH = Math.min(h0.dz, s1[2]);
+    extW = h0.ny * h0.dy; extH = h0.nz * h0.dz;
+  }
+  // Safety cap: never build a display grid denser than 4096 px per side.
+  stepW = Math.max(stepW, extW / 4096);
+  stepH = Math.max(stepH, extH / 4096);
+  // Convert physical steps to fractional img0 voxel steps so the sampler can
+  // walk the plane through voxelToWorld (exact even for a rotated sform).
+  let stepU: number, stepV: number;
+  if (axis === 'axial') { stepU = stepW / h0.dx; stepV = stepH / h0.dy; }
+  else if (axis === 'coronal') { stepU = stepW / h0.dx; stepV = stepH / h0.dz; }
+  else { stepU = stepW / h0.dy; stepV = stepH / h0.dz; }
+  return {
+    outW: Math.max(1, Math.round(extW / stepW)),
+    outH: Math.max(1, Math.round(extH / stepH)),
+    stepU, stepV,
+  };
+}
+
 function resampleOverlaySlice(
   img0: VolumeImage, img1: VolumeImage,
   axis: 'axial' | 'coronal' | 'sagittal',
   sliceIdx0: number
-): Float32Array {
+): { data: Float32Array; w: number; h: number } {
+  // Runs on every scroll frame; cache results per (image pair state, axis,
+  // slice). Invalidate on align change via the explicit clear in
+  // finishRegistration.
+  const aligned = !!img1.align;
+  // Key includes BOTH images' identity (the sample grid is img0's!) and the
+  // data byte length so a preview→full-resolution upgrade naturally
+  // invalidates stale slices.
+  const cacheKey = `${getImageUid(img0)}:${getImageUid(img1)}:` +
+    `${img1.align ? img1.align.m.join(',') : 'native'}:` +
+    `${img1.data ? img1.data.byteLength : 0}:${axis}:${sliceIdx0}`;
+
+  let outW: number, outH: number;
+  let grid: { outW: number; outH: number; stepU: number; stepV: number } | null = null;
+  if (aligned) {
+    grid = alignedSliceGrid(img0, img1, axis);
+    outW = grid.outW; outH = grid.outH;
+  } else {
+    const h0 = img0.header;
+    if (axis === 'axial') { outW = h0.nx; outH = h0.ny; }
+    else if (axis === 'coronal') { outW = h0.nx; outH = h0.nz; }
+    else { outW = h0.ny; outH = h0.nz; }
+  }
+
+  const cached = overlayResampleCache.get(cacheKey);
+  if (cached) return { data: cached, w: outW, h: outH };
+
   const h0 = img0.header;
   const h1 = img1.header;
   const d0 = img0.data;
   const d1 = img1.data;
 
-  let outW: number, outH: number;
-  if (axis === 'axial') { outW = h0.nx; outH = h0.ny; }
-  else if (axis === 'coronal') { outW = h0.nx; outH = h0.nz; }
-  else { outW = h0.ny; outH = h0.nz; }
-
   const result = new Float32Array(outW * outH);
-  if (!d0 || !d1) return result;
+  if (!d0 || !d1) return { data: result, w: outW, h: outH };
 
   const n1x = h1.nx, n1y = h1.ny, n1z = h1.nz;
   const elem1 = h1.datatype === 64 ? 8 : h1.datatype === 8 || h1.datatype === 16 || h1.datatype === 768 ? 4 : h1.datatype === 4 || h1.datatype === 512 ? 2 : 1;
@@ -3730,7 +4166,17 @@ function resampleOverlaySlice(
   for (let j = 0; j < outH; j++) {
     for (let i = 0; i < outW; i++) {
       let vx0: number, vy0: number, vz0: number;
-      if (axis === 'axial') {
+      if (grid) {
+        // Aligned display grid: fractional img0 voxel coords so consecutive
+        // output pixels advance by a fixed PHYSICAL step (the finer of the
+        // two images' in-plane voxel pitches). img1 is thus sampled at its
+        // native resolution instead of being forced onto img0's grid.
+        const u = i * grid.stepU;
+        const v = j * grid.stepV;
+        if (axis === 'axial') { vx0 = u; vy0 = v; vz0 = sliceIdx0; }
+        else if (axis === 'coronal') { vx0 = u; vy0 = sliceIdx0; vz0 = v; }
+        else { vx0 = sliceIdx0; vy0 = u; vz0 = v; }
+      } else if (axis === 'axial') {
         vx0 = i; vy0 = j; vz0 = sliceIdx0;
       } else if (axis === 'coronal') {
         vx0 = i; vy0 = sliceIdx0; vz0 = j;
@@ -3739,79 +4185,143 @@ function resampleOverlaySlice(
       }
 
       const [wx, wy, wz] = voxelToWorld(h0, vx0, vy0, vz0);
-      const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+      let vx1: number, vy1: number, vz1: number;
+      if (img1.align) {
+        // Aligned display: sample the ORIGINAL full-resolution moving data
+        // through the stored world->moving-voxel transform (ITK-SNAP style).
+        // The native header mapping is intentionally NOT applied on top.
+        const m = img1.align.m;
+        vx1 = m[0] * wx + m[1] * wy + m[2] * wz + m[3];
+        vy1 = m[4] * wx + m[5] * wy + m[6] * wz + m[7];
+        vz1 = m[8] * wx + m[9] * wy + m[10] * wz + m[11];
+      } else {
+        [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+      }
 
       const val = getVoxel1Lerp(vx1, vy1, vz1);
       result[j * outW + i] = isNaN(val) ? 0 : val;
     }
   }
 
-  return result;
+  if (overlayResampleCache.size >= OVERLAY_RESAMPLE_CACHE_MAX) {
+    const firstKey = overlayResampleCache.keys().next().value as string;
+    if (firstKey !== undefined) overlayResampleCache.delete(firstKey);
+  }
+  overlayResampleCache.set(cacheKey, result);
+  return { data: result, w: outW, h: outH };
+}
+
+// Overlay slice resample cache (img1 resampled onto img0's grid). Keyed by
+// img1 uid + align transform + axis + slice; FIFO-evicted.
+const overlayResampleCache = new Map<string, Float32Array>();
+const OVERLAY_RESAMPLE_CACHE_MAX = 18;
+
+/**
+ * Nearest-voxel intensity of `img` at a world point, honoring a stored align
+ * transform if present. Used by hover/coordinate readouts in compare mode.
+ * Returns null when the point falls outside the volume.
+ */
+function sampleImageAtWorld(img: VolumeImage, wx: number, wy: number, wz: number): number | null {
+  if (!img.data) return null;
+  const h = img.header;
+  let vx: number, vy: number, vz: number;
+  if (img.align) {
+    const m = img.align.m;
+    vx = m[0] * wx + m[1] * wy + m[2] * wz + m[3];
+    vy = m[4] * wx + m[5] * wy + m[6] * wz + m[7];
+    vz = m[8] * wx + m[9] * wy + m[10] * wz + m[11];
+  } else {
+    [vx, vy, vz] = worldToVoxel(h, wx, wy, wz);
+  }
+  const ix = Math.round(vx), iy = Math.round(vy), iz = Math.round(vz);
+  if (ix < 0 || ix >= h.nx || iy < 0 || iy >= h.ny || iz < 0 || iz >= h.nz) return null;
+  return (img.data as any)[iz * h.ny * h.nx + iy * h.nx + ix] * (img.slope || 1) + (img.inter || 0);
 }
 
 function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Array,
   w0: number, h0_: number, w1: number, h1_: number,
   pw0: number, ph0: number, pw1: number, ph1: number,
-  img0: VolumeImage, img1: VolumeImage) {
+  img0: VolumeImage, img1: VolumeImage,
+  idx0: number, idx1: number) {
+  void pw1; void ph1; void idx1; // overlay draws both slices on img0's world plane
   const canvas = canvases[axis as keyof typeof canvases];
-  if (!canvas || !data0) return;
+  if (!canvas || !data0 || data0.length === 0) return;
 
   const vs = viewState[axis as keyof typeof viewState] as { zoom: number; panX: number; panY: number };
   const zoom = vs.zoom;
+  const panX = vs.panX;
+  const panY = vs.panY;
   const dpr = window.devicePixelRatio || 1;
   const container = canvas.parentElement!;
   const dw = container.clientWidth;
   const dh = container.clientHeight;
   if (dw === 0 || dh === 0) return;
 
-  // Use unified physical extent for consistent overlay alignment
-  const unifiedPW = Math.max(pw0, pw1);
-  const unifiedPH = Math.max(ph0, ph1);
-  const ar = unifiedPW / unifiedPH;
+  // Geometry identical to paintSlice: full-container canvas, image box sized
+  // by physical aspect, centered + panned. This keeps left-drag panning and
+  // click-to-position working exactly like the single-image views (previously
+  // the overlay painter resized the canvas to the image and dropped pan,
+  // so dragging only moved the crosshair, never the image).
+  const ar = pw0 / ph0;
   let cw: number, ch: number;
   if (dw / dh > ar) { ch = dh; cw = Math.floor(dh * ar); }
   else { cw = dw; ch = Math.floor(dw / ar); }
   cw = Math.floor(cw * zoom);
   ch = Math.floor(ch * zoom);
 
-  canvas.style.width = cw + 'px';
-  canvas.style.height = ch + 'px';
-  canvas.width = cw * dpr;
-  canvas.height = ch * dpr;
+  const newW = dw * dpr;
+  const newH = dh * dpr;
+  // CSS size MUST be synced every frame (the SBS painter already does this
+  // unconditionally). Gating it on a buffer-size change left stale CSS
+  // dimensions in place whenever the drawing buffer happened to be unchanged
+  // while the layout had moved on — the painted image then appeared shifted
+  // outside the container.
+  canvas.style.width = dw + 'px';
+  canvas.style.height = dh + 'px';
+  if (canvas.width !== newW || canvas.height !== newH) {
+    canvas.width = newW;
+    canvas.height = newH;
+  }
 
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
-
-  const flips0 = img0.header ? computeFlipsForHeader(img0.header)[axis as 'axial' | 'coronal' | 'sagittal'] : { flipX: false, flipY: false };
-  const flips1 = img1.header ? computeFlipsForHeader(img1.header)[axis as 'axial' | 'coronal' | 'sagittal'] : { flipX: false, flipY: false };
-
-  const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, img0.colormap, true);
-
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  const offsetX = (canvas.width - cw * dpr) / 2;
-  const offsetY = (canvas.height + ch * dpr) / 2;
+  // Orientation flips MUST come from img0's own header — never from the
+  // global viewFlips, which tracks the ACTIVE image and diverges from the
+  // compare pair as soon as the user picks another image in the list (the
+  // SBS painter already computes per-image flips for exactly this reason).
+  const flips = computeFlipsForHeader(img0.header)[axis as 'axial' | 'coronal' | 'sagittal'];
+  const imgLeft = (dw - cw) / 2 + panX;
+  const imgTop = (dh - ch) / 2 + panY;
+  const scaleX = flips.flipX ? -cw * dpr / w0 : cw * dpr / w0;
+  const scaleY = flips.flipY ? ch * dpr / h0_ : -ch * dpr / h0_;
+  const offsetX = flips.flipX ? (imgLeft + cw) * dpr : imgLeft * dpr;
+  const offsetY = flips.flipY ? imgTop * dpr : (imgTop + ch) * dpr;
 
-  // Draw base image (img0) scaled to unified physical extent
+  const tc0 = renderSliceToTempCanvasCached(img0, axis, idx0, data0, w0, h0_, true);
+
   ctx.save();
   ctx.translate(offsetX, offsetY);
-  ctx.scale(flips0.flipX ? -cw * dpr / w0 : cw * dpr / w0, flips0.flipY ? ch * dpr / h0_ : -ch * dpr / h0_);
-  if (flips0.flipX) ctx.translate(-w0, 0);
-  if (flips0.flipY) ctx.translate(0, -h0_);
+  ctx.scale(scaleX, scaleY);
   ctx.globalAlpha = 1.0;
   ctx.drawImage(tc0, 0, 0);
   ctx.restore();
 
-  // Draw overlay image (img1) using pre-registered data1
+  // Overlay image (img1) — same screen rect as img0 (same physical extent)
+  // but drawn with its own pixel dims. Flips follow the SBS painter's rule:
+  // an ALIGNED slice was resampled in img0's voxel frame (use img0's flips);
+  // a NATIVE slice is in img1's storage order (use img1's own flips).
   if (data1 && data1.length > 0) {
-    const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap, true);
+    const flips1 = img1.align ? flips : computeFlipsForHeader(img1.header)[axis as 'axial' | 'coronal' | 'sagittal'];
+    const tc1 = renderSliceToTempCanvasCached(img1, axis, idx0, data1, w1, h1_, true);
+    const scaleX1 = flips1.flipX ? -cw * dpr / w1 : cw * dpr / w1;
+    const scaleY1 = flips1.flipY ? ch * dpr / h1_ : -ch * dpr / h1_;
 
     ctx.save();
     ctx.translate(offsetX, offsetY);
-    ctx.scale(flips1.flipX ? -cw * dpr / w1 : cw * dpr / w1, flips1.flipY ? ch * dpr / h1_ : -ch * dpr / h1_);
-    if (flips1.flipX) ctx.translate(-w1, 0);
-    if (flips1.flipY) ctx.translate(0, -h1_);
+    ctx.scale(scaleX1, scaleY1);
     ctx.globalAlpha = overlayOpacity;
     ctx.drawImage(tc1, 0, 0);
     ctx.restore();
@@ -3820,17 +4330,19 @@ function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Arra
   ctx.globalAlpha = 1.0;
 
   updateDirectionLabels(axis);
-  updateCrosshair(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch);
+  updateCrosshair(axis, w0, h0_, zoom, panX, panY, cw, ch);
   updateScaleBar(axis, pw0, ph0, zoom, cw);
-  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch);
+  updateMinimap(axis, w0, h0_, zoom, panX, panY, cw, ch, data0);
 }
 
 function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32Array,
   w0: number, h0_: number, w1: number, h1_: number,
   pw0: number, ph0: number, pw1: number, ph1: number,
-  img0: VolumeImage, img1: VolumeImage) {
+  img0: VolumeImage, img1: VolumeImage,
+  idx0: number, idx1: number) {
   const canvas = canvases[axis as keyof typeof canvases];
-  if (!canvas || !data0 || !data1) return;
+  // The right half may be absent while img1 is still loading — draw img0 only.
+  if (!canvas || !data0 || data0.length === 0) return;
 
   const vs = viewState[axis as keyof typeof viewState] as { zoom: number; panX: number; panY: number };
   const zoom = vs.zoom;
@@ -3863,7 +4375,9 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   ctx.imageSmoothingEnabled = false;
 
   const tc0 = renderSliceToTempCanvas(data0, w0, h0_, img0.min, img0.max, img0.colormap, true);
-  const tc1 = renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap, true);
+  const tc1 = data1 && data1.length > 0
+    ? renderSliceToTempCanvas(data1, w1, h1_, img1.min, img1.max, img1.colormap, true)
+    : null;
 
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -3889,20 +4403,25 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   ctx.restore();
 
   // Right half: img1 with unified scale (same physical size as img0)
-  const imgLeft1 = halfW + (halfW - cw) / 2 + vs.panX;
-  const imgTop1 = (dh - ch) / 2 + vs.panY;
-  const offsetX1 = imgLeft1 * dpr;
-  const offsetY1 = (imgTop1 + ch) * dpr;
-  ctx.save();
-  ctx.beginPath();
-  ctx.rect(halfW * dpr, 0, (dw - halfW) * dpr, dh * dpr);
-  ctx.clip();
-  ctx.translate(offsetX1, offsetY1);
-  ctx.scale(flips1.flipX ? -cw * dpr / w1 : cw * dpr / w1, flips1.flipY ? ch * dpr / h1_ : -ch * dpr / h1_);
-  if (flips1.flipX) ctx.translate(-w1, 0);
-  if (flips1.flipY) ctx.translate(0, -h1_);
-  ctx.drawImage(tc1, 0, 0);
-  ctx.restore();
+  // When img1 carries an align transform its slice was resampled into img0's
+  // storage order, so it must be drawn with img0's flips, not its own.
+  if (tc1) {
+    const drawFlips1 = img1.align ? flips0 : flips1;
+    const imgLeft1 = halfW + (halfW - cw) / 2 + vs.panX;
+    const imgTop1 = (dh - ch) / 2 + vs.panY;
+    const offsetX1 = imgLeft1 * dpr;
+    const offsetY1 = (imgTop1 + ch) * dpr;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(halfW * dpr, 0, (dw - halfW) * dpr, dh * dpr);
+    ctx.clip();
+    ctx.translate(offsetX1, offsetY1);
+    ctx.scale(drawFlips1.flipX ? -cw * dpr / w1 : cw * dpr / w1, drawFlips1.flipY ? ch * dpr / h1_ : -ch * dpr / h1_);
+    if (drawFlips1.flipX) ctx.translate(-w1, 0);
+    if (drawFlips1.flipY) ctx.translate(0, -h1_);
+    ctx.drawImage(tc1, 0, 0);
+    ctx.restore();
+  }
 
   ctx.strokeStyle = 'rgba(233,69,96,0.7)';
   ctx.lineWidth = 2 * dpr;
@@ -3941,22 +4460,33 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
     ctx.stroke();
 
     const h1 = img1.header;
-    const [wx, wy, wz] = voxelToWorld(h0, cursorX, cursorY, cursorZ);
-    const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
-    let sliceX1: number, sliceY1: number;
-    if (axis === 'axial') { sliceX1 = Math.round(vx1); sliceY1 = Math.round(vy1); }
-    else if (axis === 'coronal') { sliceX1 = Math.round(vx1); sliceY1 = Math.round(vz1); }
-    else { sliceX1 = Math.round(vy1); sliceY1 = Math.round(vz1); }
-    const nx1 = axis === 'sagittal' ? h1.ny : h1.nx;
-    const ny1 = axis === 'sagittal' ? h1.nz : (axis === 'coronal' ? h1.nz : h1.ny);
-    const cx1 = Math.max(0, Math.min(1, sliceX1 / (nx1 - 1 || 1)));
-    const cy1 = Math.max(0, Math.min(1, sliceY1 / (ny1 - 1 || 1)));
+    // Aligned right half: the displayed slice was resampled in img0's voxel
+    // frame, so its crosshair fraction is identical to the left half's.
+    // Unaligned right half: map the crosshair world position into img1's
+    // native voxel frame.
+    let cx1: number, cy1: number, flipX1: boolean, flipY1: boolean;
+    if (img1.align) {
+      cx1 = cx0; cy1 = cy0;
+      flipX1 = flips0.flipX; flipY1 = flips0.flipY;
+    } else {
+      const [wx, wy, wz] = voxelToWorld(h0, cursorX, cursorY, cursorZ);
+      const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
+      let sliceX1: number, sliceY1: number;
+      if (axis === 'axial') { sliceX1 = Math.round(vx1); sliceY1 = Math.round(vy1); }
+      else if (axis === 'coronal') { sliceX1 = Math.round(vx1); sliceY1 = Math.round(vz1); }
+      else { sliceX1 = Math.round(vy1); sliceY1 = Math.round(vz1); }
+      const nx1 = axis === 'sagittal' ? h1.ny : h1.nx;
+      const ny1 = axis === 'sagittal' ? h1.nz : (axis === 'coronal' ? h1.nz : h1.ny);
+      cx1 = Math.max(0, Math.min(1, sliceX1 / (nx1 - 1 || 1)));
+      cy1 = Math.max(0, Math.min(1, sliceY1 / (ny1 - 1 || 1)));
+      flipX1 = flips1.flipX; flipY1 = flips1.flipY;
+    }
 
     // Use unified cw/ch for crosshair positioning (same pan as rendering)
     const imgLeft1 = halfW + (halfW - cw) / 2 + vs.panX;
     const imgTop1 = (dh - ch) / 2 + vs.panY;
-    const cx1_screen = flips1.flipX ? 1 - cx1 : cx1;
-    const cy1_screen = flips1.flipY ? cy1 : 1 - cy1;
+    const cx1_screen = flipX1 ? 1 - cx1 : cx1;
+    const cy1_screen = flipY1 ? cy1 : 1 - cy1;
     const sx1 = (imgLeft1 + cx1_screen * cw) * dpr;
     const sy1 = (imgTop1 + cy1_screen * ch) * dpr;
 
@@ -3974,18 +4504,16 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
 
   updateDirectionLabels(axis);
   updateScaleBar(axis, pw0, ph0, zoom, cw);
-  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch);
+  updateMinimap(axis, w0, h0_, zoom, vs.panX, vs.panY, cw, ch, data0);
 }
 
-function paintMIP() {
+function paintMIP(interactive = false) {
   if (!header || !volumeData) return;
-  const { nx, ny, nz, dx, dy, dz } = header;
-  const mipData = computeMIP(viewState.mip.rotationX, viewState.mip.rotationY);
+  const mip = computeMIP(viewState.mip.rot, interactive);
+  const outW = mip.w, outH = mip.h;
+  if (!outW || !outH) return;
 
-  const scaleCorr = dz / Math.sqrt(dx * dy);
-  const pixelW = nx * dx * scaleCorr;
-  const pixelH = ny * dy;
-
+  // MIP pixels are square in world mm, so aspect = outW / outH directly
   const canvas = canvases.mip;
   const dpr = window.devicePixelRatio || 1;
   const container = canvas.parentElement!;
@@ -3993,7 +4521,7 @@ function paintMIP() {
   const dh = container.clientHeight;
   if (dw === 0 || dh === 0) return;
 
-  const ar = pixelW / pixelH;
+  const ar = outW / outH;
   let cw: number, ch: number;
   if (dw / dh > ar) { ch = dh; cw = Math.floor(dh * ar); }
   else { cw = dw; ch = Math.floor(dw / ar); }
@@ -4006,7 +4534,7 @@ function paintMIP() {
   const ctx = canvas.getContext('2d')!;
   ctx.imageSmoothingEnabled = false;
 
-  const imgData = ctx.createImageData(nx, ny);
+  const imgData = ctx.createImageData(outW, outH);
   const pixels = imgData.data;
   const cmapFn = COLORMAPS[colormap] || COLORMAPS.gray;
   const lo = windowLevel - windowWidth * 0.5;
@@ -4014,8 +4542,8 @@ function paintMIP() {
   const range = hi - lo || 1;
   const dataRange = globalMax - globalMin || 1;
 
-  for (let i = 0; i < nx * ny; i++) {
-    const norm = (mipData[i] - globalMin) / dataRange;
+  for (let i = 0; i < outW * outH; i++) {
+    const norm = (mip.data[i] - globalMin) / dataRange;
     const t = Math.max(0, Math.min(1, (norm - lo) / range));
     const [r, g, b] = cmapFn(t);
     const idx = i * 4;
@@ -4023,16 +4551,56 @@ function paintMIP() {
   }
 
   const tc = document.createElement('canvas');
-  tc.width = nx; tc.height = ny;
+  tc.width = outW; tc.height = outH;
   const tctx = tc.getContext('2d')!;
   tctx.putImageData(imgData, 0, 0);
-  
+
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(tc, 0, 0, canvas.width, canvas.height);
 }
 
+// rAF-coalesced MIP renders: at most one per display frame. `interactive`
+// tracks whether any pending request came from an active drag — dragging
+// renders a cheaper preview, idle renders (and drag end) render full quality.
+let mipRenderScheduled = false;
+let mipInteractivePending = false;
+
+function scheduleMIPRender(interactive: boolean): void {
+  mipInteractivePending = mipInteractivePending || interactive;
+  if (mipRenderScheduled) return;
+  mipRenderScheduled = true;
+  requestAnimationFrame(() => {
+    mipRenderScheduled = false;
+    const wasInteractive = mipInteractivePending;
+    mipInteractivePending = false;
+    paintMIP(wasInteractive);
+  });
+}
+
+// ── rAF-coalesced single-view renders ──
+// Trackpad/wheel events can fire faster than the display refresh; rendering
+// synchronously per threshold crossing painted 2-3x per frame. sliceIdx
+// state updates immediately (UI logic stays consistent); only the paint is
+// batched to at most one per axis per display frame.
+const pendingAxisRenders = new Set<'axial' | 'coronal' | 'sagittal'>();
+let axisRenderTimer: number | null = null;
+
+function scheduleSingleViewRender(axis: 'axial' | 'coronal' | 'sagittal'): void {
+  pendingAxisRenders.add(axis);
+  if (axisRenderTimer !== null) return;
+  axisRenderTimer = requestAnimationFrame(() => {
+    axisRenderTimer = null;
+    const axes = [...pendingAxisRenders];
+    pendingAxisRenders.clear();
+    for (const a of axes) updateSingleView(a);
+  });
+}
+
 function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
+  // A direct synchronous call supersedes any scheduled render for this axis
+  // (prevents double-painting when bulk paths like renderAllViews run).
+  pendingAxisRenders.delete(axis);
   if (!header) return;
   const { nx, ny, nz, dx, dy, dz } = header;
 
@@ -4180,7 +4748,8 @@ function autoContrast() {
   // Secondary volume (img1) in compare mode — sample and normalize
   // using img1's own range so the W/L works for both images.
   if (compareMode && images.length >= 2) {
-    const img1 = images[1];
+    const img1 = cmpImg(1);
+    if (!img1) return;
     const range1 = img1.max - img1.min || 1;
     if (img1.data && img1.data.length > 0) {
       const d1 = img1.data;
@@ -4233,7 +4802,7 @@ function resetViews() {
   viewState.axial = { zoom: 1, panX: 0, panY: 0 };
   viewState.coronal = { zoom: 1, panX: 0, panY: 0 };
   viewState.sagittal = { zoom: 1, panX: 0, panY: 0 };
-  viewState.mip = { rotationX: 0, rotationY: 0 };
+  viewState.mip = { rot: MIP_IDENTITY.slice() };
 
   windowWidth = initialWindowWidth;
   windowLevel = initialWindowLevel;
@@ -4544,6 +5113,315 @@ let chunkedState: {
 } | null = null;
 let chunkedGeneration = 0;
 
+// ─────────────────────────────────────────────────────────────────────────
+// Registration to template space (MNI standard / custom) — sidebar flow.
+// The affine search runs in a dedicated regWorker; this section only wires
+// the sidebar buttons, mirrors progress into the status box, and stores the
+// estimated transform on the moving image (ITK-SNAP style: the original
+// volume data is never resampled or modified).
+// ─────────────────────────────────────────────────────────────────────────
+
+let regWorker: Worker | null = null;
+let regBusy = false;
+// Which flow produced the running registration: 'register' aligns the active
+// image to an MNI/custom template; 'align' aligns one compared image onto the
+// other (chosen reference). Indices captured at launch survive user switching.
+let regFlow: 'register' | 'align' = 'register';
+let regSourceIdx = -1;   // image the transform will be attached to (moving)
+let regRefIdx = -1;      // reference image index (align flow only)
+
+async function ensureRegWorkerUrl(): Promise<string> {
+  if ((window as any).__NII_REG_WORKER_BLOB_URL__) return (window as any).__NII_REG_WORKER_BLOB_URL__;
+  const resp = await fetch((window as any).REG_WORKER_URL);
+  if (!resp.ok) throw new Error(`Reg worker fetch failed: ${resp.status}`);
+  const src = await resp.text();
+  const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+  (window as any).__NII_REG_WORKER_BLOB_URL__ = url;
+  return url;
+}
+
+function setRegButtonsEnabled(enabled: boolean): void {
+  for (const id of ['btn-reg-mni', 'btn-reg-custom', 'btn-align'] as const) {
+    const b = document.getElementById(id) as HTMLButtonElement | null;
+    if (b) b.disabled = !enabled;
+  }
+}
+
+/** kind 'idle' resets the box to neutral text; 'busy' shows the progress track. */
+function showRegStatus(kind: 'busy' | 'ok' | 'fail' | 'idle', text: string, pct?: number): void {
+  const box = document.getElementById('reg-status');
+  const txt = document.getElementById('reg-status-text');
+  const fill = document.getElementById('reg-fill');
+  if (!box || !txt || !fill) return;
+  box.classList.remove('reg-hidden', 'busy', 'ok', 'fail');
+  txt.textContent = text;
+  if (kind === 'busy') {
+    box.classList.add('busy');
+    fill.style.width = `${Math.max(0, Math.min(100, Math.round((pct ?? 0) * 100)))}%`;
+  } else if (kind !== 'idle') {
+    box.classList.add(kind);
+    fill.style.width = kind === 'ok' ? '100%' : '0%';
+  }
+  setRegButtonsEnabled(kind !== 'busy');
+  const cancelBtn = document.getElementById('btn-reg-cancel') as HTMLButtonElement | null;
+  if (cancelBtn) cancelBtn.style.display = kind === 'busy' ? 'inline-block' : 'none';
+}
+
+function terminateRegWorker(): void {
+  if (regWorker) { regWorker.terminate(); regWorker = null; }
+  regBusy = false;
+}
+
+function startRegistration(mode: 'mni' | 'custom'): void {
+  if (regBusy) return;
+  // Registration needs every voxel of the source volume, not a slice cache.
+  if (!header || !volumeData || !fullVolumeLoaded) {
+    showRegStatus('fail', 'Load the full volume first — registration needs all voxels.');
+    return;
+  }
+  regBusy = true;
+  regFlow = 'register';
+  regSourceIdx = activeImageIdx;
+  regRefIdx = -1;
+  showRegStatus('busy',
+    mode === 'mni' ? 'Resolving MNI template…' : 'Pick a template volume…', 0);
+  vscode.postMessage({ type: 'getTemplate', mode });
+}
+
+async function cancelRegistration(): Promise<void> {
+  if (!regBusy) return;
+  terminateRegWorker();
+  showRegStatus('idle', 'Registration cancelled.');
+}
+
+function handleRegProgress(d: any): void {
+  if (!regBusy) return;
+  showRegStatus('busy', d.phase ? `${d.phase}… ${Math.round((d.pct ?? 0) * 100)}%` : 'Registering…', d.pct);
+}
+
+function handleRegFailure(message: string, cancelled: boolean): void {
+  terminateRegWorker();
+  if (cancelled) showRegStatus('idle', 'Registration cancelled.');
+  else showRegStatus('fail', `Registration failed: ${message}`);
+  console.error('[NiftiSpy] Registration:', message);
+}
+
+async function launchRegWorker(m: any): Promise<void> {
+  try {
+    showRegStatus('busy', `Registering to ${m.name}…`, 0);
+    const srcImg = images[regSourceIdx];
+    if (!srcImg?.data) throw new Error('Source volume missing');
+    const h = srcImg.header;
+    const src = srcImg.data;
+    // Platform-ordered float copy of the leading sub-volume (4D inputs
+    // contribute their first timepoint). Shipping decoded values instead of
+    // raw bytes keeps endianness handling identical to what is on screen;
+    // slope/inter are forwarded so the optimizer sees the shown intensities.
+    const vox3d = h.nx * h.ny * h.nz;
+    const floats = new Float32Array(vox3d);
+    const lim = Math.min(vox3d, src.length);
+    for (let i = 0; i < lim; i++) floats[i] = src[i];
+
+    const old = regWorker;
+    regWorker = new Worker(await ensureRegWorkerUrl());
+    old?.terminate();
+
+    const w = regWorker;
+    w.onmessage = (ev: MessageEvent) => {
+      const d = ev.data;
+      if (d?.type === 'regProgress') handleRegProgress(d);
+      else if (d?.type === 'regResult') finishRegistration(d);
+      else if (d?.type === 'regError') handleRegFailure(d.message || 'Registration failed', false);
+    };
+    w.onerror = () => handleRegFailure('Registration worker crashed', false);
+
+    const msg: any = {
+      type: 'initReg',
+      mode: m.mode,
+      tplName: m.name,
+      moving: {
+        data: floats.buffer,
+        datatype: 16,
+        littleEndian: true,
+        slope: srcImg.slope || 1,
+        inter: srcImg.inter || 0,
+        dims: [h.nx, h.ny, h.nz],
+        srow_x: h.srow_x,
+        srow_y: h.srow_y,
+        srow_z: h.srow_z,
+      },
+      template: new Uint8Array(m.bytes),
+    };
+    // Compare-mode Align flow: the reference is another loaded image, shipped
+    // as a pre-decoded volume instead of NIfTI bytes.
+    if (regFlow === 'align') {
+      const refImg = images[regRefIdx];
+      if (!refImg?.data) throw new Error('Reference volume missing');
+      const rh = refImg.header;
+      const rn = rh.nx * rh.ny * rh.nz;
+      const rFloats = new Float32Array(rn);
+      const rlim = Math.min(rn, refImg.data.length);
+      for (let i = 0; i < rlim; i++) rFloats[i] = refImg.data![i];
+      msg.templateVolume = {
+        data: rFloats.buffer,
+        dims: [rh.nx, rh.ny, rh.nz],
+        srow_x: rh.srow_x, srow_y: rh.srow_y, srow_z: rh.srow_z,
+      };
+      showRegStatus('busy', `Aligning ${srcImg.name} → ${refImg.name}…`, 0);
+    }
+    w.postMessage(msg);
+  } catch (err: any) {
+    handleRegFailure(err?.message || String(err), false);
+  }
+}
+
+/**
+ * Compare-mode Align: register `refIdx`'s counterpart (the other compared
+ * image) onto `refIdx` as reference. Stores only the transform on the moving
+ * image — both volumes keep their native data untouched.
+ */
+async function startAlign(refIdx: number): Promise<void> {
+  if (regBusy) { showToast('A registration is already running.'); return; }
+  const img0 = cmpImg(0);
+  const img1 = cmpImg(1);
+  if (!img0 || !img1) { showToast('Enter compare mode with two images first.'); return; }
+  const ref = images[refIdx];
+  if (!ref || (images.indexOf(ref) !== compareIdxA && images.indexOf(ref) !== compareIdxB)) {
+    showToast('Pick one of the two compared images as reference.');
+    return;
+  }
+  const movIdx = images.indexOf(ref) === compareIdxA ? compareIdxB : compareIdxA;
+  const mov = images[movIdx];
+  if (!ref || !mov || ref === mov) { showToast('Pick one of the two compared images as reference.'); return; }
+  try {
+    await ensureImageData(compareIdxA, 'active');
+    await ensureImageData(compareIdxB, 'active');
+  } catch {
+    showToast('Both images must be fully loaded before aligning.');
+    return;
+  }
+  regBusy = true;
+  regFlow = 'align';
+  regSourceIdx = movIdx;
+  regRefIdx = images.indexOf(ref);
+  showRegStatus('busy', `Aligning ${mov.name} → ${ref.name}…`, 0);
+  // Reuse the custom-template pipeline; launchRegWorker attaches the
+  // reference volume payload for the align flow.
+  void launchRegWorker({ mode: 'custom', name: ref.name });
+}
+
+function finishRegistration(d: any): void {
+  try {
+    terminateRegWorker();
+    const srcImg = images[regSourceIdx];
+    if (!srcImg?.header) throw new Error('Source image missing');
+    if (!Array.isArray(d.alignM) || d.alignM.length !== 16) throw new Error('Invalid transform returned');
+
+    // ITK-SNAP style: attach the transform, keep the original volume data
+    // and header completely untouched.
+    srcImg.align = { m: d.alignM.map((v: number) => +v), ref: String(d.tplName) };
+    compareSliceCanvasCache.clear();
+    overlayResampleCache.clear();
+
+    const secs = ((d.durationMs || 0) / 1000).toFixed(1);
+    const cm = typeof d.cost === 'number' ? ` · cost ${d.cost.toFixed(3)} (${d.costMode})` : '';
+
+    if (regFlow === 'align') {
+      // Enter/refresh overlay compare: reference is the base (img0), moving
+      // image (with the new transform) is the overlay (img1).
+      const refIdx = regRefIdx;
+      const movIdx = regSourceIdx;
+      compareIdxA = refIdx;
+      compareIdxB = movIdx;
+      enterCompareOverlayUI();
+      showRegStatus('ok', `Aligned in ${secs}s${cm} · transform stored, original data untouched`);
+    } else {
+      // Template-space registration: add the template volume next to the
+      // source image, then show the aligned overlay (template as base).
+      const hdrTpl: NiiHeader = JSON.parse(JSON.stringify(srcImg.header));
+      hdrTpl.ndim = 3; hdrTpl.nt = 1; hdrTpl.nu = 1;
+      hdrTpl.nx = d.nx; hdrTpl.ny = d.ny; hdrTpl.nz = d.nz;
+      hdrTpl.dx = d.dx; hdrTpl.dy = d.dy; hdrTpl.dz = d.dz;
+      hdrTpl.datatype = 16; hdrTpl.bitpix = 32; hdrTpl.bytesPerVoxel = 4;
+      hdrTpl.scl_slope = 1; hdrTpl.scl_inter = 0;
+      hdrTpl.isGzip = false;
+      hdrTpl.totalVoxels3D = d.nx * d.ny * d.nz;
+      hdrTpl.sliceSizeXY = d.nx * d.ny;
+      hdrTpl.volumeBytes = d.nx * d.ny * d.nz * 4;
+      hdrTpl.srow_x = [...d.srow_x];
+      hdrTpl.srow_y = [...d.srow_y];
+      hdrTpl.srow_z = [...d.srow_z];
+      if (d.orientation) hdrTpl.orientation = d.orientation;
+
+      const tplTag = String(d.tplName).replace(/\.nii(\.gz)?$/i, '');
+      let tplIdx = images.findIndex(im => im.name === tplTag);
+      if (tplIdx < 0) {
+        images.push({
+          header: hdrTpl,
+          data: new Float32Array(d.tplData),
+          min: d.tplMin,
+          max: d.tplMax,
+          name: tplTag,
+          url: '',
+          directUrl: '',
+          slope: 1,
+          inter: 0,
+          colormap: srcImg.colormap,
+          state: 'ready',
+          lastAccess: Date.now(),
+        });
+        tplIdx = images.length - 1;
+      }
+      const srcIdx = images.indexOf(srcImg);
+      images[srcIdx].selected = true;
+      images[tplIdx].selected = true;
+      compareIdxA = tplIdx;        // template as base
+      compareIdxB = srcIdx;        // aligned source as overlay
+      enterCompareOverlayUI();
+      showRegStatus('ok', `Aligned to ${tplTag} in ${secs}s${cm} · original preserved, overlay shown`);
+    }
+  } catch (err: any) {
+    handleRegFailure(err?.message || String(err), false);
+  }
+}
+
+/**
+ * Enter overlay-compare UI using the current compareIdxA/B pair. Shared by
+ * the Compare button, template registration, and the Align flow.
+ */
+function enterCompareOverlayUI(): void {
+  compareMode = true;
+  compareLayout = 'overlay';
+  const btnCompare = document.getElementById('btn-compare') as HTMLButtonElement | null;
+  btnCompare?.classList.add('active');
+  if (btnCompare) btnCompare.textContent = '◑ Overlay';
+  const overlayControls = document.getElementById('overlay-controls');
+  if (overlayControls) overlayControls.style.display = 'block';
+  const img0 = cmpImg(0);
+  const img1 = cmpImg(1);
+  if (!img0 || !img1) return;
+  applyImageState(img0, true);
+  activeImageIdx = images.indexOf(img0);
+  const cmapSelect = document.getElementById('colormap') as HTMLSelectElement | null;
+  if (cmapSelect && img0) {
+    cmapSelect.value = img0.colormap;
+    colormap = img0.colormap;
+  }
+  const overlayCmapSelect = document.getElementById('overlay-colormap') as HTMLSelectElement | null;
+  if (overlayCmapSelect && img1) {
+    overlayCmapSelect.value = img1.colormap;
+    overlayColormap = img1.colormap;
+  }
+  renderColormapPreview();
+  sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
+  sliceIdx.coronal = Math.min(sliceIdx.coronal, img0.header.ny - 1);
+  sliceIdx.sagittal = Math.min(sliceIdx.sagittal, img0.header.nx - 1);
+  updateImagePicker();
+  updateFileInfo();
+  updateSliderValues();
+  renderAllViews();
+}
+
 window.addEventListener('DOMContentLoaded', () => {
   publishPerfMonitor();
   // Pre-warm the Worker blob URL so the first loadVolumeViaWorker()
@@ -4562,6 +5440,92 @@ window.addEventListener('message', async (e) => {
     injectPreconnectHint(target);
     void warmupConnection(target);
     loadNewImage(msg.fileUrl, msg.fileName, msg.isGzip, msg.isRemote, msg.directUrl);
+    return;
+  }
+
+  // Registration flow, step 2: template bytes arrived from the host, hand
+  // them to the registration worker along with the current volume.
+  if (msg.type === 'templateData') {
+    if (!regBusy) return;
+    void launchRegWorker(msg);
+    return;
+  }
+
+  if (msg.type === 'regStatus') {
+    // Host-side failure / cancellation before any worker was started.
+    handleRegFailure(String(msg.message || ''), !!msg.cancelled);
+    return;
+  }
+
+  if (msg.type === 'remoteSshHttp') {
+    // Remote-SSH fast path: the extension host registered the file in the
+    // localhost HTTP proxy and port-forwarded it via asExternalUri. The
+    // Worker now streams the forwarded URL directly — full tunnel
+    // bandwidth, overlapping decompression, early preview — instead of
+    // waiting for one postMessage round trip per chunk.
+    directPreviewReceived = true;
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+
+    fileUrl = msg.url;
+    directUrl = ''; // force the Worker to fetch the proxy URL
+    fileName = msg.fileName || fileName;
+    isGzip = !!msg.isGzip;
+    isRemoteSource = true;
+
+    if (msg.validationToken && fileName) {
+      broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0 });
+      broadcastToSliceWorkers({
+        type: 'invalidateCache',
+        fileName,
+        fileSize: msg.fileSize || 0,
+        validationToken: msg.validationToken,
+      });
+    }
+
+    // Point the pending image entry at the forwarded URL. Initial open
+    // creates the entry here; a file-switch already pushed a placeholder
+    // (loadNewImage) whose URL we now override.
+    if (images.length === 0) {
+      images.push({
+        header: null as any,
+        data: null,
+        min: 0,
+        max: 1,
+        name: fileName,
+        url: fileUrl,
+        directUrl: '',
+        slope: 1,
+        inter: 0,
+        colormap: colormap,
+        state: 'loading',
+        lastAccess: Date.now(),
+      });
+      activeImageIdx = 0;
+    } else {
+      const idx = images.length - 1;
+      images[idx].url = fileUrl;
+      images[idx].directUrl = '';
+      images[idx].name = fileName;
+      activeImageIdx = idx;
+    }
+    publishPerfMonitor();
+
+    loadingText.textContent = 'Streaming volume...';
+    updateProgress(0.02, 'Streaming volume (fast path)...', 'Stream');
+    setupInteraction();
+
+    void ensureImageData(activeImageIdx, 'active').catch((err: any) => {
+      if (err?.name === 'AbortError') return;
+      // The forwarded URL is unreachable (forwarding blocked, tunnel
+      // hiccup) — ask the extension host for the chunked fallback.
+      vscode.postMessage({
+        type: 'remoteHttpFallback',
+        webviewId: currentWebviewId,
+        reason: (err as Error)?.message || String(err),
+      });
+      loadingText.textContent = 'Retrying with chunked transfer...';
+      updateProgress(0.02, 'Retrying with chunked transfer...');
+    });
     return;
   }
 
@@ -4623,6 +5587,7 @@ window.addEventListener('message', async (e) => {
   broadcastToSliceWorkers({ type: 'cancelVolumeLoad', id: 0 });
   fileUrl = msg.fileUrl;
   directUrl = msg.directUrl || '';
+  currentWebviewId = msg.webviewId || '';
   const targetUrl = directUrl || fileUrl;
   injectPreconnectHint(targetUrl);
   void warmupConnection(targetUrl);
@@ -4675,16 +5640,25 @@ window.addEventListener('message', async (e) => {
   renderColormapPreview();
 
   directPreviewReceived = false;
-  // Use a shorter timeout for remote files — the Worker's streaming path
-  // provides early preview, so we don't need to wait 800ms for the
-  // Extension Host preview. For local files, 400ms is still enough.
-  const previewTimeout = isRemoteSource ? 300 : 400;
-  directPreviewTimer = window.setTimeout(() => {
-    directPreviewTimer = null;
-    if (!directPreviewReceived) {
-      fallbackToHttpPreview();
-    }
-  }, previewTimeout);
+  if (msg.isRemoteSsh) {
+    // Remote-SSH: startLocalLoad is dispatching the port-forwarded HTTP
+    // fast path ('remoteSshHttp' follows) or, if forwarding failed, the
+    // legacy chunked/cached postMessage path. Either message drives the
+    // UI from here — no HTTP-preview fallback timer.
+    loadingText.textContent = 'Preparing volume stream...';
+    updateProgress(0.01, 'Preparing volume stream...');
+  } else {
+    // Use a shorter timeout for remote files — the Worker's streaming path
+    // provides early preview, so we don't need to wait 800ms for the
+    // Extension Host preview. For local files, 400ms is still enough.
+    const previewTimeout = isRemoteSource ? 300 : 400;
+    directPreviewTimer = window.setTimeout(() => {
+      directPreviewTimer = null;
+      if (!directPreviewReceived) {
+        fallbackToHttpPreview();
+      }
+    }, previewTimeout);
+  }
 });
 
 function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
@@ -4841,7 +5815,7 @@ async function handleChunkedVolume(msg: any): Promise<void> {
     loadingText.textContent = 'Streaming volume...';
     updateProgress(0.05, 'Streaming volume...');
 
-    // Create a ReadableStream that we'll feed compressed chunks to.
+    // Create a ReadableStream that we'll feed chunks to.
     // The DecompressionStream pipes it to decompressed output.
     const compressedStream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -4849,8 +5823,14 @@ async function handleChunkedVolume(msg: any): Promise<void> {
       },
     });
 
-    const ds = new (self as any).DecompressionStream('gzip');
-    const decompressedStream = compressedStream.pipeThrough(ds) as unknown as ReadableStream<Uint8Array>;
+    // Non-gzip fallback (raw .nii over chunked postMessage): the bytes
+    // are already decompressed — feed the collector directly.
+    const useGzip = msg.isGzip !== false;
+    let decompressedStream: ReadableStream<Uint8Array> = compressedStream;
+    if (useGzip) {
+      const ds = new (self as any).DecompressionStream('gzip');
+      decompressedStream = compressedStream.pipeThrough(ds) as unknown as ReadableStream<Uint8Array>;
+    }
     void readDecompressedStream(decompressedStream);
   }
 
@@ -5771,7 +6751,7 @@ async function switchToImage(idx: number) {
   viewState.axial = { zoom: 1, panX: 0, panY: 0 };
   viewState.coronal = { zoom: 1, panX: 0, panY: 0 };
   viewState.sagittal = { zoom: 1, panX: 0, panY: 0 };
-  viewState.mip = { rotationX: 0, rotationY: 0 };
+  viewState.mip = { rot: MIP_IDENTITY.slice() };
   if (!img.data) {
     primeSliceFramesFromPreview(img);
     void refreshSlices(['axial', 'coronal', 'sagittal'], true).catch(() => {});
@@ -5786,9 +6766,9 @@ async function switchToImage(idx: number) {
     cmapSelect.value = images[activeImageIdx].colormap;
     colormap = images[activeImageIdx].colormap;
   }
-  if (overlayCmapSelect && images[1]) {
-    overlayCmapSelect.value = images[1].colormap;
-    overlayColormap = images[1].colormap;
+  if (overlayCmapSelect && cmpImg(1)) {
+    overlayCmapSelect.value = cmpImg(1)!.colormap;
+    overlayColormap = cmpImg(1)!.colormap;
   }
   renderColormapPreview();
 
@@ -5831,6 +6811,25 @@ function updateImagePicker() {
     const item = document.createElement('div');
     item.className = 'image-item' + (idx === activeImageIdx ? ' active' : '');
 
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.className = 'image-item-cmp';
+    cb.checked = !!img.selected;
+    cb.title = 'Select for compare (exactly two)';
+    cb.style.margin = '0 6px 0 2px';
+    cb.style.flexShrink = '0';
+    cb.style.cursor = 'pointer';
+    cb.addEventListener('click', (e) => e.stopPropagation());
+    cb.addEventListener('change', () => {
+      if (cb.checked && images.filter(im => im.selected).length >= 2) {
+        cb.checked = false;
+        showToast('Cannot compare more than two images.');
+        return;
+      }
+      img.selected = cb.checked;
+    });
+    item.appendChild(cb);
+
     const thumb = document.createElement('div');
     thumb.className = 'image-item-thumb';
     const thumbCanvas = document.createElement('canvas');
@@ -5839,8 +6838,10 @@ function updateImagePicker() {
 
     const name = document.createElement('span');
     name.className = 'image-item-name';
-    name.textContent = img.name;
-    name.title = img.name;
+    name.textContent = img.align ? `${img.name} ⇄` : img.name;
+    name.title = img.align
+      ? `${img.name} — aligned to ${img.align.ref} (stored transform, original data untouched)`
+      : img.name;
     item.appendChild(name);
 
     if (images.length > 1) {
@@ -6086,7 +7087,17 @@ function setupInteraction() {
 
   const btnCompare = document.getElementById('btn-compare') as HTMLButtonElement;
   btnCompare?.addEventListener('click', async () => {
-    if (images.length < 2) return;
+    // Starting a fresh compare requires exactly two checkbox-selected images.
+    if (!compareMode) {
+      const checked = images.filter(im => im.selected);
+      if (checked.length > 2) { showToast('Cannot compare more than two images.'); return; }
+      if (checked.length < 2) { showToast('Please add another image to compare.'); return; }
+      const ia = images.indexOf(checked[0]);
+      const ib = images.indexOf(checked[1]);
+      if (ia < 0 || ib < 0 || ia === ib) { showToast('Please add another image to compare.'); return; }
+      compareIdxA = ia;
+      compareIdxB = ib;
+    }
     if (activeLoadDebounceTimer) {
       window.clearTimeout(activeLoadDebounceTimer);
       activeLoadDebounceTimer = null;
@@ -6094,8 +7105,8 @@ function setupInteraction() {
     }
     if (!compareMode) {
       try {
-        await ensureImageData(0, 'active');
-        await ensureImageData(1, 'active');
+        await ensureImageData(compareIdxA, 'active');
+        await ensureImageData(compareIdxB, 'active');
       } catch (err) {
         console.error('Failed to prepare compare mode:', err);
         return;
@@ -6108,21 +7119,31 @@ function setupInteraction() {
       compareMode = false;
       compareLayout = 'overlay';
     }
+    // Overlay and SBS have different fit geometry (full container vs half
+    // container), so any zoom/pan left over from the single-image view (or
+    // the other layout) would place the image off-center or entirely out of
+    // view — one axis at a time if only it was zoomed before. Reset all
+    // three on every mode/layout transition.
+    viewState.axial = { zoom: 1, panX: 0, panY: 0 };
+    viewState.coronal = { zoom: 1, panX: 0, panY: 0 };
+    viewState.sagittal = { zoom: 1, panX: 0, panY: 0 };
     btnCompare.classList.toggle('active', compareMode);
     btnCompare.textContent = !compareMode ? '⊞ Compare' : compareLayout === 'overlay' ? '◑ Overlay' : '◫ SBS';
     const overlayControls = document.getElementById('overlay-controls');
     if (overlayControls) overlayControls.style.display = compareMode ? 'block' : 'none';
     if (compareMode) {
-      const img0 = images[0];
+      const img0 = cmpImg(0);
+      const img1 = cmpImg(1);
+      if (!img0 || !img1) return;
       applyImageState(img0, true);
-      activeImageIdx = 0;
+      activeImageIdx = images.indexOf(img0);
       if (cmapSelect && img0) {
         cmapSelect.value = img0.colormap;
         colormap = img0.colormap;
       }
-      if (overlayCmapSelect && images[1]) {
-        overlayCmapSelect.value = images[1].colormap;
-        overlayColormap = images[1].colormap;
+      if (overlayCmapSelect && img1) {
+        overlayCmapSelect.value = img1.colormap;
+        overlayColormap = img1.colormap;
       }
       renderColormapPreview();
       sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
@@ -6135,6 +7156,46 @@ function setupInteraction() {
     renderAllViews();
   });
 
+  // Align button (compare mode): pick which of the two compared images is the
+  // reference, then register the other onto it. Transform-only — neither
+  // volume's data is modified (ITK-SNAP style).
+  const btnAlign = document.getElementById('btn-align') as HTMLButtonElement | null;
+  btnAlign?.addEventListener('click', () => {
+    if (!compareMode) { showToast('Enter compare mode first, then align.'); return; }
+    const a = cmpImg(0);
+    const b = cmpImg(1);
+    if (!a || !b) { showToast('Compare needs exactly two selected images.'); return; }
+    document.getElementById('align-ref-menu')?.remove();
+    const rect = btnAlign.getBoundingClientRect();
+    const menu = document.createElement('div');
+    menu.id = 'align-ref-menu';
+    menu.style.cssText = 'position:fixed;z-index:10000;background:#2a2a2a;border:1px solid #444;' +
+      'border-radius:6px;padding:4px;box-shadow:0 4px 12px rgba(0,0,0,0.4);min-width:200px;';
+    const mkEntry = (img: VolumeImage, idx: number) => {
+      const it = document.createElement('div');
+      it.style.cssText = 'padding:6px 10px;border-radius:4px;cursor:pointer;font-size:12px;color:#ddd;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+      it.textContent = `Reference: ${img.name}`;
+      it.title = `Align ${img.name === a.name ? b.name : a.name} onto ${img.name}`;
+      it.addEventListener('mouseenter', () => { it.style.background = '#3a3a3a'; });
+      it.addEventListener('mouseleave', () => { it.style.background = 'transparent'; });
+      it.addEventListener('click', () => { menu.remove(); void startAlign(idx); });
+      menu.appendChild(it);
+    };
+    mkEntry(a, compareIdxA);
+    mkEntry(b, compareIdxB);
+    document.body.appendChild(menu);
+    const mw = menu.offsetWidth;
+    menu.style.left = Math.max(4, Math.min(rect.left, window.innerWidth - mw - 8)) + 'px';
+    menu.style.top = (rect.bottom + 4) + 'px';
+    const close = (e: MouseEvent) => {
+      if (!menu.contains(e.target as Node)) {
+        menu.remove();
+        document.removeEventListener('mousedown', close);
+      }
+    };
+    window.setTimeout(() => document.addEventListener('mousedown', close), 0);
+  });
+
   const opacitySlider = document.getElementById('opacity-slider') as HTMLInputElement;
   const opacityVal = document.getElementById('opacity-val');
   opacitySlider?.addEventListener('input', () => {
@@ -6145,11 +7206,21 @@ function setupInteraction() {
 
   const overlayCmapSelect = document.getElementById('overlay-colormap') as HTMLSelectElement;
   overlayCmapSelect?.addEventListener('change', () => {
-    const overlayImg = images[1];
+    const overlayImg = cmpImg(1);
     if (overlayImg) overlayImg.colormap = overlayCmapSelect.value;
     overlayColormap = overlayCmapSelect.value;
     if (compareMode) renderAllViews();
   });
+
+  // Registration buttons — trigger the affine registration pipeline
+  const btnRegMni = document.getElementById('btn-reg-mni') as HTMLButtonElement | null;
+  btnRegMni?.addEventListener('click', () => startRegistration('mni'));
+
+  const btnRegCustom = document.getElementById('btn-reg-custom') as HTMLButtonElement | null;
+  btnRegCustom?.addEventListener('click', () => startRegistration('custom'));
+
+  const btnRegCancel = document.getElementById('btn-reg-cancel') as HTMLButtonElement | null;
+  btnRegCancel?.addEventListener('click', () => void cancelRegistration());
 
   const btnAddImg = document.getElementById('btn-add-img') as HTMLButtonElement;
   btnAddImg?.addEventListener('click', () => {
@@ -6290,7 +7361,8 @@ function setupInteraction() {
     const handler = (val: number) => {
       sliceIdx[axis] = validateSliceIndex(axis, val);
       a11yAnnounce(`${axis} slice ${sliceIdx[axis] + 1}`);
-      if (volumeData) updateSingleView(axis);
+      // rAF-coalesced: slider 'input' fires per pixel of drag movement.
+      if (volumeData) scheduleSingleViewRender(axis);
       else {
         void refreshSlices([axis], true);
         scheduleLODUpgrade(axis);
@@ -6344,7 +7416,9 @@ function setupInteraction() {
           const newIdx = validateSliceIndex(axis, sliceIdx[axis] + delta);
           if (newIdx !== sliceIdx[axis]) {
             sliceIdx[axis] = newIdx;
-            if (volumeData) updateSingleView(axis);
+            // rAF-coalesced: fast trackpad scrolling fires wheel events
+            // faster than the display refresh - paint at most once/frame.
+            if (volumeData) scheduleSingleViewRender(axis);
             else {
               void refreshSlices([axis], true);
               scheduleLODUpgrade(axis);
@@ -6489,21 +7563,32 @@ function setupInteraction() {
       }
 
       if (compareMode && compareLayout === 'sideBySide' && images.length >= 2) {
-        const img0 = images[0];
-        const img1 = images[1];
+        const img0 = cmpImg(0);
+        const img1 = cmpImg(1);
+        if (!img0 || !img1) return;
         const h0 = img0.header;
         const h1 = img1.header;
         const halfW = rect.width / 2;
         const vs = viewState[axis];
         const isRight = clickX >= halfW;
 
-        if (isRight) {
+        // When img1 is aligned its slice is drawn on img0's grid, so BOTH
+        // halves map clicks through img0 geometry; the native-grid path only
+        // applies to an unaligned right half.
+        if (isRight && !img1.align) {
+          // The painter stretches img1 into the UNIFIED physical-extent box
+          // (max extent of both images, fit to the half container) — the
+          // inverse click mapping must use the SAME box, not img1's own
+          // aspect, or the picked voxel drifts whenever the two images'
+          // aspects differ.
+          const pw0m = axis === 'sagittal' ? h0.ny * h0.dy : h0.nx * h0.dx;
+          const ph0m = axis === 'axial' ? h0.ny * h0.dy : h0.nz * h0.dz;
           const pw1 = axis === 'sagittal' ? h1.ny * h1.dy : h1.nx * h1.dx;
           const ph1 = axis === 'axial' ? h1.ny * h1.dy : h1.nz * h1.dz;
-          const ar1 = pw1 / ph1;
+          const unifiedAR = Math.max(pw0m, pw1) / Math.max(ph0m, ph1);
           let cw1: number, ch1: number;
-          if (halfW / rect.height > ar1) { ch1 = rect.height; cw1 = ch1 * ar1; }
-          else { cw1 = halfW; ch1 = cw1 / ar1; }
+          if (halfW / rect.height > unifiedAR) { ch1 = rect.height; cw1 = ch1 * unifiedAR; }
+          else { cw1 = halfW; ch1 = cw1 / unifiedAR; }
           cw1 *= vs.zoom; ch1 *= vs.zoom;
           const imgLeft1 = halfW + (halfW - cw1) / 2 + vs.panX;
           const imgTop1 = (rect.height - ch1) / 2 + vs.panY;
@@ -6512,16 +7597,36 @@ function setupInteraction() {
           const ny_click = (clickY - imgTop1) / ch1;
           const w1 = axis === 'sagittal' ? h1.ny : h1.nx;
           const h1_ = axis === 'axial' ? h1.ny : h1.nz;
+          // The SBS painter draws img1 with ITS OWN orientation flips; the
+          // click must be inverted through the same flips or the crosshair
+          // lands mirrored (e.g. sagittal views of L-positive templates).
+          const flips1 = computeFlipsForHeader(h1)[axis as 'axial' | 'coronal' | 'sagittal'];
+          const cx1n = flips1.flipX ? 1 - nx_click : nx_click;
+          const cy1n = flips1.flipY ? ny_click : 1 - ny_click;
           let vx: number, vy: number, vz: number;
-          if (axis === 'axial') { vx = nx_click * w1; vy = (1 - ny_click) * h1_; vz = sliceIdx.axial; }
-          else if (axis === 'coronal') { vx = nx_click * w1; vy = sliceIdx.coronal; vz = (1 - ny_click) * h1_; }
-          else { vx = sliceIdx.sagittal; vy = nx_click * w1; vz = (1 - ny_click) * h1_; }
+          // Third axis: sliceIdx is in img0's grid — it must be mapped
+          // through world space into img1's grid before building the img1
+          // voxel. Feeding img0's raw index to voxelToWorld(h1, ...) put the
+          // world point on the wrong slice whenever the two volumes differ
+          // in extent/origin (exactly the unaligned case), so the resulting
+          // crosshair landed on unrelated anatomy.
+          const [wx0, wy0, wz0] = voxelToWorld(h0, sliceIdx.sagittal, sliceIdx.coronal, sliceIdx.axial);
+          const [tvx, tvy, tvz] = worldToVoxel(h1, wx0, wy0, wz0);
+          if (axis === 'axial') { vx = cx1n * w1; vy = cy1n * h1_; vz = tvz; }
+          else if (axis === 'coronal') { vx = cx1n * w1; vy = tvy; vz = cy1n * h1_; }
+          else { vx = tvx; vy = cx1n * w1; vz = cy1n * h1_; }
           const [wx, wy, wz] = voxelToWorld(h1, vx, vy, vz);
           const [svx, svy, svz] = worldToVoxel(h0, wx, wy, wz);
           sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.round(svx)));
           sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.round(svy)));
           sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.round(svz)));
         } else {
+          // img0-voxel mapping: the LEFT half always, AND the right half
+          // when img1 is aligned — an aligned slice is drawn in img0's voxel
+          // frame shifted by halfW (no world round-trip through img1 needed).
+          // Previously an aligned right-half click fell through here with
+          // the left-half geometry, so the out-of-bounds check rejected it
+          // and the crosshair never moved.
           const pw0 = axis === 'sagittal' ? h0.ny * h0.dy : h0.nx * h0.dx;
           const ph0 = axis === 'axial' ? h0.ny * h0.dy : h0.nz * h0.dz;
           const ar0 = pw0 / ph0;
@@ -6529,22 +7634,27 @@ function setupInteraction() {
           if (halfW / rect.height > ar0) { ch0 = rect.height; cw0 = ch0 * ar0; }
           else { cw0 = halfW; ch0 = cw0 / ar0; }
           cw0 *= vs.zoom; ch0 *= vs.zoom;
-          const imgLeft0 = (halfW - cw0) / 2 + vs.panX;
+          const imgLeft0 = (isRight ? halfW : 0) + (halfW - cw0) / 2 + vs.panX;
           const imgTop0 = (rect.height - ch0) / 2 + vs.panY;
           if (clickX < imgLeft0 || clickX > imgLeft0 + cw0 || clickY < imgTop0 || clickY > imgTop0 + ch0) return;
           const nx_click = (clickX - imgLeft0) / cw0;
           const ny_click = (clickY - imgTop0) / ch0;
           const w0 = axis === 'sagittal' ? h0.ny : h0.nx;
           const h0_ = axis === 'axial' ? h0.ny : h0.nz;
+          // Mirror the img0 flips used by the SBS painter (same rationale
+          // as the img1 half above).
+          const flips0 = computeFlipsForHeader(h0)[axis as 'axial' | 'coronal' | 'sagittal'];
+          const cx0n = flips0.flipX ? 1 - nx_click : nx_click;
+          const cy0n = flips0.flipY ? ny_click : 1 - ny_click;
           if (axis === 'axial') {
-            sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.floor(nx_click * w0)));
-            sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.floor((1 - ny_click) * h0_)));
+            sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.floor(cx0n * w0)));
+            sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.floor(cy0n * h0_)));
           } else if (axis === 'coronal') {
-            sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.floor(nx_click * w0)));
-            sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor((1 - ny_click) * h0_)));
+            sliceIdx.sagittal = Math.max(0, Math.min(h0.nx - 1, Math.floor(cx0n * w0)));
+            sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor(cy0n * h0_)));
           } else {
-            sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.floor(nx_click * w0)));
-            sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor((1 - ny_click) * h0_)));
+            sliceIdx.coronal = Math.max(0, Math.min(h0.ny - 1, Math.floor(cx0n * w0)));
+            sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor(cy0n * h0_)));
           }
         }
         if (volumeData) renderAllViews();
@@ -6552,7 +7662,15 @@ function setupInteraction() {
         return;
       }
 
-      const { nx, ny, nz, dx, dy, dz } = header;
+      // Overlay compare paints from the compare pair (img0), NOT the active
+      // image — click mapping must use img0's header and orientation flips,
+      // otherwise picking lands on the wrong voxel once the active image and
+      // img0 diverge.
+      const overlayImg = compareMode && compareLayout === 'overlay' && images.length >= 2
+        ? cmpImg(0) : null;
+      const hpick = overlayImg ? overlayImg.header : header;
+      if (!hpick) return;
+      const { nx, ny, nz, dx, dy, dz } = hpick;
       const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
       const pixelH = axis === 'axial' ? ny * dy : nz * dz;
       const ar = pixelW / pixelH;
@@ -6569,7 +7687,9 @@ function setupInteraction() {
       if (clickX < imgLeft || clickX > imgLeft + cw ||
           clickY < imgTop || clickY > imgTop + ch) return;
 
-      const flips = viewFlips[axis] || { flipX: false, flipY: false };
+      const flips = overlayImg
+        ? computeFlipsForHeader(hpick)[axis as 'axial' | 'coronal' | 'sagittal']
+        : (viewFlips[axis] || { flipX: false, flipY: false });
       const nx_click = (clickX - imgLeft) / cw;
       const ny_click = (clickY - imgTop) / ch;
       // The renderer may flip the image horizontally/vertically based on
@@ -6606,9 +7726,9 @@ function setupInteraction() {
       if (!coordEl) return;
 
       if (compareMode && images.length >= 2) {
-        const img0 = images[0];
-        const img1 = images[1];
-        if (!img0.data || !img1.data) {
+        const img0 = cmpImg(0);
+        const img1 = cmpImg(1);
+        if (!img0?.data || !img1?.data) {
           coordEl.textContent = '';
           return;
         }
@@ -6619,7 +7739,9 @@ function setupInteraction() {
         if (compareLayout === 'sideBySide') {
           const halfW = rect.width / 2;
           const isRight = mouseX >= halfW;
-          const img = isRight ? img1 : img0;
+          // Coordinate mapping: an aligned right half is drawn on img0's
+          // grid, so map through img0 geometry there as well.
+          const img = (isRight && img1.align) ? img0 : (isRight ? img1 : img0);
           const hi = img.header;
           const pw = axis === 'sagittal' ? hi.ny * hi.dy : hi.nx * hi.dx;
           const ph = axis === 'axial' ? hi.ny * hi.dy : hi.nz * hi.dz;
@@ -6635,10 +7757,14 @@ function setupInteraction() {
           const ny_m = (mouseY - it) / ih;
           const w = axis === 'sagittal' ? hi.ny : hi.nx;
           const h_ = axis === 'axial' ? hi.ny : hi.nz;
+          // Invert the per-side orientation flips used by the SBS painter.
+          const mf = computeFlipsForHeader(hi)[axis as 'axial' | 'coronal' | 'sagittal'];
+          const cx_m = mf.flipX ? 1 - nx_m : nx_m;
+          const cy_m = mf.flipY ? ny_m : 1 - ny_m;
           let px: number, py: number, pz: number;
-          if (axis === 'axial') { px = Math.floor(nx_m * w); py = Math.floor((1 - ny_m) * h_); pz = sliceIdx.axial; }
-          else if (axis === 'coronal') { px = Math.floor(nx_m * w); pz = Math.floor((1 - ny_m) * h_); py = sliceIdx.coronal; }
-          else { py = Math.floor(nx_m * w); pz = Math.floor((1 - ny_m) * h_); px = sliceIdx.sagittal; }
+          if (axis === 'axial') { px = Math.floor(cx_m * w); py = Math.floor(cy_m * h_); pz = sliceIdx.axial; }
+          else if (axis === 'coronal') { px = Math.floor(cx_m * w); pz = Math.floor(cy_m * h_); py = sliceIdx.coronal; }
+          else { py = Math.floor(cx_m * w); pz = Math.floor(cy_m * h_); px = sliceIdx.sagittal; }
           if (px >= 0 && px < hi.nx && py >= 0 && py < hi.ny && pz >= 0 && pz < hi.nz) {
             const other = isRight ? img0 : img1;
             if (!img.data || !other.data) {
@@ -6647,14 +7773,9 @@ function setupInteraction() {
             }
             const val = img.data[pz * hi.ny * hi.nx + py * hi.nx + px] * img.slope + img.inter;
             const [wx, wy, wz] = voxelToWorld(hi, px, py, pz);
-            const oh = other.header;
-            const [ox, oy, oz] = worldToVoxel(oh, wx, wy, wz);
-            const oxi = Math.round(ox), oyi = Math.round(oy), ozi = Math.round(oz);
-            let otherVal: string;
-            if (oxi >= 0 && oxi < oh.nx && oyi >= 0 && oyi < oh.ny && ozi >= 0 && ozi < oh.nz) {
-              const ov = other.data[ozi * oh.ny * oh.nx + oyi * oh.nx + oxi] * other.slope + other.inter;
-              otherVal = ov.toFixed(4);
-            } else { otherVal = '---'; }
+            // Align-aware sampling for the counterpart value.
+            const ov = sampleImageAtWorld(other, wx, wy, wz);
+            const otherVal: string = ov === null ? '---' : ov.toFixed(4);
             const name0 = isRight ? other.name : img.name;
             const name1 = isRight ? img.name : other.name;
             const v0 = isRight ? otherVal : val.toFixed(4);
@@ -6686,12 +7807,8 @@ function setupInteraction() {
             }
             const val0 = img0.data[pz * ny * nx + py * nx + px] * img0.slope + img0.inter;
             const [wx, wy, wz] = voxelToWorld(h0, px, py, pz);
-            const [vx1, vy1, vz1] = worldToVoxel(h1, wx, wy, wz);
-            const ix1 = Math.round(vx1), iy1 = Math.round(vy1), iz1 = Math.round(vz1);
-            let val1Str: string;
-            if (ix1 >= 0 && ix1 < h1.nx && iy1 >= 0 && iy1 < h1.ny && iz1 >= 0 && iz1 < h1.nz) {
-              val1Str = (img1.data[iz1 * h1.ny * h1.nx + iy1 * h1.nx + ix1] * img1.slope + img1.inter).toFixed(4);
-            } else { val1Str = '---'; }
+            const ov = sampleImageAtWorld(img1, wx, wy, wz);
+            const val1Str: string = ov === null ? '---' : ov.toFixed(4);
             coordEl.textContent = `${img0.name}: ${val0.toFixed(4)}\n${img1.name}: ${val1Str}`;
           }
         }
@@ -6793,25 +7910,45 @@ function setupInteraction() {
 
   const mipCanvas = canvases.mip;
   let mipDragging = false;
-  let mipLastX = 0, mipLastY = 0;
+  // Pose captured at drag start: the rotation for the whole gesture is
+  // recomputed from (dragStart, current pointer) each frame instead of
+  // integrating tiny per-move steps. Step-wise integration mixed roll into
+  // the trackball axes and the volume ended up wildly tilted after a few
+  // gestures; gesture-relative composition keeps each drag a clean
+  // rotation around the captured pose.
+  let mipDragStartX = 0, mipDragStartY = 0;
+  let mipDragStartRot: number[] = MIP_IDENTITY.slice();
 
   mipCanvas.addEventListener('mousedown', (e) => {
     mipDragging = true;
-    mipLastX = e.clientX;
-    mipLastY = e.clientY;
+    mipDragStartX = e.clientX;
+    mipDragStartY = e.clientY;
+    mipDragStartRot = viewState.mip.rot.slice();
     if (!mipInitialized) { mipInitialized = true; paintMIP(); }
     mipCanvas.style.cursor = 'grabbing';
   });
 
   document.addEventListener('mousemove', (e) => {
     if (mipDragging) {
-      const dx = e.clientX - mipLastX;
-      const dy = e.clientY - mipLastY;
-      viewState.mip.rotationY += dx * 0.01;
-      viewState.mip.rotationX += dy * 0.01;
-      mipLastX = e.clientX;
-      mipLastY = e.clientY;
-      paintMIP();
+      const dx = e.clientX - mipDragStartX;
+      const dy = e.clientY - mipDragStartY;
+      // Screen-space arcball: ONE rotation around the screen-plane axis
+      // perpendicular to the drag direction, applied to the captured start
+      // pose. Turntable-style orbit — the rotation direction is inverted
+      // relative to grabbing semantics: drag down → top leans away from the
+      // viewer; drag right → front surface moves left. Because the axis is
+      // in the screen plane and the rotation is recomputed against the
+      // gesture-start pose, no roll can accumulate across drags.
+      const len = Math.hypot(dx, dy);
+      if (len > 0) {
+        const S = rotAxisAngle(-dy, dx, 0, len * 0.01);
+        viewState.mip.rot = mul3(S, mipDragStartRot);
+      }
+      // A full CPU MIP takes tens-to-hundreds of ms; painting synchronously
+      // per mousemove queued up events faster than frames and made dragging
+      // stutter. Coalesce to one (reduced-quality) render per display frame
+      // instead; the drag end handler schedules the full-quality pass.
+      scheduleMIPRender(true);
     }
   });
 
@@ -6819,6 +7956,7 @@ function setupInteraction() {
     if (mipDragging) {
       mipDragging = false;
       mipCanvas.style.cursor = 'crosshair';
+      scheduleMIPRender(false);
     }
   });
 
@@ -6869,11 +8007,9 @@ function setupInteraction() {
         }
       }
     });
-    // WebGL context loss recovery
-    canvas.addEventListener('webglcontextlost', (e) => {
-      e.preventDefault();
-      handleWebGLContextLoss(canvas, axis);
-    });
+    // WebGL context loss is watched on the renderer's private GL canvas
+    // (see WebGLRenderer.watchContextLoss) - the display canvas holds a 2D
+    // context and never emits webglcontextlost.
   }
 
   // High contrast media query listener

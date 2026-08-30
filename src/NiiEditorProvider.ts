@@ -98,6 +98,18 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private debugStatusBarItem: vscode.StatusBarItem | null = null;
   private nativeFallbackWarned = false;
   private perfChannel: vscode.OutputChannel | null = null;
+  // Remote-SSH fast-path fallback contexts, keyed by webviewId. If the
+  // webview cannot fetch the port-forwarded proxy URL (forwarding blocked,
+  // CSP, tunnel hiccup), it reports back and we fall back to the chunked
+  // postMessage transfer from this stashed context.
+  private remoteHttpFallbacks = new Map<string, {
+    webview: vscode.Webview;
+    fsPath: string;
+    fileSize: number;
+    validationToken: string;
+    signal: AbortSignal;
+    isGzip: boolean;
+  }>();
   // Debug mode: when on, perf reports are written to the OutputChannel AND
   // the panel is auto-revealed. Toggled by clicking the $(bug) status bar item.
   // Persists across sessions via workspaceState. Initial value also honors
@@ -345,6 +357,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     webviewPanel.onDidDispose(() => {
       abortController.abort();
       this.loadQueue.cancel(webviewId);
+      this.remoteHttpFallbacks.delete(webviewId);
       this.volumeCache.setActive(uri.toString(), null);
       this.activeWebviews.delete(webviewId);
     });
@@ -394,6 +407,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           fullVolumePolicy: config.get('fullVolumePolicy', 'debounced'),
           nativeAcceleration: config.get('nativeAcceleration', 'auto'),
           isRemote,
+          // Remote-SSH with a file-scheme URI: the file lives on the remote
+          // host. startLocalLoad will try the port-forwarded HTTP fast path
+          // and send a follow-up 'remoteSshHttp' message; the webview uses
+          // this flag to skip the HTTP-preview fallback timer (the fast
+          // path overlaps download + decompress in the Worker).
+          isRemoteSsh: !isRemote && !!vscode.env.remoteName,
           fileUrl,
           directUrl: isRemote ? uri.toString() : '',
           fileName: path.basename(uri.fsPath ?? uri.toString()),
@@ -407,6 +426,15 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         } else if (!isRemote) {
           this.startLocalLoad(webview, webviewId, uri, abortController.signal, fileSize, validationToken);
         }
+      } else if (msg.type === 'remoteHttpFallback') {
+        // The webview could not fetch the port-forwarded proxy URL
+        // (forwarding blocked / CSP / tunnel hiccup). Resume the legacy
+        // chunked postMessage transfer from the stashed context.
+        const fb = this.remoteHttpFallbacks.get(msg.webviewId);
+        this.remoteHttpFallbacks.delete(msg.webviewId);
+        if (!fb || fb.signal.aborted) return;
+        this.logPerf(`[remote-ssh-http] webview fetch failed (${String(msg.reason || 'unknown')}), falling back to chunked transfer`);
+        await this.remoteSshChunkedLoad(fb.webview, fb.fsPath, fb.fileSize, fb.validationToken, fb.signal, fb.isGzip);
       } else if (msg.type === 'perfReport') {
         this.handlePerfReport(msg);
       } else if (msg.type === 'selectImage') {
@@ -482,6 +510,51 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         const { url } = msg;
         if (typeof url === 'string' && url.startsWith('https://github.com/MaiwulanjiangMaiming/NiftiSpy/issues')) {
           await vscode.env.openExternal(vscode.Uri.parse(url));
+        }
+      } else if (msg.type === 'getTemplate') {
+        // Registration flow, step 1: resolve the template volume for the
+        // requested mode and ship its raw bytes to the webview. The MNI path
+        // remembers the chosen file in the user-level `niftispy.mniTemplatePath`
+        // setting so subsequent runs start instantly; the custom path always
+        // asks. Errors land back in the webview as regStatus failures so the
+        // sidebar button state recovers cleanly.
+        try {
+          const cfg = vscode.workspace.getConfiguration('niftispy');
+          let tplPath = msg.mode === 'mni' ? (cfg.get<string>('mniTemplatePath') || '') : '';
+          if (!tplPath) {
+            const picked = await vscode.window.showOpenDialog({
+              canSelectMany: false,
+              title: msg.mode === 'mni'
+                ? 'Select MNI standard template (e.g. MNI152_T1_2mm.nii.gz)'
+                : 'Select custom template volume',
+              filters: { 'NIfTI volumes': ['nii', 'gz'] },
+            });
+            if (!picked || picked.length === 0) {
+              webview.postMessage({ type: 'regStatus', mode: msg.mode, ok: false, cancelled: true, message: 'Template selection cancelled' });
+              return;
+            }
+            tplPath = picked[0].fsPath;
+            if (msg.mode === 'mni') {
+              await cfg.update('mniTemplatePath', tplPath, vscode.ConfigurationTarget.Global);
+            }
+          }
+          const tplUri = vscode.Uri.file(tplPath);
+          const bytes = new Uint8Array(await vscode.workspace.fs.readFile(tplUri));
+          // postMessage clones buffers (no transfer-list support), so hand it
+          // a standalone ArrayBuffer of exact payload size.
+          webview.postMessage({
+            type: 'templateData',
+            mode: msg.mode,
+            name: path.basename(tplPath),
+            bytes,
+          });
+        } catch (err: any) {
+          webview.postMessage({
+            type: 'regStatus',
+            mode: msg.mode,
+            ok: false,
+            message: `Template load failed: ${err?.message || String(err)}`,
+          });
         }
       }
     });
@@ -683,6 +756,26 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           // Hoisted out of the isGzip block so the finalize path's
           // perfExtTiming (which runs for both .nii and .nii.gz) can read it.
           const isRemoteSSH = !!vscode.env.remoteName;
+
+          // ── Remote-SSH fast path: HTTP port-forward streaming ──
+          // The chunked postMessage path is latency-bound: each 2MB chunk
+          // waits a full ext-host→renderer RPC round trip over the SSH
+          // relay, so a 100-200MB volume needs 50-100 sequential awaits
+          // (1-2 minutes in practice). Instead, serve the file from the
+          // localhost HTTP proxy and let vscode.env.asExternalUri port-
+          // forward it to the local side. The webview Worker then fetches
+          // the forwarded URL directly: a raw TCP stream through SSH's
+          // direct-tcpip channel (full tunnel bandwidth, backpressure,
+          // no per-message RPC overhead) with overlapping decompression
+          // and early preview. Falls through to the postMessage paths
+          // below if port forwarding is unavailable.
+          if (isRemoteSSH) {
+            const dispatched = await this.tryRemoteSshHttpLoad(
+              webview, webviewId, uri, fsPath, fileSize, validationToken, signal
+            );
+            if (dispatched) return;
+            // asExternalUri failed → legacy postMessage paths below.
+          }
 
           if (isGzip) {
             // ── Remote-SSH: chunked compressed transfer ──
@@ -1343,6 +1436,76 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   }
 
   /**
+   * Remote-SSH fast path: serve the file over the localhost HTTP proxy and
+   * port-forward it via vscode.env.asExternalUri, then let the webview
+   * Worker fetch the forwarded URL directly.
+   *
+   * Why this is dramatically faster than postMessage: the ext-host→webview
+   * RPC channel adds a serialization + delivery-acknowledgement round trip
+   * per message, so sequentially-awaited 2MB chunks cap throughput at
+   * ~1 chunk/RTT. The forwarded port instead carries a raw TCP stream
+   * multiplexed inside the SSH connection: no per-message overhead, full
+   * tunnel bandwidth, natural backpressure — while the Worker overlaps
+   * decompression and renders an early preview during the download.
+   *
+   * Returns true if the fast path was dispatched (webview will drive the
+   * load); false if port forwarding is unavailable (caller falls back to
+   * the postMessage paths).
+   */
+  private async tryRemoteSshHttpLoad(
+    webview: vscode.Webview,
+    webviewId: string,
+    uri: vscode.Uri,
+    fsPath: string,
+    fileSize: number,
+    validationToken: string,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    try {
+      if (!this.proxy) {
+        this.proxy = new LocalFileProxy(this.volumeCache);
+        await this.proxy.start();
+        this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
+      }
+      const proxyUrl = this.proxy.registerFile(uri);
+      // Ask VS Code to forward the remote-side localhost port so the local
+      // webview can reach it. Throws when forwarding is unavailable
+      // (e.g. restricted remote environments).
+      const external = await vscode.env.asExternalUri(vscode.Uri.parse(proxyUrl));
+
+      // Stash the fallback context BEFORE posting: if the webview fetch
+      // fails, it reports back and we resume the chunked transfer.
+      this.remoteHttpFallbacks.set(webviewId, {
+        webview, fsPath, fileSize, validationToken, signal,
+        isGzip: fsPath.endsWith('.gz'),
+      });
+
+      const ok = await webview.postMessage({
+        type: 'remoteSshHttp',
+        url: external.toString(),
+        fileName: path.basename(fsPath),
+        fileSize,
+        validationToken,
+        isGzip: fsPath.endsWith('.gz'),
+        perfExtTiming: {
+          isRemoteSSH: true,
+          path: 'remote-ssh-http',
+        },
+      });
+      if (!ok) {
+        this.remoteHttpFallbacks.delete(webviewId);
+        return false;
+      }
+      this.logPerf(`[remote-ssh-http] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`);
+      return true;
+    } catch (err) {
+      this.remoteHttpFallbacks.delete(webviewId);
+      this.logPerf(`[remote-ssh-http] unavailable (${String(err)}) — falling back to postMessage transfer`);
+      return false;
+    }
+  }
+
+  /**
    * Remote-SSH compressed transfer: read the .nii.gz file WITHOUT
    * decompressing on the extension host, and ship the compressed bytes
    * to the webview. The webview decompresses locally with the browser-
@@ -1391,32 +1554,33 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   }
 
   /**
-   * Remote-SSH chunked transfer: read the compressed .nii.gz in small
-   * chunks and postMessage each separately. This avoids the synchronous
-   * structured-clone cost of one large ArrayBuffer (which blocks the
-   * ext-host main thread and freezes the IDE), while still delivering
-   * the compressed bytes (3-5x smaller than decompressed) to the webview
-   * for local DecompressionStream inflation.
+   * Remote-SSH chunked transfer (fallback when the port-forwarded HTTP
+   * path is unavailable): read the file in chunks and postMessage each
+   * separately, avoiding the synchronous structured-clone cost of one
+   * huge ArrayBuffer.
    *
-   * Each chunk: ~2MB → ~10-20ms serialization, then setImmediate yields
-   * to the event loop so other extensions/UI/command palette stay live.
-   * The webview feeds chunks to a streaming DecompressionStream and
-   * shows early preview as soon as enough data arrives.
+   * Pipelined: messages are posted without awaiting each one — we keep a
+   * bounded window of chunks in flight (4MB × 6 ≈ 24MB buffered) so the
+   * RPC channel stays saturated instead of idling one round-trip per
+   * chunk. This is ~6x faster than the previous sequential await.
    */
   private async remoteSshChunkedLoad(
     webview: vscode.Webview,
     fsPath: string,
     fileSize: number,
     validationToken: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    isGzip: boolean = true
   ): Promise<void> {
-    const CHUNK_SIZE = 2 * 1024 * 1024; // 2MB per postMessage
+    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per postMessage
+    const MAX_INFLIGHT = 6;             // pipelining window
     const totalChunks = Math.max(1, Math.ceil(fileSize / CHUNK_SIZE));
     const tStart = performance.now();
 
     // Use createReadStream for efficient chunked reading
     const stream = fs.createReadStream(fsPath, { highWaterMark: CHUNK_SIZE });
     let chunkIndex = 0;
+    const inflight: Thenable<boolean>[] = [];
 
     try {
       for await (const chunk of stream) {
@@ -1425,11 +1589,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         // Extract a clean ArrayBuffer (Node Buffer may have byteOffset)
         const ab = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
 
-        await webview.postMessage({
+        // Fire without awaiting: FIFO order is preserved by VS Code's
+        // message channel, and the webview reorders defensively anyway.
+        inflight.push(webview.postMessage({
           type: 'chunkedVolume',
           chunk: ab,
           index: chunkIndex,
           total: totalChunks,
+          isGzip,
           fileName: path.basename(fsPath),
           fileSize,
           validationToken,
@@ -1438,15 +1605,19 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             path: 'remote-ssh-chunked',
             compressedBytes: fileSize,
           },
-        });
-
+        }));
         chunkIndex++;
 
-        // Yield to the event loop so other extensions, UI, and command
-        // palette can run between chunks. Without this, the postMessage
-        // serialization queue still dominates the main thread.
-        await new Promise<void>(r => setImmediate(r));
+        // Backpressure: wait for the oldest in-flight message before
+        // queueing more, keeping the window bounded.
+        if (inflight.length >= MAX_INFLIGHT) {
+          await inflight.shift();
+          // Yield to the event loop so other extensions, UI, and command
+          // palette can run between batches.
+          await new Promise<void>(r => setImmediate(r));
+        }
       }
+      await Promise.all(inflight);
 
       this.logPerf(`[remote-ssh-chunked] sent ${chunkIndex}/${totalChunks} chunks for ${path.basename(fsPath)} in ${+(performance.now() - tStart).toFixed(0)}ms`);
     } finally {
@@ -2072,6 +2243,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     const workerUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'dist', 'worker.js')
     );
+    const regWorkerUri = webview.asWebviewUri(
+      vscode.Uri.joinPath(this.context.extensionUri, 'dist', 'regWorker.js')
+    );
 
     return /* html */`<!DOCTYPE html>
 <html lang="en">
@@ -2192,6 +2366,16 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 .ns-tooltip{position:fixed;padding:4px 10px;border-radius:4px;background:var(--bg,#1a1a2e);color:var(--text,#e0e0e0);border:1px solid var(--border,#2a3f5f);font-size:11px;font-weight:400;white-space:nowrap;pointer-events:none;opacity:0;transition:opacity .12s ease;z-index:99999;box-shadow:0 2px 8px rgba(0,0,0,.25);max-width:280px;overflow:hidden;text-overflow:ellipsis}
 .ns-tooltip.visible{opacity:1}
 .measure-canvas{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:6}
+.reg-hidden{display:none}
+#reg-status{margin-top:6px;font-size:10px;color:var(--text2)}
+#reg-status-text{white-space:normal;word-break:break-word;line-height:1.4}
+#reg-status.ok #reg-status-text{color:#4cd964}
+#reg-status.fail #reg-status-text{color:var(--danger)}
+#reg-status.busy #reg-status-text{color:var(--warning)}
+.reg-track{height:3px;background:rgba(255,255,255,.12);border-radius:2px;margin-top:4px;overflow:hidden;display:none}
+#reg-status.busy .reg-track{display:block}
+#reg-fill{height:100%;width:0%;background:var(--accent);transition:width .18s ease}
+#btn-reg-mni:disabled,#btn-reg-custom:disabled{opacity:.45;cursor:not-allowed}
 @media(prefers-contrast:more){.crosshair-h{height:2px!important}.crosshair-v{width:2px!important}.vl{font-size:14px!important}.vi{font-size:12px!important}}
 </style>
 </head>
@@ -2238,6 +2422,17 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
       <div id="overlay-controls" style="display:none;margin-top:4px">
         <div class="sr"><label>Opacity:</label><input id="opacity-slider" type="range" min="0" max="100" value="50" style="flex:1"><span class="sv" id="opacity-val">50</span></div>
         <div class="sr"><label>Color:</label><select id="overlay-colormap" style="flex:1"><option value="hot">Hot</option><option value="jet">Jet</option><option value="cool">Cool</option><option value="viridis">Viridis</option><option value="inferno">Inferno</option><option value="gray">Gray</option></select></div>
+        <button class="btn" id="btn-align" style="width:100%;margin-top:4px" title="Register the overlay image onto the base image (stores a transform only — original data is untouched)">⇄ Align…</button>
+      </div>
+    </div>
+    <div class="ss">
+      <h3>Registration</h3>
+      <button class="btn" id="btn-reg-mni" style="width:100%" title="Register the current image to the MNI standard template (affine)">🧠 To MNI</button>
+      <button class="btn" id="btn-reg-custom" style="width:100%;margin-top:4px" title="Register the current image to a user-selected template volume">📂 Custom Template…</button>
+      <div id="reg-status" class="reg-hidden">
+        <div id="reg-status-text"></div>
+        <div class="reg-track"><div id="reg-fill"></div></div>
+        <div class="reg-actions"><button class="btn" id="btn-reg-cancel" style="display:none">✕ Cancel</button></div>
       </div>
     </div>
     <div class="ss">
@@ -2269,6 +2464,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
 <div id="a11y-announce" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)"></div>
 <div id="loading"><span id="loading-text">Initializing...</span><span id="loading-detail"></span></div>
 <script>window.WORKER_URL="${workerUri}";</script>
+<script>window.REG_WORKER_URL="${regWorkerUri}";</script>
 <script src="${viewerUri}"></script>
 </body>
 </html>`;
