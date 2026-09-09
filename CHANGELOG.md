@@ -2,13 +2,29 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.3.2] - 2026-09-09
+
+### Changed — Gzip random access
+- **Correct random-access index**: the sidecar next to a `.nii.gz` now stores deflate block boundaries with leftover bits and a 32KB window, so `/slice` can inflate only the needed range instead of the whole file.
+- **One sequential inflate on the host**: the same pass produces the first axial slice, mid-plane coronal and sagittal views, a coarse strided preview volume, and the index. Repeat opens reuse `.niftispy-index`.
+- **Coronal and sagittal from one inflate walk**: scrolling Y/X no longer restarts gzip decode for every z-row. If the index cannot be built, the host decompresses once to a seekable `.niftispy-unpack.nii` sidecar instead of holding the volume in RAM for every `/slice`.
+
+### Changed — Full volume on a remote link
+- **Adaptive full-volume policy** (new default): files ≤8MB and local/WSL/container opens still load the volume immediately. Medium files (8–80MB) on a healthy link debounce a background `/file` download. Files above 80MB, or a link under ~2 Mbps / RTT above 400ms, stay on `/slice` until MIP or registration asks for voxels.
+- **Scrolling preempts background downloads**: wheel and slider motion cancel auto `/file` transfers (MIP/registration loads are left alone). The proxy aborts an in-flight background stream when the client disconnects or a slice is queued.
+- **Slice prefetch follows the link**: ±1 neighbour on a slow link, ±4 when the link is fast.
+
+### Added — 4D timepoints and Analyze pairs
+- **Time slider** for `dim[4] > 1`. Host header parsing now reads `nt`/`dt`; `/slice` accepts `?t=` so later volumes do not require a full 4D download.
+- **`.hdr` + `.img`**: opening an Analyze/NIfTI header looks up the sibling voxel file. Voxel I/O uses the `.img`; the header file stays 348/540 bytes.
+
 ## [2.3.1] - 2026-09-09
 
-### Changed — Remote loading (P0)
-- **Paint z=0 immediately**: streaming / chunked / compressed paths no longer discard `partialPreview`. The first axial slice is shown as soon as it is decompressed instead of waiting for the full volume.
-- **WAN vs local-fast remotes**: `vscode.env.remoteName` is classified. WSL and Dev Containers use the local rapidgzip/mmap path; only SSH / Codespaces / Tunnels are treated as WAN (`X-Remote-Source` is set only for those).
-- **Slice-on-demand for large WAN files** (≥8MB): Remote-SSH no longer downloads the whole `.nii` / `.nii.gz` across the tunnel by default. The host extracts a cheap preview on the remote disk and the webview scrolls via `/slice`. HTTP remotes follow the same preview-first path. Full volume still loads for small files, local/WSL, and when the user needs MIP/registration.
-- **Slow-link preload off**: next-image full-volume prefetch is skipped on low-bandwidth links and in slice-on-demand mode so it cannot starve the current view.
+### Changed — Remote loading
+- **First axial slice paints immediately**: streaming / chunked / compressed paths no longer discard `partialPreview`. The first slice is shown as soon as it is decompressed instead of waiting for the full volume.
+- **WSL and Dev Containers stay local-fast**: `vscode.env.remoteName` is classified. WSL and Dev Containers use the local rapidgzip/mmap path; only SSH / Codespaces / Tunnels set `X-Remote-Source` and avoid pulling whole volumes by default.
+- **On-demand slices for large remote files** (≥8MB): Remote-SSH no longer downloads the whole `.nii` / `.nii.gz` across the tunnel by default. The host extracts a cheap preview on the remote disk and the webview scrolls via `/slice`. HTTP remotes follow the same preview-first path. Full volume still loads for small files, local/WSL, and when the user needs MIP/registration.
+- **Slow-link preload off**: next-image full-volume prefetch is skipped on low-bandwidth links and in slice mode so it cannot starve the current view.
 
 ## [2.3.0] - 2026-08-30
 

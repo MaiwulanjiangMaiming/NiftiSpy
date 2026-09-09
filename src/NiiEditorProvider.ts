@@ -4,10 +4,11 @@ import * as fs from 'fs';
 import * as zlib from 'zlib';
 import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
-import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
 import { downsampleSlice } from './nifti/sliceExtractor';
 import { getNativeBindings } from './nativeBridge';
+import { parseNiiHeaderQuick } from './nifti/headerParser';
 import { isWanRemote, shouldUseSliceMode, SLICE_MODE_MIN_BYTES } from './remoteEnv';
+import { resolveAnalyzePair, isAnalyzeHeaderPath, type AnalyzePair } from './io/analyzePair';
 
 interface LoadJob {
   webviewId: string;
@@ -91,7 +92,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private loadQueue: LoadQueue;
   private webviewCounter = 0;
   private activeWebviews = new Map<string, { panel: vscode.WebviewPanel; abortController: AbortController }>();
-  private gzipIndexes = new Map<string, GzipIndex>();
   private gzipIndexStatusItems = new Map<string, vscode.Disposable>();
   private chunkProgressItem: vscode.StatusBarItem | null = null;
   private nativeStatusBarItem: vscode.StatusBarItem | null = null;
@@ -311,6 +311,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     _token: vscode.CancellationToken
   ): Promise<void> {
     const uri = document.uri;
+    const pair = await resolveAnalyzePair(uri);
     const webview = webviewPanel.webview;
     const webviewId = String(this.webviewCounter++);
 
@@ -336,14 +337,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         await this.proxy.start();
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
-      fileUrl = this.proxy.registerFile(uri);
+      fileUrl = this.proxy.registerFile(pair.headerUri, pair.separateImg ? pair.dataUri : undefined);
       entryId = fileUrl.split('/').pop()!;
     } else {
       // Local file: direct webview URI + postMessage. Worker fetch of
       // asWebviewUri URLs is unreliable across VS Code versions, so we
       // keep the proven postMessage path (Float64→Float32 + zero-copy
       // buffer + streaming gz load with 16MB highWaterMark).
-      fileUrl = webview.asWebviewUri(uri).toString();
+      fileUrl = webview.asWebviewUri(pair.dataUri).toString();
     }
 
     webview.html = this.buildHtml(webview, fileUrl, uri.fsPath ?? uri.toString());
@@ -390,10 +391,16 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         let fileSize = 0;
         let validationToken = '';
         try {
-          if (!isRemote && uri.fsPath) {
-            const stat = await fs.promises.stat(uri.fsPath);
+          if (!isRemote && pair.dataUri.fsPath) {
+            const stat = await fs.promises.stat(pair.dataUri.fsPath);
             fileSize = stat.size;
             validationToken = `${stat.mtimeMs}:${stat.size}`;
+          } else if (isRemote) {
+            try {
+              const stat = await vscode.workspace.fs.stat(pair.dataUri);
+              fileSize = Number(stat.size);
+              validationToken = `${stat.mtime}:${stat.size}`;
+            } catch { /* remote stat optional */ }
           }
         } catch {
           // stat may fail for remote URIs; validationToken stays empty
@@ -405,27 +412,31 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           defaultColormap: config.get('defaultColormap', 'gray'),
           previewMode: config.get('previewMode', 'binary'),
           renderBackend: config.get('renderBackend', 'canvas'),
-          fullVolumePolicy: config.get('fullVolumePolicy', 'debounced'),
+          fullVolumePolicy: config.get('fullVolumePolicy', 'adaptive'),
           nativeAcceleration: config.get('nativeAcceleration', 'auto'),
           isRemote,
-          // True WAN Remote-SSH (not WSL/Dev Container): startLocalLoad will
-          // try port-forwarded HTTP, then either slice-on-demand (large files)
+          // Remote-SSH (not WSL/Dev Container): startLocalLoad will try
+          // port-forwarded HTTP, then either on-demand slices (large files)
           // or a full fetch (small files). The webview skips the HTTP-preview
           // fallback timer while that message is in flight.
           isRemoteSsh: !isRemote && isWanRemote(),
           deferFullVolume: isRemote || shouldUseSliceMode(fileSize),
           fileUrl,
-          directUrl: isRemote ? uri.toString() : '',
+          directUrl: isRemote ? pair.dataUri.toString() : '',
           fileName: path.basename(uri.fsPath ?? uri.toString()),
           webviewId,
           fileSize,
           validationToken,
         });
 
+        if (isAnalyzeHeaderPath(uri.fsPath || uri.path) && !pair.separateImg) {
+          vscode.window.showWarningMessage('NiftiSpy: no matching .img next to this .hdr — voxel data was not found.');
+        }
+
         if (isRemote && entryId) {
           this.startPreviewLoad(entryId, webview, webviewId, uri, abortController.signal);
         } else if (!isRemote) {
-          this.startLocalLoad(webview, webviewId, uri, abortController.signal, fileSize, validationToken);
+          this.startLocalLoad(webview, webviewId, uri, abortController.signal, fileSize, validationToken, pair);
         }
       } else if (msg.type === 'remoteHttpFallback') {
         // The webview could not fetch the port-forwarded proxy URL
@@ -441,14 +452,15 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       } else if (msg.type === 'selectImage') {
         const files = await vscode.window.showOpenDialog({
           canSelectMany: false,
-          filters: { 'NIfTI Files': ['nii', 'nii.gz'] },
+          filters: { 'NIfTI Files': ['nii', 'nii.gz', 'hdr', 'img'] },
           title: 'Select Image File',
         });
         if (files && files.length > 0) {
           const imgUri = files[0];
+          const imgPair = await resolveAnalyzePair(imgUri);
           const imgIsRemote = imgUri.scheme !== 'file';
           const imgFileName = path.basename(imgUri.fsPath ?? imgUri.toString());
-          const imgIsGzip = imgUri.fsPath?.endsWith('.gz') ?? false;
+          const imgIsGzip = (imgPair.dataUri.fsPath || imgUri.fsPath)?.endsWith('.gz') ?? false;
           const imgWebviewId = msg.webviewId || webviewId;
 
           if (imgIsRemote) {
@@ -457,12 +469,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               await this.proxy.start();
               this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
             }
-            const imgUrl = this.proxy.registerFile(imgUri);
+            const imgUrl = this.proxy.registerFile(imgPair.headerUri, imgPair.separateImg ? imgPair.dataUri : undefined);
             const entryId = imgUrl.split('/').pop()!;
             webview.postMessage({
               type: 'newImage',
               fileUrl: imgUrl,
-              directUrl: imgUri.toString(),
+              directUrl: imgPair.dataUri.toString(),
               fileName: imgFileName,
               isGzip: imgIsGzip,
               isRemote: true,
@@ -470,13 +482,13 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             this.startPreviewLoad(entryId, webview, imgWebviewId, imgUri, new AbortController().signal);
           } else {
             // Local file: direct webview URI + postMessage (same as initial open).
-            const imgUrl = webview.asWebviewUri(imgUri).toString();
+            const imgUrl = webview.asWebviewUri(imgPair.dataUri).toString();
             // stat for size-aware dispatch + cache validation (mirrors initial open).
             let imgFileSize = 0;
             let imgValidationToken = '';
             try {
-              if (imgUri.fsPath) {
-                const st = await fs.promises.stat(imgUri.fsPath);
+              if (imgPair.dataUri.fsPath) {
+                const st = await fs.promises.stat(imgPair.dataUri.fsPath);
                 imgFileSize = st.size;
                 imgValidationToken = `${st.mtimeMs}:${st.size}`;
               }
@@ -490,7 +502,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               isGzip: imgIsGzip,
               isRemote: false,
             });
-            this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal, imgFileSize, imgValidationToken);
+            this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal, imgFileSize, imgValidationToken, imgPair);
           }
         }
       } else if (msg.type === 'exportSlice') {
@@ -561,58 +573,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     });
   }
 
-  private parseNiiHeaderFromBuffer(buf: Uint8Array): any | null {
-    if (buf.length < 348) return null;
-    const v = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-    const le = v.getInt32(0, true) === 348 || v.getInt32(0, true) === 540;
-    if (!le && v.getInt32(0, false) !== 348 && v.getInt32(0, false) !== 540) return null;
-    const sizeofHdr = v.getInt32(0, le);
-    const version = sizeofHdr === 540 ? 2 : 1;
-    let nx: number, ny: number, nz: number, dx: number, dy: number, dz: number;
-    let datatype: number, bitpix: number, voxOffset: number;
-    let scl_slope: number, scl_inter: number;
-    let qform_code: number, sform_code: number;
-    let quatern_b: number, quatern_c: number, quatern_d: number;
-    let qoffset_x: number, qoffset_y: number, qoffset_z: number;
-    let srow_x: number[], srow_y: number[], srow_z: number[];
-
-    if (version === 1) {
-      nx = Math.max(1, v.getInt16(42, le)); ny = Math.max(1, v.getInt16(44, le)); nz = Math.max(1, v.getInt16(46, le));
-      datatype = v.getInt16(70, le); bitpix = v.getInt16(72, le);
-      dx = Math.abs(v.getFloat32(80, le)) || 1; dy = Math.abs(v.getFloat32(84, le)) || 1; dz = Math.abs(v.getFloat32(88, le)) || 1;
-      voxOffset = Math.max(352, v.getFloat32(108, le));
-      scl_slope = v.getFloat32(112, le); scl_inter = v.getFloat32(116, le);
-      qform_code = v.getInt16(252, le); sform_code = v.getInt16(254, le);
-      quatern_b = v.getFloat32(256, le); quatern_c = v.getFloat32(260, le); quatern_d = v.getFloat32(264, le);
-      qoffset_x = v.getFloat32(268, le); qoffset_y = v.getFloat32(272, le); qoffset_z = v.getFloat32(276, le);
-      srow_x = [v.getFloat32(280, le), v.getFloat32(284, le), v.getFloat32(288, le), v.getFloat32(292, le)];
-      srow_y = [v.getFloat32(296, le), v.getFloat32(300, le), v.getFloat32(304, le), v.getFloat32(308, le)];
-      srow_z = [v.getFloat32(312, le), v.getFloat32(316, le), v.getFloat32(320, le), v.getFloat32(324, le)];
-    } else {
-      const readInt64 = (off: number) => { const lo = v.getUint32(off, le); const hi = v.getInt32(off + 4, le); return hi * 0x100000000 + lo; };
-      nx = readInt64(24); ny = readInt64(32); nz = readInt64(40);
-      datatype = v.getInt16(12, le); bitpix = v.getInt16(14, le);
-      dx = Math.abs(v.getFloat64(104, le)) || 1; dy = Math.abs(v.getFloat64(112, le)) || 1; dz = Math.abs(v.getFloat64(120, le)) || 1;
-      voxOffset = Math.max(544, readInt64(168));
-      scl_slope = v.getFloat64(176, le); scl_inter = v.getFloat64(184, le);
-      qform_code = v.getInt16(196, le); sform_code = v.getInt16(198, le);
-      quatern_b = v.getFloat32(200, le); quatern_c = v.getFloat32(204, le); quatern_d = v.getFloat32(208, le);
-      qoffset_x = v.getFloat32(212, le); qoffset_y = v.getFloat32(216, le); qoffset_z = v.getFloat32(220, le);
-      srow_x = [v.getFloat64(224, le), v.getFloat64(232, le), v.getFloat64(240, le), v.getFloat64(248, le)];
-      srow_y = [v.getFloat64(256, le), v.getFloat64(264, le), v.getFloat64(272, le), v.getFloat64(280, le)];
-      srow_z = [v.getFloat64(288, le), v.getFloat64(296, le), v.getFloat64(304, le), v.getFloat64(312, le)];
-    }
-
-    return {
-      version, ndim: 3, nx, ny, nz, nt: 1, nu: 1, dx, dy, dz, dt: 0, datatype, bitpix, voxOffset,
-      scl_slope: scl_slope || 1, scl_inter: scl_inter || 0,
-      littleEndian: le, qform_code, sform_code, quatern_b, quatern_c, quatern_d,
-      qoffset_x, qoffset_y, qoffset_z, srow_x, srow_y, srow_z,
-      isGzip: false, bytesPerVoxel: Math.max(1, bitpix / 8),
-      totalVoxels3D: nx * ny * nz, sliceSizeXY: nx * ny,
-      volumeBytes: nx * ny * nz * Math.max(1, bitpix / 8),
-      descrip: '', xyzt_units: 0, orientation: '',
-    };
+  private parseNiiHeaderFromBuffer(buf: Uint8Array, separateImg = false): any | null {
+    return parseNiiHeaderQuick(buf, { separateImg });
   }
 
   private computeVoxelStats(rawData: Uint8Array, header: any, fsPath?: string): { min: number; max: number } {
@@ -700,7 +662,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     uri: vscode.Uri,
     signal: AbortSignal,
     fileSize: number = 0,
-    validationToken: string = ''
+    validationToken: string = '',
+    pair?: AnalyzePair,
   ): Promise<void> {
     const uriKey = uri.toString();
     const cached = this.volumeCache.get(uriKey);
@@ -917,12 +880,24 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             streamStats = result.stats;  // min/max computed during load (full scan, free)
             streamTiming = result.timing;
           } else {
-            // .nii: direct read (SSD < 0.5s for 500MB)
-            const fullData = await fs.promises.readFile(fsPath);
-            if (signal.aborted) return;
-            rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
-            header = this.parseNiiHeaderFromBuffer(rawData);
-            if (!header) return;
+            // Uncompressed .nii, or Analyze .hdr + companion .img
+            const headerPath = pair?.headerUri.fsPath || fsPath;
+            const dataPath = pair?.dataUri.fsPath || fsPath;
+            if (pair?.separateImg && headerPath !== dataPath) {
+              const headerBuf = await fs.promises.readFile(headerPath);
+              if (signal.aborted) return;
+              header = this.parseNiiHeaderFromBuffer(new Uint8Array(headerBuf), true);
+              if (!header) return;
+              const imgData = await fs.promises.readFile(dataPath);
+              if (signal.aborted) return;
+              rawData = new Uint8Array(imgData.buffer, imgData.byteOffset, imgData.byteLength);
+            } else {
+              const fullData = await fs.promises.readFile(fsPath);
+              if (signal.aborted) return;
+              rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
+              header = this.parseNiiHeaderFromBuffer(rawData);
+              if (!header) return;
+            }
           }
 
           if (signal.aborted) return;
@@ -980,10 +955,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.updateCacheStatusBar();
 
           const perfT3 = performance.now();
-          // Build gzip index in background for .nii.gz files
-          if (isGzip && !this.gzipIndexes.has(uriKey)) {
-            this.buildGzipIndexInBackground(fsPath, uriKey);
-          }
 
           // ── Avoid double copy: pass the full underlying ArrayBuffer ──
           // Previous code did `voxelOnly.buffer.slice(...)` which COPIED the
@@ -1441,8 +1412,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
    * port-forward it via vscode.env.asExternalUri, then let the webview
    * Worker fetch the forwarded URL directly.
    *
-   * Large files (≥8MB) use slice-on-demand: the host extracts a cheap
-   * z=0 / ortho preview on the remote disk and the webview scrolls via
+   * Large files (≥8MB) keep the compressed object on the remote disk: the
+   * host extracts a cheap z=0 / ortho preview and the webview scrolls via
    * /slice. Small files still stream the whole compressed object — the
    * extra round trips of slice mode are a net loss below that size.
    *
@@ -1465,7 +1436,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         await this.proxy.start();
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
-      const proxyUrl = this.proxy.registerFile(uri);
+      const pair = await resolveAnalyzePair(uri);
+      const proxyUrl = this.proxy.registerFile(pair.headerUri, pair.separateImg ? pair.dataUri : undefined);
       const entryId = proxyUrl.split('/').pop()!;
       // Ask VS Code to forward the remote-side localhost port so the local
       // webview can reach it. Throws when forwarding is unavailable
@@ -1481,7 +1453,34 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       });
 
       if (sliceMode) {
-        this.proxy.startGzipIndex(entryId);
+        if (isGzip) {
+          const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+          statusItem.text = '$(sync~spin) Building gzip index...';
+          statusItem.show();
+          this.gzipIndexStatusItems.set(webviewId, statusItem);
+          this.proxy.startGzipIndex(entryId, (pct: number) => {
+            statusItem.text = `$(sync~spin) Building gzip index... ${pct}%`;
+          });
+          void this.proxy.whenGzipIndexReady(entryId).then(() => {
+            statusItem.dispose();
+            this.gzipIndexStatusItems.delete(webviewId);
+          });
+          void this.proxy.whenGzipOrthoReady(entryId).then((ortho) => {
+            if (!ortho || signal.aborted) return;
+            void webview.postMessage({
+              type: 'previewOrtho',
+              header: ortho.header,
+              globalMin: ortho.min,
+              globalMax: ortho.max,
+              slope: ortho.slope,
+              inter: ortho.inter,
+              sliceIdx: ortho.sliceIdx,
+              axialSlice: ortho.axial,
+              coronalSlice: ortho.coronal,
+              sagittalSlice: ortho.sagittal,
+            });
+          });
+        }
         let preview: Awaited<ReturnType<LocalFileProxy['extractPreviewForWebview']>> = null;
         try {
           preview = await this.proxy.extractPreviewForWebview(entryId, signal);
@@ -2268,37 +2267,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     return { data: ds.data, w: ds.w, h: ds.h };
   }
 
-  private buildGzipIndexInBackground(fsPath: string, uriKey: string): void {
-    // Try loading cached index first
-    loadCachedIndex(fsPath).then((cachedIndex) => {
-      if (cachedIndex) {
-        this.gzipIndexes.set(uriKey, cachedIndex);
-        return;
-      }
-
-      // No cached index — build one with progress reporting
-      const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-      statusItem.text = `$(sync~spin) Building gzip index...`;
-      statusItem.show();
-      this.gzipIndexStatusItems.set(uriKey, statusItem);
-
-      GzipIndex.buildIndex(fsPath, undefined, (pct: number) => {
-        statusItem.text = `$(sync~spin) Building gzip index... ${pct}%`;
-      }).then((index) => {
-        this.gzipIndexes.set(uriKey, index);
-        statusItem.dispose();
-        this.gzipIndexStatusItems.delete(uriKey);
-        // Save to cache for reuse
-        saveCachedIndex(fsPath, index).catch(() => {});
-      }).catch(() => {
-        statusItem.dispose();
-        this.gzipIndexStatusItems.delete(uriKey);
-      });
-    }).catch(() => {
-      // If cache load fails, silently skip
-    });
-  }
-
   private buildHtml(
     webview: vscode.Webview,
     _fileUrl: string,
@@ -2480,6 +2448,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
       <div class="sr"><label>Axial Z:</label><input id="axial-slider-side" type="range" min="0" max="100" value="50" role="slider" aria-label="Axial slice Z" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="sv" id="axial-val">0</span></div>
       <div class="sr"><label>Coronal Y:</label><input id="coronal-slider-side" type="range" min="0" max="100" value="50" role="slider" aria-label="Coronal slice Y" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="sv" id="coronal-val">0</span></div>
       <div class="sr"><label>Sagittal X:</label><input id="sagittal-slider-side" type="range" min="0" max="100" value="50" role="slider" aria-label="Sagittal slice X" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50"><span class="sv" id="sagittal-val">0</span></div>
+      <div class="sr" id="time-slider-row" style="display:none"><label>Time T:</label><input id="time-slider-side" type="range" min="0" max="0" value="0" role="slider" aria-label="Time index" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0"><span class="sv" id="time-val">0</span></div>
     </div>
     <div class="ss">
       <h3>Images</h3>

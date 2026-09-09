@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",
@@ -96,12 +96,36 @@
       }
     ],
     "keybindings": [
-      { "key": "alt+up", "command": "niftispy.scrollSliceUp", "when": "activeCustomEditorId == 'niftispy.nifti'" },
-      { "key": "alt+down", "command": "niftispy.scrollSliceDown", "when": "activeCustomEditorId == 'niftispy.nifti'" },
-      { "key": "alt+a", "command": "niftispy.setViewAxial", "when": "activeCustomEditorId == 'niftispy.nifti'" },
-      { "key": "alt+c", "command": "niftispy.setViewCoronal", "when": "activeCustomEditorId == 'niftispy.nifti'" },
-      { "key": "alt+s", "command": "niftispy.setViewSagittal", "when": "activeCustomEditorId == 'niftispy.nifti'" },
-      { "key": "alt+r", "command": "niftispy.resetView", "when": "activeCustomEditorId == 'niftispy.nifti'" }
+      {
+        "key": "alt+up",
+        "command": "niftispy.scrollSliceUp",
+        "when": "activeCustomEditorId == 'niftispy.nifti'"
+      },
+      {
+        "key": "alt+down",
+        "command": "niftispy.scrollSliceDown",
+        "when": "activeCustomEditorId == 'niftispy.nifti'"
+      },
+      {
+        "key": "alt+a",
+        "command": "niftispy.setViewAxial",
+        "when": "activeCustomEditorId == 'niftispy.nifti'"
+      },
+      {
+        "key": "alt+c",
+        "command": "niftispy.setViewCoronal",
+        "when": "activeCustomEditorId == 'niftispy.nifti'"
+      },
+      {
+        "key": "alt+s",
+        "command": "niftispy.setViewSagittal",
+        "when": "activeCustomEditorId == 'niftispy.nifti'"
+      },
+      {
+        "key": "alt+r",
+        "command": "niftispy.resetView",
+        "when": "activeCustomEditorId == 'niftispy.nifti'"
+      }
     ],
     "commands": [
       {
@@ -162,13 +186,14 @@
         },
         "niftispy.fullVolumePolicy": {
           "type": "string",
-          "default": "debounced",
+          "default": "adaptive",
           "enum": [
+            "adaptive",
             "manual",
             "debounced",
             "eager"
           ],
-          "description": "When to trigger full-volume loading"
+          "description": "When to load the full volume. adaptive: small and local files load immediately; medium files on a fast link debounce a background download; large files and slow links stay on slices until MIP or registration needs voxels."
         },
         "niftispy.nativeAcceleration": {
           "type": "string",
@@ -219,6 +244,7 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
-    "fflate": "^0.8.2"
+    "fflate": "^0.8.2",
+    "pako": "^3.0.1"
   }
 }

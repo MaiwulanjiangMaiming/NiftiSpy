@@ -514,9 +514,10 @@ export function deriveFileHash(fileName: string, fileSize: number): string {
 export function makeSliceCacheKey(
   fileHash: string,
   axis: string,
-  sliceIndex: number
+  sliceIndex: number,
+  timeIdx = 0,
 ): string {
-  return `${fileHash}_${axis}_${sliceIndex}`;
+  return timeIdx ? `${fileHash}_${axis}_${sliceIndex}_t${timeIdx}` : `${fileHash}_${axis}_${sliceIndex}`;
 }
 
 // Singleton for convenient shared usage

@@ -17,8 +17,14 @@ export function computeSliceMinMax(...slices: Float32Array[]): { min: number; ma
   return { min, max };
 }
 
-export function encodePreviewBinary(header: any, slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array }, min: number, max: number): Buffer {
-  const sliceIdxVal = {
+export function encodePreviewBinary(
+  header: any,
+  slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array },
+  min: number,
+  max: number,
+  sliceIdx?: { axial: number; coronal: number; sagittal: number },
+): Buffer {
+  const sliceIdxVal = sliceIdx ?? {
     axial: Math.floor(header.nz / 2),
     coronal: Math.floor(header.ny / 2),
     sagittal: Math.floor(header.nx / 2),

@@ -15,7 +15,7 @@ function classifyRemote(remoteName) {
   }
 }
 
-test('classifyRemote: local / WSL / container vs WAN SSH', () => {
+test('classifyRemote: local / WSL / container vs SSH', () => {
   assert.equal(classifyRemote(undefined), 'local');
   assert.equal(classifyRemote(null), 'local');
   assert.equal(classifyRemote(''), 'local');
@@ -27,11 +27,13 @@ test('classifyRemote: local / WSL / container vs WAN SSH', () => {
   assert.equal(classifyRemote('tunnel'), 'sshWan');
 });
 
-test('src/remoteEnv.ts keeps WSL/container as localFast and SSH as WAN', () => {
+test('src/remoteEnv.ts keeps WSL/container as localFast and SSH as sshWan', () => {
   const src = fs.readFileSync(path.join(__dirname, '../src/remoteEnv.ts'), 'utf8');
+  const policy = fs.readFileSync(path.join(__dirname, '../src/volumePolicy.ts'), 'utf8');
   assert.match(src, /case 'wsl':/);
   assert.match(src, /case 'dev-container':/);
   assert.match(src, /return 'localFast'/);
   assert.match(src, /return 'sshWan'/);
-  assert.match(src, /SLICE_MODE_MIN_BYTES = 8 \* 1024 \* 1024/);
+  assert.match(policy, /SLICE_MODE_MIN_BYTES = 8 \* 1024 \* 1024/);
+  assert.match(policy, /LARGE_FILE_BYTES = 80 \* 1024 \* 1024/);
 });

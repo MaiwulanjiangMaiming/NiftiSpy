@@ -15,6 +15,8 @@ initWasmBindings().then(bindings => {
   console.log('[Worker] WASM SIMD not available, using JS fallback');
 });
 
+let volumeFetchPriority: 'user' | 'background' = 'background';
+
 const MAX_RETRIES = 3;
 const CHUNK_SIZE = 16 * 1024 * 1024;
 const RETRY_DELAY_BASE = 500;
@@ -62,7 +64,8 @@ self.onmessage = async (e: MessageEvent) => {
   const { id, type, url, isGzip, directUrl } = e.data;
   try {
     if (type === 'loadVolume') {
-      const { estimatedBps = 0, estimatedRttMs = 0 } = e.data;
+      const { estimatedBps = 0, estimatedRttMs = 0, priority = 'background' } = e.data;
+      volumeFetchPriority = priority === 'user' ? 'user' : 'background';
       await handleLoadVolume(id, url, isGzip, directUrl, estimatedBps, estimatedRttMs);
     } else if (type === 'loadVolumeFromData') {
       await handleLoadVolumeFromData(id, e.data);
@@ -183,13 +186,18 @@ function createVolumeView(buffer: SharedArrayBuffer, datatype: number, length: n
 
 async function fetchWithRetry(url: string, options?: RequestInit, retries: number = MAX_RETRIES, signal?: AbortSignal): Promise<Response> {
   let lastErr: Error | null = null;
+  const headers = new Headers(options?.headers || {});
+  if (!headers.has('X-NiftiSpy-Priority')) {
+    headers.set('X-NiftiSpy-Priority', volumeFetchPriority);
+  }
+  const opts: RequestInit = { ...options, headers };
   for (let attempt = 0; attempt < retries; attempt++) {
     throwIfAborted(signal);
     try {
       // Headers phase is watchdog-protected: a frozen VPN never rejects the
       // fetch promise, so without this every caller could hang at TTFB.
       // TimeoutError lands in the retry path below (it is not an AbortError).
-      const resp = await fetchHeadersWatchdog(url, options || {}, DEFAULT_IDLE_TIMEOUT_MS, signal);
+      const resp = await fetchHeadersWatchdog(url, opts, DEFAULT_IDLE_TIMEOUT_MS, signal);
       if (resp.ok || resp.status === 206) return resp;
       const shouldRetryStatus = resp.status === 408 || resp.status === 425 || resp.status === 429 || resp.status >= 500;
       if (shouldRetryStatus && attempt < retries - 1) {
@@ -376,12 +384,12 @@ async function fetchRangeBytesWithRetry(
   throw lastErr || new Error('Range fetch failed after retries');
 }
 
-function getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number): string {
-  return `${url}|${axis}|${index}|${factor}`;
+function getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): string {
+  return `${url}|${axis}|${index}|${factor}|t${timeIdx}`;
 }
 
-function getCachedSlice(url: string, axis: SliceAxis, index: number, factor: number): CachedSlice | null {
-  const key = getSliceCacheKey(url, axis, index, factor);
+function getCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): CachedSlice | null {
+  const key = getSliceCacheKey(url, axis, index, factor, timeIdx);
   const cached = sliceCache.get(key);
   if (!cached) return null;
   sliceCache.delete(key);
@@ -389,8 +397,8 @@ function getCachedSlice(url: string, axis: SliceAxis, index: number, factor: num
   return cached;
 }
 
-function setCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, slice: CachedSlice): void {
-  const key = getSliceCacheKey(url, axis, index, factor);
+function setCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, slice: CachedSlice, timeIdx = 0): void {
+  const key = getSliceCacheKey(url, axis, index, factor, timeIdx);
   sliceCache.delete(key);
   sliceCache.set(key, slice);
   while (sliceCache.size > MAX_SLICE_CACHE) {
@@ -400,9 +408,10 @@ function setCachedSlice(url: string, axis: SliceAxis, index: number, factor: num
   }
 }
 
-function buildSliceUrl(url: string, axis: SliceAxis, index: number, factor: number): string {
+function buildSliceUrl(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): string {
   const sliceUrl = new URL(url.replace('/file/', '/slice/') + `/${axis}/${index}`);
   if (factor > 1) sliceUrl.searchParams.set('factor', String(factor));
+  if (timeIdx > 0) sliceUrl.searchParams.set('t', String(timeIdx));
   return sliceUrl.toString();
 }
 
@@ -416,10 +425,10 @@ function getPreferredConcurrency(url: string): number {
   return REMOTE_MAX_CONCURRENT;
 }
 
-async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: number, signal?: AbortSignal): Promise<CachedSlice> {
-  const cached = getCachedSlice(url, axis, index, factor);
+async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: number, signal?: AbortSignal, timeIdx = 0): Promise<CachedSlice> {
+  const cached = getCachedSlice(url, axis, index, factor, timeIdx);
   if (cached) return cached;
-  const cacheKey = getSliceCacheKey(url, axis, index, factor);
+  const cacheKey = getSliceCacheKey(url, axis, index, factor, timeIdx);
   const pending = pendingSliceFetches.get(cacheKey);
   if (pending) return pending;
 
@@ -428,13 +437,13 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     if (currentFileHash) {
       try {
         const db = await ensureSliceCacheDB();
-        const dbKey = makeSliceCacheKey(currentFileHash, axis, index);
+        const dbKey = makeSliceCacheKey(currentFileHash, axis, index, timeIdx);
         const dbData = await db.get(dbKey);
         if (dbData) {
           recordCacheHit('l3');
           const data = new Float32Array(dbData);
           const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
-          setCachedSlice(url, axis, index, factor, slice);
+          setCachedSlice(url, axis, index, factor, slice, timeIdx);
           return slice;
         }
       } catch {
@@ -443,13 +452,13 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     }
 
     // Fall back to legacy IndexedDB cache
-    const idbKey = makeCacheKey(url, axis, index);
+    const idbKey = makeCacheKey(url, axis, index) + (timeIdx ? `|t${timeIdx}` : '');
     const idbData = await getCachedChunk(idbKey);
     if (idbData) {
       recordCacheHit('l3');
       const data = new Float32Array(idbData);
       const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
-      setCachedSlice(url, axis, index, factor, slice);
+      setCachedSlice(url, axis, index, factor, slice, timeIdx);
       return slice;
     }
     recordCacheMiss('l3');
@@ -457,7 +466,7 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     const startedAt = performance.now();
     recordL4Fetch();
     if (signal?.aborted) throw abortError();
-    const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor), undefined, MAX_RETRIES, signal);
+    const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor, timeIdx), undefined, MAX_RETRIES, signal);
     if (!resp.ok) {
       throw new Error(`Slice fetch failed: ${resp.status}`);
     }
@@ -472,12 +481,12 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
       height,
       timestamp: Date.now(),
     };
-    setCachedSlice(url, axis, index, factor, slice);
+    setCachedSlice(url, axis, index, factor, slice, timeIdx);
 
     // Store in new SliceCacheDB (primary)
     if (currentFileHash) {
       const db = await ensureSliceCacheDB();
-      const dbKey = makeSliceCacheKey(currentFileHash, axis, index);
+      const dbKey = makeSliceCacheKey(currentFileHash, axis, index, timeIdx);
       db.put(dbKey, buffer).catch(() => {});
       // Background eviction
       db.evictLRU().catch(() => {});
@@ -508,11 +517,13 @@ async function handleFetchSlice(message: {
   factor?: number;
   prefetch?: number;
   maxIndex?: number;
+  timeIdx?: number;
   signal?: AbortSignal;
 }): Promise<void> {
   const factor = Math.max(1, message.factor || 1);
+  const timeIdx = message.timeIdx || 0;
 
-  if (sharedVolume && factor === 1) {
+  if (sharedVolume && factor === 1 && timeIdx === 0) {
     const { buffer, nx, ny, nz, slope, inter, datatype } = sharedVolume;
     const data = createVolumeView(buffer, datatype, nx * ny * nz);
     const idx = message.index;
@@ -559,11 +570,11 @@ async function handleFetchSlice(message: {
     return;
   }
 
-  const slice = await fetchSlice(message.url, message.axis, message.index, factor, message.signal);
+  const slice = await fetchSlice(message.url, message.axis, message.index, factor, message.signal, timeIdx);
   // Transfer the buffer directly instead of copying — the cache entry
   // becomes invalid after transfer, so remove it from the cache.
   const payload = slice.data;
-  const cacheKey = getSliceCacheKey(message.url, message.axis, message.index, factor);
+  const cacheKey = getSliceCacheKey(message.url, message.axis, message.index, factor, timeIdx);
   sliceCache.delete(cacheKey);
   self.postMessage({
     id: message.id,
@@ -583,8 +594,8 @@ async function handleFetchSlice(message: {
   for (let delta = 1; delta <= prefetch; delta++) {
     for (const nextIndex of [message.index - delta, message.index + delta]) {
       if (nextIndex < 0 || nextIndex > maxIndex) continue;
-      if (getCachedSlice(message.url, message.axis, nextIndex, factor)) continue;
-      void fetchSlice(message.url, message.axis, nextIndex, factor, message.signal).catch(() => {});
+      if (getCachedSlice(message.url, message.axis, nextIndex, factor, timeIdx)) continue;
+      void fetchSlice(message.url, message.axis, nextIndex, factor, message.signal, timeIdx).catch(() => {});
     }
   }
 }

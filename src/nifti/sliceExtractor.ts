@@ -1,4 +1,27 @@
 import { readLocalFilePartial } from '../io/fileReader';
+import { timepointByteOffset } from './headerParser';
+
+export function decodeVoxel(bytes: Uint8Array, offset: number, header: any, view?: DataView): number {
+  const bpv = Math.max(1, header.bitpix / 8);
+  if (offset + bpv > bytes.length) return 0;
+  const dv = view ?? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const le = header.littleEndian;
+  const slope = header.scl_slope || 1;
+  const inter = header.scl_inter || 0;
+  let val: number;
+  switch (header.datatype) {
+    case 2: val = bytes[offset]; break;
+    case 4: val = dv.getInt16(offset, le); break;
+    case 8: val = dv.getInt32(offset, le); break;
+    case 16: val = dv.getFloat32(offset, le); break;
+    case 64: val = dv.getFloat64(offset, le); break;
+    case 256: val = (bytes[offset] << 24) >> 24; break;
+    case 512: val = dv.getUint16(offset, le); break;
+    case 768: val = dv.getUint32(offset, le); break;
+    default: val = 0;
+  }
+  return val * slope + inter;
+}
 
 export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any): Float32Array {
   const { nx, ny, datatype, scl_slope, scl_inter, littleEndian } = header;
@@ -29,7 +52,7 @@ export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any):
   return slice;
 }
 
-export async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number): Promise<Float32Array | null> {
+export async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
   const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
   if (idx < 0 || idx >= ny) return null;
   const bpv = Math.max(1, header.bitpix / 8);
@@ -37,11 +60,12 @@ export async function extractCoronalSliceFromRange(fsPath: string, header: any, 
   const slope = scl_slope || 1;
   const inter = scl_inter || 0;
   const slice = new Float32Array(nx * nz);
+  const tOff = timepointByteOffset(header, timeIdx);
 
   const rowSize = nx * bpv;
   const promises: Promise<{ rowBytes: Uint8Array; z: number }>[] = [];
   for (let z = 0; z < nz; z++) {
-    const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bpv;
+    const rowOffset = voxOffset + tOff + (z * ny * nx + idx * nx) * bpv;
     promises.push(
       readLocalFilePartial(fsPath, rowOffset, rowOffset + rowSize - 1)
         .then(rowBytes => ({ rowBytes, z }))
@@ -71,7 +95,7 @@ export async function extractCoronalSliceFromRange(fsPath: string, header: any, 
   return slice;
 }
 
-export async function extractSagittalSliceFromRange(fsPath: string, header: any, idx: number): Promise<Float32Array | null> {
+export async function extractSagittalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
   const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
   if (idx < 0 || idx >= nx) return null;
   const bpv = Math.max(1, header.bitpix / 8);
@@ -79,11 +103,12 @@ export async function extractSagittalSliceFromRange(fsPath: string, header: any,
   const slope = scl_slope || 1;
   const inter = scl_inter || 0;
   const slice = new Float32Array(ny * nz);
+  const tOff = timepointByteOffset(header, timeIdx);
 
   const axialSize = nx * ny * bpv;
   const promises: Promise<{ axialBytes: Uint8Array; z: number }>[] = [];
   for (let z = 0; z < nz; z++) {
-    const axialOffset = voxOffset + z * nx * ny * bpv;
+    const axialOffset = voxOffset + tOff + z * nx * ny * bpv;
     promises.push(
       readLocalFilePartial(fsPath, axialOffset, axialOffset + axialSize - 1)
         .then(axialBytes => ({ axialBytes, z }))
@@ -168,10 +193,11 @@ export function extractPreviewSlices(rawData: Uint8Array, header: any): { axial:
   return { axial, coronal, sagittal };
 }
 
-export function extractSingleSlice(rawData: Uint8Array, header: any, axis: string, idx: number): Float32Array | null {
+export function extractSingleSlice(rawData: Uint8Array, header: any, axis: string, idx: number, timeIdx = 0): Float32Array | null {
   const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
   const bpv = Math.max(1, header.bitpix / 8);
-  const dataStart = voxOffset;
+  const tOff = timepointByteOffset(header, timeIdx);
+  const dataStart = voxOffset + tOff;
   const le = littleEndian;
   const slope = scl_slope || 1;
   const inter = scl_inter || 0;

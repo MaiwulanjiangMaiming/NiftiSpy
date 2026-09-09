@@ -16,6 +16,7 @@ native/index.node
 native-wasm/target/
 *.wasm
 .niftispy-index
+*.niftispy-unpack.nii
 
 # Benchmark/generated artifacts
 benchmarks/tmp/

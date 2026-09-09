@@ -45,7 +45,7 @@ interface SliceFrame {
 interface ViewerConfig {
   previewMode: 'binary' | 'json';
   renderBackend: 'auto' | 'webgl' | 'canvas';
-  fullVolumePolicy: 'manual' | 'debounced' | 'eager';
+  fullVolumePolicy: 'manual' | 'debounced' | 'eager' | 'adaptive';
   nativeAcceleration: 'off' | 'auto' | 'force';
 }
 
@@ -119,6 +119,7 @@ let sharedBufferBytes = 0;
 let workerCopyBytes = 0;
 
 const sliceIdx = { axial: 0, coronal: 0, sagittal: 0 };
+let timeIdx = 0;
 let windowWidth = 1.0;
 let windowLevel = 0.5;
 let pendingAddImageIdx = -1;
@@ -162,10 +163,11 @@ let isGzip = false;
 let fileName = '';
 let crosshairVisible = true;
 let isRemoteSource = false;
-// When true, do not auto-download the full volume (WAN large files / HTTP
-// remotes). Scrolling uses /slice; MIP/registration still require a manual
-// or explicit full load.
+// When true, do not auto-download the full volume (large Remote-SSH files /
+// HTTP remotes). Scrolling uses /slice; MIP/registration still require a
+// manual or explicit full load.
 let deferFullVolume = false;
+let currentFileSize = 0;
 // WebviewId assigned by the extension host (used to route fallback
 // requests such as 'remoteHttpFallback' back to the right webview).
 let currentWebviewId = '';
@@ -213,9 +215,11 @@ const MAX_PARALLEL_VOLUME_LOADS = 2;
 const ACTIVE_FULL_LOAD_DEBOUNCE_MS = 180;
 let activeVolumeLoads = 0;
 type VolumeLoadPriority = 'active' | 'background';
+type VolumeLoadReason = 'user' | 'auto';
 interface QueuedVolumeLoad {
   key: string;
   priority: VolumeLoadPriority;
+  reason: VolumeLoadReason;
   cancelled: boolean;
   run: () => void;
   reject: (reason?: any) => void;
@@ -225,6 +229,7 @@ let nextStreamRequestId = 2000;
 const workerStreamHandlers = new Map<number, (msg: any) => void>();
 let activeVolumeLoadKey: string | null = null;
 const volumeWorkers = new Map<string, Worker>();
+const volumeLoadReasons = new Map<string, VolumeLoadReason>();
 let activeLoadDebounceTimer: number | null = null;
 let scheduledActiveIndex: number | null = null;
 
@@ -282,7 +287,7 @@ const fpsCounter = {
 const viewerConfig: ViewerConfig = {
   previewMode: 'binary',
   renderBackend: 'auto',
-  fullVolumePolicy: 'debounced',
+  fullVolumePolicy: 'adaptive',
   nativeAcceleration: 'auto',
 };
 
@@ -499,6 +504,8 @@ class BandwidthEstimator {
   private maxSamples = 10;
   private _estimatedBps: number = 10 * 1024 * 1024;
   private _estimatedRttMs: number = 50;
+  private listeners: Array<() => void> = [];
+  private lastQuality: 'high' | 'medium' | 'low' = 'medium';
 
   get estimatedBps(): number {
     return this._estimatedBps;
@@ -506,6 +513,17 @@ class BandwidthEstimator {
 
   get estimatedRttMs(): number {
     return this._estimatedRttMs;
+  }
+
+  onQualityChange(fn: () => void): void {
+    this.listeners.push(fn);
+  }
+
+  private emitIfQualityChanged(): void {
+    const q = this.qualityLevel;
+    if (q === this.lastQuality) return;
+    this.lastQuality = q;
+    for (const fn of this.listeners) fn();
   }
 
   addSample(bytes: number, durationMs: number): void {
@@ -521,6 +539,7 @@ class BandwidthEstimator {
       totalMs += s.durationMs;
     }
     this._estimatedBps = (totalBytes / totalMs) * 1000 * 8;
+    this.emitIfQualityChanged();
   }
 
   addRttSample(rttMs: number): void {
@@ -528,17 +547,44 @@ class BandwidthEstimator {
     // Exponential moving average for RTT: smooth, responsive to regime changes.
     const alpha = 0.3;
     this._estimatedRttMs = this._estimatedRttMs * (1 - alpha) + rttMs * alpha;
+    this.emitIfQualityChanged();
   }
 
   get qualityLevel(): 'high' | 'medium' | 'low' {
     const mbps = this._estimatedBps / (1024 * 1024);
-    if (mbps > 50) return 'high';
-    if (mbps > 10) return 'medium';
-    return 'low';
+    if (mbps < 2 || this._estimatedRttMs > 400) return 'low';
+    if (mbps > 20) return 'high';
+    return 'medium';
   }
 }
 
 const bandwidthEstimator = new BandwidthEstimator();
+const SLICE_MODE_MIN_BYTES = 8 * 1024 * 1024;
+const LARGE_FILE_BYTES = 80 * 1024 * 1024;
+
+function shouldAutoloadFullVolume(): boolean {
+  const policy = viewerConfig.fullVolumePolicy;
+  if (policy === 'manual') return false;
+  if (policy === 'eager') return true;
+  if (policy === 'debounced') return !deferFullVolume;
+  const small = currentFileSize > 0 && currentFileSize <= SLICE_MODE_MIN_BYTES;
+  const large = currentFileSize <= 0 || currentFileSize > LARGE_FILE_BYTES;
+  if (small || !deferFullVolume) return true;
+  if (large || bandwidthEstimator.qualityLevel === 'low') return false;
+  return true;
+}
+
+function volumeHasTimepoint(t: number): boolean {
+  if (!header || !volumeData) return false;
+  const frame = header.nx * header.ny * header.nz;
+  return volumeData.length >= (Math.max(0, t) + 1) * frame;
+}
+
+function slicePrefetchCount(): number {
+  if (isVerySlowLink()) return 1;
+  if (bandwidthEstimator.qualityLevel === 'high') return 4;
+  return Math.min(PRELOAD_RANGE, 3);
+}
 
 // Warm up the TCP/TLS connection for a remote URL as early as possible and
 // measure the round-trip time. On high-latency links this hides the handshake
@@ -1930,11 +1976,39 @@ function unregisterWorkerStream(requestId: number) {
 function cancelVolumeLoadByKey(key: string | null): void {
   if (!key) return;
   const worker = volumeWorkers.get(key);
+  volumeLoadReasons.delete(key);
   if (!worker) return;
   volumeWorkers.delete(key);
   if (activeVolumeLoadKey === key) activeVolumeLoadKey = null;
   worker.terminate();
   publishPerfMonitor();
+}
+
+function cancelAutoVolumeLoads(): void {
+  for (const [key, reason] of [...volumeLoadReasons]) {
+    if (reason === 'auto') cancelVolumeLoadByKey(key);
+  }
+  for (const entry of volumeLoadQueue) {
+    if (entry.reason !== 'auto') continue;
+    entry.cancelled = true;
+    entry.reject(makeAbortError());
+  }
+  for (let i = volumeLoadQueue.length - 1; i >= 0; i--) {
+    if (volumeLoadQueue[i].reason === 'auto') volumeLoadQueue.splice(i, 1);
+  }
+  if (preloadTimer) {
+    window.clearTimeout(preloadTimer);
+    preloadTimer = null;
+  }
+  if (activeLoadDebounceTimer) {
+    window.clearTimeout(activeLoadDebounceTimer);
+    activeLoadDebounceTimer = null;
+  }
+}
+
+function onUserScrollSlices(): void {
+  lastScrollTime = Date.now();
+  cancelAutoVolumeLoads();
 }
 
 function cancelQueuedVolumeLoads(exceptKey?: string): void {
@@ -1960,11 +2034,12 @@ async function reprioritizeVolumeLoad(key: string, priority: VolumeLoadPriority)
   }
 }
 
-function queueVolumeLoad<T>(key: string, task: () => Promise<T>, priority: VolumeLoadPriority = 'background'): Promise<T> {
+function queueVolumeLoad<T>(key: string, task: () => Promise<T>, priority: VolumeLoadPriority = 'background', reason: VolumeLoadReason = 'auto'): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const entry: QueuedVolumeLoad = {
       key,
       priority,
+      reason,
       cancelled: false,
       reject,
       run: () => {
@@ -1974,10 +2049,12 @@ function queueVolumeLoad<T>(key: string, task: () => Promise<T>, priority: Volum
         }
         activeVolumeLoads++;
         activeVolumeLoadKey = key;
+        volumeLoadReasons.set(key, reason);
         publishPerfMonitor();
         task().then(resolve, reject).finally(() => {
           activeVolumeLoads = Math.max(0, activeVolumeLoads - 1);
           if (activeVolumeLoadKey === key) activeVolumeLoadKey = null;
+          volumeLoadReasons.delete(key);
           const next = volumeLoadQueue.shift();
           next?.run();
           publishPerfMonitor();
@@ -2167,6 +2244,7 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
       directUrl: directFetchUrl || '',
       estimatedBps: bandwidthEstimator?.estimatedBps ?? 0,
       estimatedRttMs: bandwidthEstimator?.estimatedRttMs ?? 0,
+      priority: volumeLoadReasons.get(loadKey) === 'user' ? 'user' : 'background',
     });
   });
 }
@@ -2181,7 +2259,7 @@ function scheduleActiveImageLoad(index: number): void {
   activeLoadDebounceTimer = window.setTimeout(() => {
     activeLoadDebounceTimer = null;
     if (scheduledActiveIndex !== index || activeImageIdx !== index) return;
-    void ensureImageData(index, 'active').catch((err) => {
+    void ensureImageData(index, 'active', 'auto').catch((err) => {
       if ((err as any)?.name !== 'AbortError') {
         console.error('Failed to activate image:', err);
       }
@@ -2200,11 +2278,22 @@ function isVerySlowLink(): boolean {
   return bandwidthEstimator.qualityLevel === 'low';
 }
 
+async function ensureFullVolumeForTool(): Promise<boolean> {
+  if (volumeData && fullVolumeLoaded) return true;
+  try {
+    await ensureImageData(activeImageIdx, 'active', 'user');
+    return !!(volumeData && fullVolumeLoaded);
+  } catch {
+    return false;
+  }
+}
+
 function maybeScheduleFullVolume(index: number): void {
-  if (deferFullVolume) return;
-  if (viewerConfig.fullVolumePolicy === 'manual') return;
-  if (viewerConfig.fullVolumePolicy === 'eager') {
-    void ensureImageData(index, 'active').catch((err) => {
+  if (!shouldAutoloadFullVolume()) return;
+  const policy = viewerConfig.fullVolumePolicy;
+  const small = currentFileSize > 0 && currentFileSize <= SLICE_MODE_MIN_BYTES;
+  if (policy === 'eager' || (policy === 'adaptive' && (small || !deferFullVolume))) {
+    void ensureImageData(index, 'active', 'auto').catch((err) => {
       if ((err as any)?.name !== 'AbortError') {
         loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
       }
@@ -2213,6 +2302,16 @@ function maybeScheduleFullVolume(index: number): void {
   }
   scheduleActiveImageLoad(index);
 }
+
+bandwidthEstimator.onQualityChange(() => {
+  if (bandwidthEstimator.qualityLevel === 'low') {
+    cancelAutoVolumeLoads();
+    return;
+  }
+  if (header && shouldAutoloadFullVolume() && !fullVolumeLoaded) {
+    maybeScheduleFullVolume(activeImageIdx);
+  }
+});
 
 function scheduleNextImagePreload(currentIdx: number): void {
   if (deferFullVolume || isVerySlowLink()) return;
@@ -2238,7 +2337,7 @@ function scheduleNextImagePreload(currentIdx: number): void {
   }, 800);
 }
 
-async function ensureImageData(index: number, priority: VolumeLoadPriority = 'background'): Promise<void> {
+async function ensureImageData(index: number, priority: VolumeLoadPriority = 'background', reason: VolumeLoadReason = 'auto'): Promise<void> {
   const img = images[index];
   if (!img) return;
   const loadKey = img.url;
@@ -2391,7 +2490,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
     perfMonitor.failures++;
     publishPerfMonitor();
     throw lastError;
-  }, priority).catch((err) => {
+  }, priority, reason).catch((err) => {
     img.state = (err as any)?.name === 'AbortError' ? 'preview' : 'error';
     throw err;
   }).finally(() => {
@@ -2448,8 +2547,9 @@ async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
       axis,
       index: sliceIdx[axis],
       factor,
-      prefetch: PRELOAD_RANGE,
+      prefetch: slicePrefetchCount(),
       maxIndex: geometry.maxIndex,
+      timeIdx,
       signal,
     });
     if (signal.aborted) return;
@@ -2481,14 +2581,17 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
   const { nx, ny, nz } = header;
   const src = volumeData;
   const s = dataSlope;
-  const t = dataInter;
-  const needScale = s !== 1 || t !== 0;
+  const intercept = dataInter;
+  const needScale = s !== 1 || intercept !== 0;
+  const frame = nx * ny * nz;
+  const tBase = Math.max(0, timeIdx) * frame;
+  if (src.length < tBase + frame) return new Float32Array(0);
 
   if (axis === 'axial') {
     const slice = float32Pool.acquire(nx * ny);
-    const base = idx * ny * nx;
+    const base = tBase + idx * ny * nx;
     if (needScale) {
-      for (let i = 0; i < nx * ny; i++) slice[i] = src[base + i] * s + t;
+      for (let i = 0; i < nx * ny; i++) slice[i] = src[base + i] * s + intercept;
     } else {
       for (let i = 0; i < nx * ny; i++) slice[i] = src[base + i];
     }
@@ -2496,9 +2599,9 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
   } else if (axis === 'coronal') {
     const slice = float32Pool.acquire(nx * nz);
     for (let z = 0; z < nz; z++) {
-      const base = z * ny * nx + idx * nx;
+      const base = tBase + z * ny * nx + idx * nx;
       if (needScale) {
-        for (let x = 0; x < nx; x++) slice[z * nx + x] = src[base + x] * s + t;
+        for (let x = 0; x < nx; x++) slice[z * nx + x] = src[base + x] * s + intercept;
       } else {
         for (let x = 0; x < nx; x++) slice[z * nx + x] = src[base + x];
       }
@@ -2507,9 +2610,9 @@ function extractSlice(axis: 'axial' | 'coronal' | 'sagittal', idx: number): Floa
   } else {
     const slice = float32Pool.acquire(ny * nz);
     for (let z = 0; z < nz; z++) {
-      const base = z * ny * nx;
+      const base = tBase + z * ny * nx;
       if (needScale) {
-        for (let y = 0; y < ny; y++) slice[z * ny + y] = src[base + y * nx + idx] * s + t;
+        for (let y = 0; y < ny; y++) slice[z * ny + y] = src[base + y * nx + idx] * s + intercept;
       } else {
         for (let y = 0; y < ny; y++) slice[z * ny + y] = src[base + y * nx + idx];
       }
@@ -4535,7 +4638,13 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
 }
 
 function paintMIP(interactive = false) {
-  if (!header || !volumeData) return;
+  if (!header) return;
+  if (!volumeData || !fullVolumeLoaded) {
+    void ensureFullVolumeForTool().then((ok) => {
+      if (ok) paintMIP(interactive);
+    });
+    return;
+  }
   const mip = computeMIP(viewState.mip.rot, interactive);
   const outW = mip.w, outH = mip.h;
   if (!outW || !outH) return;
@@ -4640,10 +4749,10 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
     return;
   }
 
-  if (volumeData) {
-    // Skip CPU extractSlice when 3D texture is ready
+  if (volumeHasTimepoint(timeIdx)) {
+    // Skip CPU extractSlice when 3D texture is ready (first timepoint only)
     const renderer3D = glRenderers[axis as Axis];
-    const hasVolume3D = renderer3D && renderer3D.isVolume3DReady() &&
+    const hasVolume3D = timeIdx === 0 && renderer3D && renderer3D.isVolume3DReady() &&
       renderBackend !== 'canvas2d' && renderBackend !== 'webgl2d';
     if (hasVolume3D) {
       const pixelW = axis === 'sagittal' ? ny * dy : nx * dx;
@@ -4681,7 +4790,7 @@ function updateSingleView(axis: 'axial' | 'coronal' | 'sagittal') {
   // Scrolling one axis moves the crosshair in the other two views — update all.
   updateAllCrosshairs();
 
-  if (volumeData) preloadSlices(axis, sliceIdx[axis]);
+  if (volumeHasTimepoint(timeIdx)) preloadSlices(axis, sliceIdx[axis]);
 }
 
 function updateAllInfo() {
@@ -4717,6 +4826,19 @@ function updateSliderValues() {
     if (ssl) { ssl.max = String(s.max); ssl.value = String(sliceIdx[s.axis as keyof typeof sliceIdx]); }
     if (vl) vl.textContent = String(sliceIdx[s.axis as keyof typeof sliceIdx]);
   }
+
+  const nt = Math.max(1, header.nt || 1);
+  const timeRow = document.getElementById('time-slider-row') as HTMLElement | null;
+  const tsl = document.getElementById('time-slider-side') as HTMLInputElement | null;
+  const tvl = document.getElementById('time-val') as HTMLSpanElement | null;
+  if (timeRow) timeRow.style.display = nt > 1 ? '' : 'none';
+  if (tsl) {
+    tsl.max = String(Math.max(0, nt - 1));
+    tsl.value = String(Math.min(timeIdx, nt - 1));
+    tsl.setAttribute('aria-valuemax', String(Math.max(0, nt - 1)));
+    tsl.setAttribute('aria-valuenow', String(timeIdx));
+  }
+  if (tvl) tvl.textContent = String(timeIdx);
 }
 
 function updateFileInfo() {
@@ -4817,7 +4939,7 @@ function autoContrast() {
   if (wwSlider) wwSlider.value = String(Math.round(windowWidth * 100));
   if (wlSlider) wlSlider.value = String(Math.round(windowLevel * 100));
 
-  if (volumeData) renderAllViews();
+  if (volumeHasTimepoint(timeIdx)) renderAllViews();
   else void refreshSlices(['axial', 'coronal', 'sagittal']);
 }
 
@@ -4853,7 +4975,7 @@ function handleKeyboardAction(action: string) {
       const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
       if (newIdx !== sliceIdx[axis]) {
         sliceIdx[axis] = newIdx;
-        if (volumeData) updateSingleView(axis);
+        if (volumeHasTimepoint(timeIdx)) updateSingleView(axis);
         else void refreshSlices([axis], true);
       }
     }
@@ -5202,18 +5324,24 @@ function terminateRegWorker(): void {
 
 function startRegistration(mode: 'mni' | 'custom'): void {
   if (regBusy) return;
-  // Registration needs every voxel of the source volume, not a slice cache.
-  if (!header || !volumeData || !fullVolumeLoaded) {
-    showRegStatus('fail', 'Load the full volume first — registration needs all voxels.');
-    return;
-  }
-  regBusy = true;
-  regFlow = 'register';
-  regSourceIdx = activeImageIdx;
-  regRefIdx = -1;
-  showRegStatus('busy',
-    mode === 'mni' ? 'Resolving MNI template…' : 'Pick a template volume…', 0);
-  vscode.postMessage({ type: 'getTemplate', mode });
+  void (async () => {
+    const ok = await ensureFullVolumeForTool();
+    if (!ok) {
+      showRegStatus('fail', 'Could not load the full volume — registration needs all voxels.');
+      return;
+    }
+    if (!header || !volumeData || !fullVolumeLoaded) {
+      showRegStatus('fail', 'Load the full volume first — registration needs all voxels.');
+      return;
+    }
+    regBusy = true;
+    regFlow = 'register';
+    regSourceIdx = activeImageIdx;
+    regRefIdx = -1;
+    showRegStatus('busy',
+      mode === 'mni' ? 'Resolving MNI template…' : 'Pick a template volume…', 0);
+    vscode.postMessage({ type: 'getTemplate', mode });
+  })();
 }
 
 async function cancelRegistration(): Promise<void> {
@@ -5322,8 +5450,8 @@ async function startAlign(refIdx: number): Promise<void> {
   const mov = images[movIdx];
   if (!ref || !mov || ref === mov) { showToast('Pick one of the two compared images as reference.'); return; }
   try {
-    await ensureImageData(compareIdxA, 'active');
-    await ensureImageData(compareIdxB, 'active');
+    await ensureImageData(compareIdxA, 'active', 'user');
+    await ensureImageData(compareIdxB, 'active', 'user');
   } catch {
     showToast('Both images must be fully loaded before aligning.');
     return;
@@ -5553,8 +5681,9 @@ window.addEventListener('message', async (e) => {
   }
 
   if (msg.type === 'remoteSliceMode') {
-    // WAN large-file path: preview pixels come from the remote disk; scrolling
-    // uses /slice. The compressed object is NOT pulled across the tunnel.
+    // Large Remote-SSH files: preview pixels come from the remote disk;
+    // scrolling uses /slice. The compressed object is not pulled across
+    // the tunnel.
     directPreviewReceived = true;
     if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
 
@@ -5564,6 +5693,7 @@ window.addEventListener('message', async (e) => {
     isGzip = !!msg.isGzip;
     isRemoteSource = true;
     deferFullVolume = true;
+    if (msg.fileSize) currentFileSize = msg.fileSize;
 
     if (msg.validationToken && fileName) {
       broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0 });
@@ -5577,6 +5707,7 @@ window.addEventListener('message', async (e) => {
 
     if (msg.header) {
       showPartialPreviewFromMessage(msg, { fetchMissingSlices: true });
+      maybeScheduleFullVolume(0);
     } else {
       loadingText.textContent = 'Loading preview...';
       setupInteraction();
@@ -5598,6 +5729,7 @@ window.addEventListener('message', async (e) => {
         loading.style.display = 'none';
         showSliceModeBadge();
         void refreshSlices(['axial', 'coronal', 'sagittal'], false).catch(() => {});
+        maybeScheduleFullVolume(0);
       }).catch((err) => {
         vscode.postMessage({
           type: 'remoteHttpFallback',
@@ -5606,6 +5738,30 @@ window.addEventListener('message', async (e) => {
         });
       });
     }
+    return;
+  }
+
+  if (msg.type === 'previewOrtho') {
+    if (volumeData && fullVolumeLoaded) return;
+    const hdr = (msg.header || header) as NiiHeader | null;
+    if (!hdr) return;
+    const coronal = toFloat32Array(msg.coronalSlice, 'coronal', msg);
+    const sagittal = toFloat32Array(msg.sagittalSlice, 'sagittal', msg);
+    if (coronal.length > 0 && sliceHasSignal(coronal)) {
+      setCurrentSlice('coronal', coronal, hdr.nx, hdr.nz, 1);
+    }
+    if (sagittal.length > 0 && sliceHasSignal(sagittal)) {
+      setCurrentSlice('sagittal', sagittal, hdr.ny, hdr.nz, 1);
+    }
+    if (msg.sliceIdx) {
+      sliceIdx.coronal = msg.sliceIdx.coronal ?? sliceIdx.coronal;
+      sliceIdx.sagittal = msg.sliceIdx.sagittal ?? sliceIdx.sagittal;
+    }
+    if (typeof msg.globalMin === 'number' && typeof msg.globalMax === 'number' && msg.globalMax > msg.globalMin) {
+      globalMin = msg.globalMin;
+      globalMax = msg.globalMax;
+    }
+    renderAllViews();
     return;
   }
 
@@ -5675,6 +5831,7 @@ window.addEventListener('message', async (e) => {
   isGzip = fileName.endsWith('.gz');
   isRemoteSource = !!msg.isRemote;
   deferFullVolume = !!msg.deferFullVolume;
+  currentFileSize = msg.fileSize || currentFileSize;
   viewerConfig.previewMode = msg.previewMode || viewerConfig.previewMode;
   applyRenderBackend(msg.renderBackend || viewerConfig.renderBackend);
   viewerConfig.renderBackend = msg.renderBackend || viewerConfig.renderBackend;
@@ -5959,8 +6116,8 @@ function handleDirectPreview(msg: any): void {
 
   if (msg.deferFullVolume) deferFullVolume = true;
 
-  // z=0 / ortho preview: paint immediately so WAN users see an image
-  // before the full volume (which may never be downloaded in slice mode).
+  // First axial / ortho preview: paint immediately so Remote-SSH users see
+  // an image before the full volume (which may never be downloaded).
   if (msg.partialPreview) {
     showPartialPreviewFromMessage(msg, { fetchMissingSlices: deferFullVolume });
     if (!deferFullVolume) maybeScheduleFullVolume(0);
@@ -7662,8 +7819,9 @@ function setupInteraction() {
     const handler = (val: number) => {
       sliceIdx[axis] = validateSliceIndex(axis, val);
       a11yAnnounce(`${axis} slice ${sliceIdx[axis] + 1}`);
+      onUserScrollSlices();
       // rAF-coalesced: slider 'input' fires per pixel of drag movement.
-      if (volumeData) scheduleSingleViewRender(axis);
+      if (volumeHasTimepoint(timeIdx)) scheduleSingleViewRender(axis);
       else {
         void refreshSlices([axis], true);
         scheduleLODUpgrade(axis);
@@ -7678,6 +7836,18 @@ function setupInteraction() {
   bindSlider('axial-slider', 'axial-slider-side', 'axial');
   bindSlider('coronal-slider', 'coronal-slider-side', 'coronal');
   bindSlider('sagittal-slider', 'sagittal-slider-side', 'sagittal');
+
+  const timeSlider = document.getElementById('time-slider-side') as HTMLInputElement | null;
+  timeSlider?.addEventListener('input', () => {
+    if (!header) return;
+    const nt = Math.max(1, header.nt || 1);
+    timeIdx = Math.max(0, Math.min(nt - 1, parseInt(timeSlider.value, 10) || 0));
+    a11yAnnounce(`time ${timeIdx + 1}`);
+    onUserScrollSlices();
+    updateSliderValues();
+    if (volumeHasTimepoint(timeIdx)) scheduleRender();
+    else void refreshSlices(['axial', 'coronal', 'sagittal'], true);
+  });
 
   document.querySelectorAll('.vb').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -7717,9 +7887,10 @@ function setupInteraction() {
           const newIdx = validateSliceIndex(axis, sliceIdx[axis] + delta);
           if (newIdx !== sliceIdx[axis]) {
             sliceIdx[axis] = newIdx;
+            onUserScrollSlices();
             // rAF-coalesced: fast trackpad scrolling fires wheel events
             // faster than the display refresh - paint at most once/frame.
-            if (volumeData) scheduleSingleViewRender(axis);
+            if (volumeHasTimepoint(timeIdx)) scheduleSingleViewRender(axis);
             else {
               void refreshSlices([axis], true);
               scheduleLODUpgrade(axis);
@@ -7958,7 +8129,7 @@ function setupInteraction() {
             sliceIdx.axial = Math.max(0, Math.min(h0.nz - 1, Math.floor(cy0n * h0_)));
           }
         }
-        if (volumeData) renderAllViews();
+        if (volumeHasTimepoint(timeIdx)) renderAllViews();
         else void refreshSlices(['axial', 'coronal', 'sagittal']);
         return;
       }
@@ -8010,7 +8181,7 @@ function setupInteraction() {
         sliceIdx.axial = Math.max(0, Math.min(nz - 1, Math.floor(cy_norm * nz)));
       }
 
-      if (volumeData) renderAllViews();
+      if (volumeHasTimepoint(timeIdx)) renderAllViews();
       else void refreshSlices(['axial', 'coronal', 'sagittal']);
     });
 
@@ -8302,7 +8473,7 @@ function setupInteraction() {
         const newIdx = Math.max(0, Math.min(max, sliceIdx[axis] + delta));
         if (newIdx !== sliceIdx[axis]) {
           sliceIdx[axis] = newIdx;
-          if (volumeData) updateSingleView(axis);
+          if (volumeHasTimepoint(timeIdx)) updateSingleView(axis);
           else { void refreshSlices([axis], true); scheduleLODUpgrade(axis); }
           a11yAnnounce(`${axis} slice ${newIdx + 1} of ${max + 1}`);
         }

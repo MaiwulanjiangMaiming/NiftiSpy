@@ -1,145 +1,218 @@
 import * as fs from 'fs';
-import * as zlib from 'zlib';
+import {
+  ZStream,
+  zlibInflateInit2,
+  zlibInflate,
+  zlibInflateEnd,
+  zlibInflateSetDictionary,
+  Z_BLOCK,
+  Z_OK,
+  Z_STREAM_END,
+  Z_BUF_ERROR,
+  Z_SYNC_FLUSH,
+} from 'pako';
 
 export interface GzipIndexEntry {
+  /** Byte offset from the start of the deflate stream (after the gzip header). */
   compressedOffset: number;
+  /** Unused bits in the previous compressed byte (0–7). */
+  bits: number;
   decompressedOffset: number;
-  windowBits: Uint8Array | null;
+  /** 32KB inflate window at this point, or null at the start of the stream. */
+  window: Uint8Array | null;
 }
 
-const SPACING = 1 << 20; // ~1MB between index points
-const WINDOW_SIZE = 32768; // 32KB sliding window
+const SPACING = 1 << 20;
+const WINDOW_SIZE = 32768;
+const IN_CHUNK = 256 * 1024;
+const OUT_CHUNK = 64 * 1024;
+const INDEX_MAGIC = Buffer.from('NSPI');
+const INDEX_VERSION = 2;
 
-// Serialization format:
-// [4 bytes] entry count
-// For each entry:
-//   [4 bytes] compressedOffset
-//   [4 bytes] decompressedOffset
-//   [1 byte]  hasWindow (0 or 1)
-//   [4 bytes] windowLength (if hasWindow)
-//   [windowLength bytes] window data
+export function gzipHeaderLength(buf: Uint8Array): number {
+  if (buf.length < 10 || buf[0] !== 0x1f || buf[1] !== 0x8b) {
+    throw new Error('Not a gzip file');
+  }
+  const flg = buf[3];
+  let off = 10;
+  if (flg & 4) {
+    if (off + 2 > buf.length) throw new Error('Truncated gzip extra field');
+    const xlen = buf[off] | (buf[off + 1] << 8);
+    off += 2 + xlen;
+  }
+  if (flg & 8) {
+    while (off < buf.length && buf[off] !== 0) off++;
+    off++;
+  }
+  if (flg & 16) {
+    while (off < buf.length && buf[off] !== 0) off++;
+    off++;
+  }
+  if (flg & 2) off += 2;
+  if (off > buf.length) throw new Error('Truncated gzip header');
+  return off;
+}
+
+function updateWindow(window: Buffer, filled: number, chunk: Uint8Array): number {
+  if (chunk.length >= WINDOW_SIZE) {
+    Buffer.from(chunk.subarray(chunk.length - WINDOW_SIZE)).copy(window);
+    return WINDOW_SIZE;
+  }
+  if (filled + chunk.length <= WINDOW_SIZE) {
+    Buffer.from(chunk).copy(window, filled);
+    return filled + chunk.length;
+  }
+  const keep = WINDOW_SIZE - chunk.length;
+  window.copyWithin(0, filled - keep, filled);
+  Buffer.from(chunk).copy(window, keep);
+  return WINDOW_SIZE;
+}
+
+function snapshotWindow(window: Buffer, filled: number): Uint8Array {
+  const out = Buffer.alloc(WINDOW_SIZE);
+  if (filled === WINDOW_SIZE) {
+    window.copy(out);
+  } else if (filled > 0) {
+    window.copy(out, WINDOW_SIZE - filled, 0, filled);
+  }
+  return new Uint8Array(out.buffer, out.byteOffset, out.byteLength);
+}
+
+function primeInflate(strm: InstanceType<typeof ZStream>, bits: number, prevByte: number): void {
+  if (!bits) return;
+  strm.state.hold = prevByte >> (8 - bits);
+  strm.state.bits = bits;
+}
 
 export class GzipIndex {
+  gzipHeaderLength = 10;
   entries: GzipIndexEntry[] = [];
 
-  static async buildIndex(fsPath: string, signal?: AbortSignal, onProgress?: (pct: number) => void): Promise<GzipIndex> {
-    const index = new GzipIndex();
+  static async buildIndex(
+    fsPath: string,
+    signal?: AbortSignal,
+    onProgress?: (pct: number) => void,
+    onOutput?: (chunk: Uint8Array, decompressedOffset: number) => void | Promise<void>,
+  ): Promise<GzipIndex> {
     const stat = await fs.promises.stat(fsPath);
-    const fileSize = stat.size;
+    const fd = await fs.promises.open(fsPath, 'r');
+    try {
+      const head = Buffer.alloc(Math.min(1024, stat.size));
+      const { bytesRead: headRead } = await fd.read(head, 0, head.length, 0);
+      const headerLen = gzipHeaderLength(head.subarray(0, headRead));
+      return await inflateAndIndex(fd, stat.size, headerLen, signal, onProgress, onOutput);
+    } finally {
+      await fd.close();
+    }
+  }
 
-    return new Promise<GzipIndex>((resolve, reject) => {
-      const entries: GzipIndexEntry[] = [];
-      let compOffset = 0;
-      let decompOffset = 0;
-      let windowBuf: Buffer | null = null;
-      let windowFilled = 0;
-      let lastSyncDecompOffset = 0;
-      let resolved = false;
+  /**
+   * Inflate decompressed bytes in `[start, end)` and visit each chunk at its
+   * absolute decompressed offset. Used for coronal/sagittal slices so one
+   * inflate walk can pick rows instead of restarting per z.
+   */
+  static async scanRange(
+    fsPath: string,
+    index: GzipIndex,
+    start: number,
+    end: number,
+    onChunk: (absOffset: number, bytes: Uint8Array) => void | Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (start >= end) return;
+    const entries = index.entries;
+    if (entries.length === 0) {
+      throw new Error('Empty gzip index');
+    }
 
-      const inflator = zlib.createInflateRaw();
+    let best = entries[0];
+    for (let i = 1; i < entries.length; i++) {
+      if (entries[i].decompressedOffset <= start) best = entries[i];
+      else break;
+    }
 
-      const input = fs.createReadStream(fsPath);
-      input.on('data', (chunk: string | Buffer) => {
-        if (resolved) return;
-        if (typeof chunk === 'string') return;
-        if (signal?.aborted) {
-          resolved = true;
-          input.destroy();
-          inflator.destroy();
-          reject(new DOMException('Aborted', 'AbortError'));
-          return;
+    const fd = await fs.promises.open(fsPath, 'r');
+    const strm = new ZStream();
+    const init = zlibInflateInit2(strm, -15);
+    if (init !== Z_OK) {
+      await fd.close();
+      throw new Error('Failed to start raw inflate');
+    }
+
+    try {
+      if (best.window && best.window.length > 0) {
+        const dictRet = zlibInflateSetDictionary(strm, best.window);
+        if (dictRet !== Z_OK) throw new Error('Failed to restore inflate window');
+      }
+
+      let filePos = index.gzipHeaderLength + best.compressedOffset;
+      if (best.bits) {
+        const prev = Buffer.alloc(1);
+        const { bytesRead } = await fd.read(prev, 0, 1, filePos - 1);
+        if (bytesRead !== 1) throw new Error('Failed to read gzip leftover byte');
+        primeInflate(strm, best.bits, prev[0]);
+      }
+
+      const needed = end - start;
+      let skip = start - best.decompressedOffset;
+      let written = 0;
+      let loops = 0;
+      const inBuf = Buffer.alloc(IN_CHUNK);
+      const outBuf = new Uint8Array(OUT_CHUNK);
+      strm.output = outBuf;
+      const stat = await fd.stat();
+
+      while (written < needed) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (strm.avail_in === 0) {
+          const { bytesRead } = await fd.read(inBuf, 0, inBuf.length, filePos);
+          filePos += bytesRead;
+          if (bytesRead === 0) break;
+          strm.input = inBuf.subarray(0, bytesRead);
+          strm.next_in = 0;
+          strm.avail_in = bytesRead;
         }
-        compOffset += chunk.length;
-        if (onProgress && fileSize > 0) {
-          onProgress(Math.min(99, Math.round((compOffset / fileSize) * 100)));
-        }
-      });
 
-      inflator.on('data', (chunk: Buffer) => {
-        if (resolved) return;
-
-        if (windowBuf === null) {
-          windowBuf = Buffer.alloc(WINDOW_SIZE);
-          windowFilled = 0;
-        }
-
-        const spaceLeft = WINDOW_SIZE - windowFilled;
-        if (chunk.length <= spaceLeft) {
-          chunk.copy(windowBuf, windowFilled);
-          windowFilled += chunk.length;
-        } else {
-          const overflow = chunk.length - spaceLeft;
-          chunk.copy(windowBuf, windowFilled, 0, spaceLeft);
-          chunk.copy(windowBuf, 0, spaceLeft);
-          windowFilled = Math.min(WINDOW_SIZE, overflow);
-          if (overflow < WINDOW_SIZE) {
-            windowBuf.copyWithin(0, WINDOW_SIZE - overflow, WINDOW_SIZE);
-            windowFilled = overflow;
-          } else {
-            const tailStart = chunk.length - WINDOW_SIZE;
-            chunk.copy(windowBuf, 0, tailStart);
-            windowFilled = WINDOW_SIZE;
-          }
-        }
-
-        decompOffset += chunk.length;
-
-        if (decompOffset - lastSyncDecompOffset >= SPACING) {
-          const entry: GzipIndexEntry = {
-            compressedOffset: compOffset,
-            decompressedOffset: decompOffset,
-            windowBits: null,
-          };
-
-          if (windowFilled > 0) {
-            const w = Buffer.alloc(WINDOW_SIZE);
-            if (windowFilled === WINDOW_SIZE) {
-              windowBuf.copy(w);
+        strm.next_out = 0;
+        strm.avail_out = outBuf.length;
+        const ret = zlibInflate(strm, Z_SYNC_FLUSH);
+        const got = outBuf.length - strm.avail_out;
+        if (got > 0) {
+          let from = 0;
+          let n = got;
+          if (skip > 0) {
+            if (skip >= n) {
+              skip -= n;
+              n = 0;
             } else {
-              w.fill(0, 0, WINDOW_SIZE - windowFilled);
-              windowBuf.copy(w, WINDOW_SIZE - windowFilled, 0, windowFilled);
+              from = skip;
+              n -= skip;
+              skip = 0;
             }
-            entry.windowBits = new Uint8Array(w.buffer, w.byteOffset, w.byteLength);
           }
-
-          entries.push(entry);
-          lastSyncDecompOffset = decompOffset;
-        }
-      });
-
-      inflator.on('end', () => {
-        if (!resolved) {
-          resolved = true;
-          if (entries.length === 0 || entries[0].decompressedOffset !== 0) {
-            entries.unshift({
-              compressedOffset: 0,
-              decompressedOffset: 0,
-              windowBits: null,
-            });
+          if (n > 0) {
+            const take = Math.min(n, needed - written);
+            const abs = start + written;
+            await onChunk(abs, Buffer.from(outBuf.subarray(from, from + take)));
+            written += take;
           }
-          index.entries = entries;
-          if (onProgress) onProgress(100);
-          resolve(index);
         }
-      });
 
-      inflator.on('error', (err: Error) => {
-        if (!resolved) {
-          resolved = true;
-          reject(err);
+        if (ret === Z_STREAM_END) break;
+        if (ret !== Z_OK && ret !== Z_BUF_ERROR) {
+          throw new Error(strm.msg || `gzip inflate failed (${ret})`);
         }
-      });
+        if (got === 0 && strm.avail_in === 0 && filePos >= stat.size) break;
 
-      input.on('error', (err: Error) => {
-        if (!resolved) {
-          resolved = true;
-          inflator.destroy();
-          reject(err);
+        loops++;
+        if ((loops & 15) === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
         }
-      });
-
-      input.pipe(inflator);
-    });
+      }
+    } finally {
+      zlibInflateEnd(strm);
+      await fd.close();
+    }
   }
 
   static async readRange(
@@ -147,176 +220,154 @@ export class GzipIndex {
     index: GzipIndex,
     start: number,
     end: number,
-    signal?: AbortSignal
+    signal?: AbortSignal,
   ): Promise<Uint8Array> {
-    if (start >= end) {
-      return new Uint8Array(0);
-    }
-
-    const entries = index.entries;
-
-    let bestIdx = 0;
-    for (let i = 0; i < entries.length; i++) {
-      if (entries[i].decompressedOffset <= start) {
-        bestIdx = i;
-      } else {
-        break;
-      }
-    }
-
-    const entry = entries[bestIdx];
-    const compStart = entry.compressedOffset;
-    const resultSize = end - start;
-    const result = Buffer.alloc(resultSize);
-    let resultOffset = 0;
-    let decompPos = entry.decompressedOffset;
-    let resolved = false;
-
-    return new Promise<Uint8Array>((resolve, reject) => {
-      const inflator = zlib.createInflateRaw();
-
-      if (entry.windowBits && entry.windowBits.length > 0) {
-        try {
-          (inflator as any)._window = Buffer.from(entry.windowBits);
-        } catch { /* best-effort window restore */ }
-      }
-
-      const input = fs.createReadStream(fsPath, { start: compStart });
-      input.on('data', (chunk: string | Buffer) => {
-        if (resolved) return;
-        if (typeof chunk === 'string') return;
-        if (signal?.aborted) {
-          resolved = true;
-          input.destroy();
-          inflator.destroy();
-          reject(new DOMException('Aborted', 'AbortError'));
-          return;
-        }
-      });
-
-      inflator.on('data', (chunk: Buffer) => {
-        if (resolved) return;
-
-        const chunkStart = decompPos;
-        const chunkEnd = decompPos + chunk.length;
-
-        if (chunkEnd <= start) {
-          decompPos = chunkEnd;
-          return;
-        }
-
-        if (chunkStart >= end) {
-          resolved = true;
-          input.destroy();
-          inflator.destroy();
-          resolve(new Uint8Array(result.buffer, result.byteOffset, resultOffset));
-          return;
-        }
-
-        const copyStart = Math.max(chunkStart, start) - chunkStart;
-        const copyEnd = Math.min(chunkEnd, end) - chunkStart;
-        const copyLen = copyEnd - copyStart;
-
-        if (copyLen > 0 && resultOffset + copyLen <= resultSize) {
-          chunk.copy(result, resultOffset, copyStart, copyEnd);
-          resultOffset += copyLen;
-        }
-
-        decompPos = chunkEnd;
-
-        if (decompPos >= end) {
-          resolved = true;
-          input.destroy();
-          inflator.destroy();
-          resolve(new Uint8Array(result.buffer, result.byteOffset, resultOffset));
-        }
-      });
-
-      inflator.on('end', () => {
-        if (!resolved) {
-          resolved = true;
-          resolve(new Uint8Array(result.buffer, result.byteOffset, resultOffset));
-        }
-      });
-
-      inflator.on('error', (err: Error) => {
-        if (!resolved) {
-          resolved = true;
-          reject(err);
-        }
-      });
-
-      input.on('error', (err: Error) => {
-        if (!resolved) {
-          resolved = true;
-          inflator.destroy();
-          reject(err);
-        }
-      });
-
-      input.pipe(inflator);
-    });
+    if (start >= end) return new Uint8Array(0);
+    const result = Buffer.alloc(end - start);
+    let written = 0;
+    await GzipIndex.scanRange(fsPath, index, start, end, (abs, chunk) => {
+      Buffer.from(chunk).copy(result, abs - start);
+      written = Math.max(written, abs - start + chunk.length);
+    }, signal);
+    return new Uint8Array(result.buffer, result.byteOffset, written);
   }
 
   serializeIndex(): Buffer {
-    const entryCount = this.entries.length;
-    // Calculate total size
-    let totalSize = 4; // entry count
+    let total = 4 + 4; // headerLen + entry count
     for (const entry of this.entries) {
-      totalSize += 4 + 4 + 1; // compressedOffset + decompressedOffset + hasWindow
-      if (entry.windowBits) {
-        totalSize += 4 + entry.windowBits.length; // windowLength + window data
+      total += 8 + 1 + 8 + 1;
+      if (entry.window) total += 4 + entry.window.length;
+    }
+    const buf = Buffer.alloc(total);
+    let off = 0;
+    buf.writeUInt32LE(this.gzipHeaderLength, off); off += 4;
+    buf.writeUInt32LE(this.entries.length, off); off += 4;
+    for (const entry of this.entries) {
+      buf.writeBigUInt64LE(BigInt(entry.compressedOffset), off); off += 8;
+      buf.writeUInt8(entry.bits & 7, off); off += 1;
+      buf.writeBigUInt64LE(BigInt(entry.decompressedOffset), off); off += 8;
+      if (entry.window) {
+        buf.writeUInt8(1, off); off += 1;
+        buf.writeUInt32LE(entry.window.length, off); off += 4;
+        Buffer.from(entry.window.buffer, entry.window.byteOffset, entry.window.byteLength).copy(buf, off);
+        off += entry.window.length;
+      } else {
+        buf.writeUInt8(0, off); off += 1;
       }
     }
-
-    const buf = Buffer.alloc(totalSize);
-    let offset = 0;
-
-    buf.writeUInt32LE(entryCount, offset); offset += 4;
-
-    for (const entry of this.entries) {
-      buf.writeUInt32LE(entry.compressedOffset, offset); offset += 4;
-      buf.writeUInt32LE(entry.decompressedOffset, offset); offset += 4;
-      const hasWindow = entry.windowBits !== null ? 1 : 0;
-      buf.writeUInt8(hasWindow, offset); offset += 1;
-      if (entry.windowBits) {
-        buf.writeUInt32LE(entry.windowBits.length, offset); offset += 4;
-        Buffer.from(entry.windowBits.buffer, entry.windowBits.byteOffset, entry.windowBits.byteLength).copy(buf, offset);
-        offset += entry.windowBits.length;
-      }
-    }
-
-    return buf;
+    return buf.subarray(0, off);
   }
 
   static deserializeIndex(data: Buffer): GzipIndex {
+    if (data.length < 8) throw new Error('Truncated gzip index');
+    let off = 0;
     const index = new GzipIndex();
-    let offset = 0;
-
-    const entryCount = data.readUInt32LE(offset); offset += 4;
-    index.entries = [];
-
-    for (let i = 0; i < entryCount; i++) {
-      const compressedOffset = data.readUInt32LE(offset); offset += 4;
-      const decompressedOffset = data.readUInt32LE(offset); offset += 4;
-      const hasWindow = data.readUInt8(offset); offset += 1;
-
-      let windowBits: Uint8Array | null = null;
+    index.gzipHeaderLength = data.readUInt32LE(off); off += 4;
+    const count = data.readUInt32LE(off); off += 4;
+    for (let i = 0; i < count; i++) {
+      const compressedOffset = Number(data.readBigUInt64LE(off)); off += 8;
+      const bits = data.readUInt8(off); off += 1;
+      const decompressedOffset = Number(data.readBigUInt64LE(off)); off += 8;
+      const hasWindow = data.readUInt8(off); off += 1;
+      let window: Uint8Array | null = null;
       if (hasWindow) {
-        const windowLength = data.readUInt32LE(offset); offset += 4;
-        windowBits = new Uint8Array(windowLength);
-        data.copy(Buffer.from(windowBits.buffer, windowBits.byteOffset, windowBits.byteLength), 0, offset, offset + windowLength);
-        offset += windowLength;
+        const windowLength = data.readUInt32LE(off); off += 4;
+        window = Uint8Array.from(data.subarray(off, off + windowLength));
+        off += windowLength;
       }
-
-      index.entries.push({ compressedOffset, decompressedOffset, windowBits });
+      index.entries.push({ compressedOffset, bits, decompressedOffset, window });
     }
-
     return index;
   }
 }
 
-// --- Index Persistence ---
+async function inflateAndIndex(
+  fd: fs.promises.FileHandle,
+  fileSize: number,
+  headerLen: number,
+  signal: AbortSignal | undefined,
+  onProgress: ((pct: number) => void) | undefined,
+  onOutput: ((chunk: Uint8Array, decompressedOffset: number) => void | Promise<void>) | undefined,
+): Promise<GzipIndex> {
+  const index = new GzipIndex();
+  index.gzipHeaderLength = headerLen;
+  index.entries.push({
+    compressedOffset: 0,
+    bits: 0,
+    decompressedOffset: 0,
+    window: null,
+  });
+
+  const strm = new ZStream();
+  const init = zlibInflateInit2(strm, -15);
+  if (init !== Z_OK) throw new Error('Failed to start raw inflate');
+
+  const window = Buffer.alloc(WINDOW_SIZE);
+  let winFill = 0;
+  let produced = 0;
+  let lastSync = 0;
+  let loops = 0;
+  const inBuf = Buffer.alloc(IN_CHUNK);
+  const outBuf = new Uint8Array(OUT_CHUNK);
+  strm.output = outBuf;
+  let filePos = headerLen;
+
+  try {
+    while (filePos < fileSize || strm.avail_in > 0) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      if (strm.avail_in === 0) {
+        const { bytesRead } = await fd.read(inBuf, 0, inBuf.length, filePos);
+        filePos += bytesRead;
+        if (bytesRead === 0) break;
+        strm.input = inBuf.subarray(0, bytesRead);
+        strm.next_in = 0;
+        strm.avail_in = bytesRead;
+        if (onProgress && fileSize > 0) {
+          onProgress(Math.min(99, Math.round((filePos / fileSize) * 100)));
+        }
+      }
+
+      strm.next_out = 0;
+      strm.avail_out = outBuf.length;
+      const ret = zlibInflate(strm, Z_BLOCK);
+      const got = outBuf.length - strm.avail_out;
+      if (got > 0) {
+        const chunk = outBuf.subarray(0, got);
+        winFill = updateWindow(window, winFill, chunk);
+        if (onOutput) await onOutput(Buffer.from(chunk), produced);
+        produced += got;
+      }
+
+      const dataType = strm.data_type;
+      const atBlockEnd = (dataType & 128) !== 0 && (dataType & 64) === 0;
+      if (atBlockEnd && produced - lastSync >= SPACING) {
+        index.entries.push({
+          compressedOffset: strm.total_in,
+          bits: dataType & 7,
+          decompressedOffset: produced,
+          window: snapshotWindow(window, winFill),
+        });
+        lastSync = produced;
+      }
+
+      if (ret === Z_STREAM_END) break;
+      if (ret !== Z_OK && ret !== Z_BUF_ERROR) {
+        throw new Error(strm.msg || `gzip inflate failed (${ret})`);
+      }
+
+      loops++;
+      if ((loops & 15) === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+    }
+  } finally {
+    zlibInflateEnd(strm);
+  }
+
+  if (onProgress) onProgress(100);
+  return index;
+}
 
 export interface IndexCacheMeta {
   fileSize: number;
@@ -334,29 +385,21 @@ export async function loadCachedIndex(fsPath: string): Promise<GzipIndex | null>
       fs.promises.stat(fsPath),
       fs.promises.stat(cachePath),
     ]);
-    // Cache must be newer than the file
-    if (cacheStat.mtimeMs < fileStat.mtimeMs) {
-      return null;
-    }
+    if (cacheStat.mtimeMs < fileStat.mtimeMs) return null;
     const data = await fs.promises.readFile(cachePath);
-    if (data.length < 4) return null;
-
-    // Read and validate metadata header
-    const metaSize = 4 + 8; // fileSize (uint32) + mtimeMs (double)
-    if (data.length < metaSize + 4) return null;
+    if (data.length < 20) return null;
+    if (data.compare(INDEX_MAGIC, 0, 4, 0, 4) !== 0) return null;
 
     let off = 0;
-    const cachedFileSize = data.readUInt32LE(off); off += 4;
+    off += 4; // magic, already checked
+    const version = data.readUInt16LE(off); off += 2;
+    if (version !== INDEX_VERSION) return null;
+    const cachedFileSize = Number(data.readBigUInt64LE(off)); off += 8;
     const cachedMtimeMs = data.readDoubleLE(off); off += 8;
-
-    // Validate file hasn't changed
     if (cachedFileSize !== fileStat.size || Math.abs(cachedMtimeMs - fileStat.mtimeMs) > 1) {
       return null;
     }
-
-    // Rest is the serialized index
-    const indexData = data.slice(off);
-    return GzipIndex.deserializeIndex(indexData);
+    return GzipIndex.deserializeIndex(data.subarray(off));
   } catch {
     return null;
   }
@@ -367,22 +410,18 @@ export async function saveCachedIndex(fsPath: string, index: GzipIndex): Promise
   try {
     const stat = await fs.promises.stat(fsPath);
     const indexData = index.serializeIndex();
-
-    // Prepend metadata: fileSize (uint32) + mtimeMs (float64)
-    const metaSize = 4 + 8;
-    const buf = Buffer.alloc(metaSize + indexData.length);
+    const buf = Buffer.alloc(4 + 2 + 8 + 8 + indexData.length);
     let off = 0;
-    buf.writeUInt32LE(stat.size, off); off += 4;
+    INDEX_MAGIC.copy(buf, off); off += 4;
+    buf.writeUInt16LE(INDEX_VERSION, off); off += 2;
+    buf.writeBigUInt64LE(BigInt(stat.size), off); off += 8;
     buf.writeDoubleLE(stat.mtimeMs, off); off += 8;
     indexData.copy(buf, off);
-
     await fs.promises.writeFile(cachePath, buf);
   } catch {
-    // Silently fail - caching is best-effort
+    // Sidecar write is best-effort; a missing cache just rebuilds next time.
   }
 }
-
-// --- Legacy standalone functions for backward compatibility ---
 
 export function buildGzipIndex(fsPath: string, signal?: AbortSignal): Promise<GzipIndexEntry[]> {
   return GzipIndex.buildIndex(fsPath, signal).then(idx => idx.entries);
@@ -393,61 +432,9 @@ export function extractRangeFromGzipIndex(
   index: GzipIndexEntry[],
   decompStart: number,
   decompEnd: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
   const gi = new GzipIndex();
   gi.entries = index;
   return GzipIndex.readRange(fsPath, gi, decompStart, decompEnd, signal);
-}
-
-export function buildGzipIndexFromBuffer(data: Uint8Array, signal?: AbortSignal): Promise<GzipIndexEntry[]> {
-  return new Promise((resolve, reject) => {
-    const entries: GzipIndexEntry[] = [];
-    let decompOffset = 0;
-    let lastSyncDecompOffset = 0;
-    let resolved = false;
-
-    const inflator = zlib.createInflateRaw();
-
-    if (signal?.aborted) {
-      reject(new DOMException('Aborted', 'AbortError'));
-      return;
-    }
-
-    inflator.on('data', (chunk: Buffer) => {
-      if (resolved) return;
-      decompOffset += chunk.length;
-
-      if (decompOffset - lastSyncDecompOffset >= SPACING) {
-        entries.push({
-          compressedOffset: 0,
-          decompressedOffset: decompOffset,
-          windowBits: null,
-        });
-        lastSyncDecompOffset = decompOffset;
-      }
-    });
-
-    inflator.on('end', () => {
-      if (!resolved) {
-        resolved = true;
-        entries.unshift({
-          compressedOffset: 0,
-          decompressedOffset: 0,
-          windowBits: null,
-        });
-        resolve(entries);
-      }
-    });
-
-    inflator.on('error', (err: Error) => {
-      if (!resolved) {
-        resolved = true;
-        reject(err);
-      }
-    });
-
-    inflator.write(Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-    inflator.end();
-  });
 }

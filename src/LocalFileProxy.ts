@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as zlib from 'zlib';
 import * as vscode from 'vscode';
 import { VolumeCache } from './VolumeCache';
-import { parseNiiHeaderQuick } from './nifti/headerParser';
+import { parseNiiHeaderQuick, timepointByteOffset } from './nifti/headerParser';
 import {
   extractAxialSliceFromRange,
   extractCoronalSliceFromRange,
@@ -21,13 +21,20 @@ import {
   streamingGunzipPreview,
   streamingHttpGunzipPreview,
   streamingGunzipPreviewVolume,
-  type VolumePreviewResult,
 } from './io/compression';
-import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
+import { GzipIndex } from './io/gzipIndex';
+import {
+  GzipScanSession,
+  extractStridedVolumeFromIndex,
+  extractSliceFromGzipIndex,
+  type GzipOrthoPreview,
+} from './io/gzipScan';
 import { isWanRemote } from './remoteEnv';
 
 interface FileEntry {
   uri: vscode.Uri;
+  dataUri: vscode.Uri;
+  separateImg: boolean;
   id: string;
   size?: number;
   dataCache?: Uint8Array;
@@ -38,7 +45,8 @@ interface FileEntry {
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
   pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
   gzipIndex?: GzipIndex;
-  gzipIndexBuilding?: boolean;
+  gzipScan?: GzipScanSession;
+  unpackPath?: string;
 }
 
 interface ConnectionStats {
@@ -50,15 +58,16 @@ interface ConnectionStats {
 
 interface PrioritizedRequest {
   priority: number;
+  preemptible?: boolean;
   execute: () => Promise<void>;
 }
 
 const REQUEST_PRIORITY = {
   header: 100,
-  preview: 80,
-  previewBin: 80,
-  previewVolume: 90, // higher than slice — users want to see *something* fast
-  slice: 50,
+  preview: 90,
+  previewBin: 90,
+  slice: 80,
+  previewVolume: 40,
   lod: 20,
   file: 10,
   stats: 0,
@@ -75,6 +84,7 @@ export class LocalFileProxy {
   private recentSliceRequests = new Map<string, number>(); // key -> timestamp
   private priorityQueue: PrioritizedRequest[] = [];
   private activeStreamCount = 0;
+  private inflightFileStreams = new Set<{ destroy: () => void; background: boolean }>();
 
   constructor(volumeCache?: VolumeCache) {
     this.volumeCache = volumeCache || null;
@@ -162,9 +172,17 @@ export class LocalFileProxy {
     this.server = null;
   }
 
-  registerFile(uri: vscode.Uri): string {
+  registerFile(uri: vscode.Uri, dataUri?: vscode.Uri): string {
     const id = String(this.idCounter++);
-    this.files.set(id, { uri, id, sliceCache: new Map(), lodCache: new Map() });
+    const data = dataUri || uri;
+    this.files.set(id, {
+      uri,
+      dataUri: data,
+      separateImg: data.toString() !== uri.toString(),
+      id,
+      sliceCache: new Map(),
+      lodCache: new Map(),
+    });
     return `http://127.0.0.1:${this.port}/file/${id}`;
   }
 
@@ -180,45 +198,59 @@ export class LocalFileProxy {
     return undefined;
   }
 
-  /** Kick gzip random-access indexing in the background (best-effort). */
-  startGzipIndex(entryId: string): void {
+  /** Start a single gzip inflate that builds the random-access index. */
+  startGzipIndex(entryId: string, onProgress?: (pct: number) => void): void {
     const entry = this.files.get(entryId);
-    if (entry) this.ensureGzipIndexBuilding(entry);
+    if (entry) this.ensureGzipScan(entry, onProgress);
   }
 
-  private ensureGzipIndexBuilding(entry: FileEntry): void {
+  whenGzipOrthoReady(entryId: string): Promise<GzipOrthoPreview | null> {
+    const entry = this.files.get(entryId);
+    const session = entry ? this.ensureGzipScan(entry) : null;
+    if (!session) return Promise.resolve(null);
+    return session.ortho.catch(() => null);
+  }
+
+  whenGzipIndexReady(entryId: string): Promise<GzipIndex | null> {
+    const entry = this.files.get(entryId);
+    const session = entry ? this.ensureGzipScan(entry) : null;
+    if (!session) return Promise.resolve(null);
+    return session.done;
+  }
+
+  private ensureGzipScan(entry: FileEntry, onProgress?: (pct: number) => void): GzipScanSession | null {
     const fsPath = entry.uri.fsPath;
-    if (!fsPath || !fsPath.endsWith('.gz')) return;
-    if (entry.gzipIndex || entry.gzipIndexBuilding) return;
-    entry.gzipIndexBuilding = true;
-    loadCachedIndex(fsPath).then(cachedIdx => {
-      if (cachedIdx) {
-        entry.gzipIndex = cachedIdx;
-        entry.gzipIndexBuilding = false;
-        return;
-      }
-      return GzipIndex.buildIndex(fsPath).then(idx => {
-        entry.gzipIndex = idx;
-        entry.gzipIndexBuilding = false;
-        saveCachedIndex(fsPath, idx).catch(() => {});
-      });
-    }).catch(() => {
-      GzipIndex.buildIndex(fsPath).then(idx => {
-        entry.gzipIndex = idx;
-        entry.gzipIndexBuilding = false;
-        saveCachedIndex(fsPath, idx).catch(() => {});
-      }).catch(() => {
-        entry.gzipIndexBuilding = false;
-      });
-    }).catch(() => {
-      entry.gzipIndexBuilding = false;
+    if (!fsPath || !fsPath.endsWith('.gz')) return null;
+    if (entry.gzipScan) return entry.gzipScan;
+    const session = GzipScanSession.start(fsPath, undefined, onProgress);
+    entry.gzipScan = session;
+    void session.done.then(idx => {
+      if (idx) entry.gzipIndex = idx;
+      if (session.unpackPath) entry.unpackPath = session.unpackPath;
     });
+    void session.z0.then(preview => {
+      if (preview.header) entry.headerCache = preview.header;
+    }).catch(() => {});
+    return session;
   }
 
   private readonly maxConcurrentRequests = 32;
   private activeRequests = 0;
 
-  private enqueueRequest(priority: number, execute: () => Promise<void>): void {
+  private headerPath(entry: FileEntry): string {
+    return entry.uri.fsPath;
+  }
+
+  private dataPath(entry: FileEntry): string {
+    return (entry.dataUri || entry.uri).fsPath;
+  }
+
+  private parseEntryHeader(entry: FileEntry, bytes: Uint8Array): any | null {
+    return parseNiiHeaderQuick(bytes, { separateImg: !!entry.separateImg });
+  }
+
+  private enqueueRequest(priority: number, execute: () => Promise<void>, opts?: { preemptible?: boolean }): void {
+    if (priority > REQUEST_PRIORITY.file) this.pauseBackgroundFileLoads();
     // Binary insert into sorted array — O(log n) instead of O(n log n) sort
     let lo = 0, hi = this.priorityQueue.length;
     while (lo < hi) {
@@ -226,8 +258,15 @@ export class LocalFileProxy {
       if (this.priorityQueue[mid].priority > priority) lo = mid + 1;
       else hi = mid;
     }
-    this.priorityQueue.splice(lo, 0, { priority, execute });
+    this.priorityQueue.splice(lo, 0, { priority, execute, preemptible: opts?.preemptible });
     this.processPriorityQueue();
+  }
+
+  private pauseBackgroundFileLoads(): void {
+    for (const handle of [...this.inflightFileStreams]) {
+      if (handle.background) handle.destroy();
+    }
+    this.priorityQueue = this.priorityQueue.filter(job => !job.preemptible);
   }
 
   private processPriorityQueue(): void {
@@ -253,15 +292,15 @@ export class LocalFileProxy {
     const _res = res as http.ServerResponse;
 
     _res.setHeader('Access-Control-Allow-Origin', '*');
-    _res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding');
+    _res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding, X-NiftiSpy-Priority');
     _res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source');
     _res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
     _res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     _res.setHeader('Connection', 'keep-alive');
     _res.setHeader('Keep-Alive', 'timeout=30, max=100');
-    // Only true WAN remotes (SSH / Codespaces / Tunnels) pay a real RTT
-    // on 127.0.0.1: the Worker keys chunk size off this flag. WSL and
-    // Dev Containers are loopback-class and must not be marked remote.
+    // Only SSH / Codespaces / Tunnels pay a real RTT on 127.0.0.1: the
+    // Worker keys chunk size off this flag. WSL and Dev Containers are
+    // loopback-class and must not be marked remote.
     if (isWanRemote()) {
       _res.setHeader('X-Remote-Source', 'true');
     }
@@ -281,14 +320,21 @@ export class LocalFileProxy {
       return;
     }
 
-    const headerMatch = _req.url?.match(/^\/header\/(\d+)$/);
-    const previewMatch = _req.url?.match(/^\/preview\/(\d+)$/);
-    const previewBinMatch = _req.url?.match(/^\/preview-bin\/(\d+)$/);
-    const previewVolumeMatch = _req.url?.match(/^\/preview-volume\/(\d+)/);
-    const sliceMatch = _req.url?.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
-    const lodMatch = _req.url?.match(/^\/lod\/(\d+)\/(\d+)$/);
-    const fileMatch = _req.url?.match(/^\/file\/(\d+)$/);
-    const match = headerMatch || previewMatch || previewBinMatch || previewVolumeMatch || sliceMatch || lodMatch || fileMatch;
+    const rawUrl = _req.url || '';
+    const qIndex = rawUrl.indexOf('?');
+    const pathname = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
+    const query = qIndex >= 0 ? new URLSearchParams(rawUrl.slice(qIndex + 1)) : new URLSearchParams();
+
+    const headerMatch = pathname.match(/^\/header\/(\d+)$/);
+    const previewMatch = pathname.match(/^\/preview\/(\d+)$/);
+    const previewBinMatch = pathname.match(/^\/preview-bin\/(\d+)$/);
+    const previewVolumeMatch = pathname.match(/^\/preview-volume\/(\d+)/);
+    const previewOrthoMatch = pathname.match(/^\/preview-ortho\/(\d+)$/);
+    const metaMatch = pathname.match(/^\/meta\/(\d+)$/);
+    const sliceMatch = pathname.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
+    const lodMatch = pathname.match(/^\/lod\/(\d+)\/(\d+)$/);
+    const fileMatch = pathname.match(/^\/file\/(\d+)$/);
+    const match = headerMatch || previewMatch || previewBinMatch || previewVolumeMatch || previewOrthoMatch || metaMatch || sliceMatch || lodMatch || fileMatch;
     if (!match) {
       _res.writeHead(404);
       _res.end();
@@ -306,14 +352,21 @@ export class LocalFileProxy {
       : previewMatch ? REQUEST_PRIORITY.preview
       : previewBinMatch ? REQUEST_PRIORITY.previewBin
       : previewVolumeMatch ? REQUEST_PRIORITY.previewVolume
+      : previewOrthoMatch ? REQUEST_PRIORITY.preview
+      : metaMatch ? REQUEST_PRIORITY.header
       : sliceMatch ? REQUEST_PRIORITY.slice
       : lodMatch ? REQUEST_PRIORITY.lod
       : REQUEST_PRIORITY.file;
 
+    const backgroundFile = !!fileMatch && String(_req.headers['x-niftispy-priority'] || '').toLowerCase() === 'background';
     this.enqueueRequest(priority, async () => {
       try {
         if (headerMatch) {
           await this.handleHeader(entry, _res, _req);
+          return;
+        }
+        if (metaMatch) {
+          this.handleGzipMeta(entry, _res);
           return;
         }
         if (previewMatch) {
@@ -324,13 +377,18 @@ export class LocalFileProxy {
           await this.handlePreviewBinary(entry, _res, _req);
           return;
         }
+        if (previewOrthoMatch) {
+          await this.handlePreviewOrtho(entry, _res, _req);
+          return;
+        }
         if (previewVolumeMatch) {
           const factor = parseFactorFromPath(_req.url || '');
           await this.handlePreviewVolume(entry, factor, _res, _req);
           return;
         }
         if (sliceMatch) {
-          await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3]), _res, _req);
+          const timeIdx = parseInt(query.get('t') || '0', 10) || 0;
+          await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3], 10), _res, _req, timeIdx);
           return;
         }
         if (lodMatch) {
@@ -344,13 +402,15 @@ export class LocalFileProxy {
         _res.writeHead(500);
         _res.end(String(err));
       }
-    });
+    }, { preemptible: backgroundFile });
   }
 
   private async handleFile(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+    const fileUri = entry.dataUri || entry.uri;
+    const isHttpRemote = fileUri.scheme === 'http' || fileUri.scheme === 'https';
     const method = (req.method || 'GET').toUpperCase();
     const rangeHeader = req.headers['range'];
+    const background = String(req.headers['x-niftispy-priority'] || '').toLowerCase() === 'background';
 
     // ── Remote range request: forward directly, skip HEAD size lookup ──
     // The remote's Content-Range response header carries the total size,
@@ -358,13 +418,13 @@ export class LocalFileProxy {
     // This is critical: the worker issues ~16 parallel range probes and
     // a HEAD-per-request would add a full RTT to every single one.
     if (isHttpRemote && method === 'GET' && rangeHeader) {
-      await this.streamHttpRangeToResponse(entry.uri.toString(), rangeHeader, res, entry);
+      await this.streamHttpRangeToResponse(fileUri.toString(), rangeHeader, res, entry, req, background);
       return;
     }
 
     // ── Remote full-file GET: stream directly without buffering ──
     if (isHttpRemote && method === 'GET' && !rangeHeader) {
-      await this.streamHttpToResponse(entry.uri.toString(), res, entry);
+      await this.streamHttpToResponse(fileUri.toString(), res, entry, req, background);
       return;
     }
 
@@ -372,10 +432,10 @@ export class LocalFileProxy {
     if (method === 'HEAD') {
       if (!entry.size) {
         if (isHttpRemote) {
-          try { entry.size = await this.getHttpRemoteSize(entry.uri.toString()); } catch { /* unknown */ }
+          try { entry.size = await this.getHttpRemoteSize(fileUri.toString()); } catch { /* unknown */ }
         }
         if (!entry.size) {
-          const stat = await vscode.workspace.fs.stat(entry.uri);
+          const stat = await vscode.workspace.fs.stat(fileUri);
           entry.size = Number(stat.size);
         }
       }
@@ -392,7 +452,7 @@ export class LocalFileProxy {
 
     // ── Local file paths (fsPath or vscode-remote) need a size lookup ──
     if (!entry.size) {
-      const stat = await vscode.workspace.fs.stat(entry.uri);
+      const stat = await vscode.workspace.fs.stat(fileUri);
       entry.size = Number(stat.size);
     }
     const totalSize = entry.size!;
@@ -408,7 +468,7 @@ export class LocalFileProxy {
       const end = m[2] ? Math.min(parseInt(m[2]), totalSize - 1) : totalSize - 1;
       const chunkSize = end - start + 1;
 
-      const fsPath = entry.uri.fsPath;
+      const fsPath = fileUri.fsPath;
       if (fsPath) {
         res.writeHead(206, {
           'Content-Range': `bytes ${start}-${end}/${totalSize}`,
@@ -416,11 +476,12 @@ export class LocalFileProxy {
           'Accept-Ranges': 'bytes',
           'Content-Type': 'application/octet-stream',
         });
-        fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 }).pipe(res);
+        const stream = fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 });
+        await this.pipeLocalFile(req, res, stream, background);
       } else {
         entry.lastAccess = Date.now();
         if (!entry.dataCache) {
-          entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
+          entry.dataCache = await vscode.workspace.fs.readFile(fileUri);
         }
         const chunk = entry.dataCache.slice(start, end + 1);
         res.writeHead(206, {
@@ -432,11 +493,11 @@ export class LocalFileProxy {
         res.end(Buffer.from(chunk));
       }
     } else {
-      const fsPath = entry.uri.fsPath;
+      const fsPath = fileUri.fsPath;
       // Never re-compress an already-compressed payload: gzip-of-gzip wastes
       // server CPU (~2-5s per 100MB) with zero size benefit, and browsers
       // cannot skip Accept-Encoding on fetch() (it is a forbidden header).
-      const isAlreadyCompressed = /\.gz$/i.test(fsPath || '') || /\.gz$/i.test(entry.uri.path || '');
+      const isAlreadyCompressed = /\.gz$/i.test(fsPath || '') || /\.gz$/i.test(fileUri.path || '');
       const shouldCompress = !isAlreadyCompressed && (req.headers['accept-encoding'] || '').includes('gzip');
       if (fsPath && !shouldCompress) {
         res.writeHead(200, {
@@ -444,22 +505,73 @@ export class LocalFileProxy {
           'Accept-Ranges': 'bytes',
           'Content-Type': 'application/octet-stream',
         });
-        fs.createReadStream(fsPath, { highWaterMark: 4 * 1024 * 1024 }).pipe(res);
+        const stream = fs.createReadStream(fsPath, { highWaterMark: 4 * 1024 * 1024 });
+        await this.pipeLocalFile(req, res, stream, background);
       } else if (fsPath && shouldCompress) {
         res.writeHead(200, {
           'Content-Encoding': 'gzip',
           'Accept-Ranges': 'bytes',
           'Content-Type': 'application/octet-stream',
         });
-        fs.createReadStream(fsPath).pipe(zlib.createGzip({ level: 1 })).pipe(res);
+        const stream = fs.createReadStream(fsPath);
+        const gzip = zlib.createGzip({ level: 1 });
+        stream.pipe(gzip);
+        await this.pipeLocalFile(req, res, gzip, background, stream);
       } else {
         entry.lastAccess = Date.now();
         if (!entry.dataCache) {
-          entry.dataCache = await vscode.workspace.fs.readFile(entry.uri);
+          entry.dataCache = await vscode.workspace.fs.readFile(fileUri);
         }
         compressResponse(Buffer.from(entry.dataCache), req, res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
       }
     }
+  }
+
+  private pipeLocalFile(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    stream: NodeJS.ReadableStream,
+    background: boolean,
+    extra?: { destroy: () => void },
+  ): Promise<void> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        this.inflightFileStreams.delete(handle);
+        resolve();
+      };
+      const destroy = () => {
+        try { extra?.destroy(); } catch { /* already closed */ }
+        try { (stream as any).destroy?.(); } catch { /* already closed */ }
+        if (!res.writableEnded) {
+          try { res.destroy(); } catch { /* already closed */ }
+        }
+        finish();
+      };
+      const handle = { destroy, background };
+      this.inflightFileStreams.add(handle);
+      req.on('close', destroy);
+      stream.on('error', finish);
+      res.on('finish', finish);
+      res.on('close', finish);
+      stream.pipe(res);
+    });
+  }
+
+  private trackHttpAbort(
+    clientReq: http.IncomingMessage | undefined,
+    remoteReq: { destroy: () => void },
+    background: boolean,
+  ): () => void {
+    const destroy = () => {
+      try { remoteReq.destroy(); } catch { /* already closed */ }
+    };
+    const handle = { destroy, background };
+    this.inflightFileStreams.add(handle);
+    clientReq?.on('close', destroy);
+    return () => this.inflightFileStreams.delete(handle);
   }
 
   private remoteSizeCache = new Map<string, number>();
@@ -494,7 +606,14 @@ export class LocalFileProxy {
     });
   }
 
-  private streamHttpRangeToResponse(url: string, rangeHeader: string, res: http.ServerResponse, entry?: FileEntry): Promise<void> {
+  private streamHttpRangeToResponse(
+    url: string,
+    rangeHeader: string,
+    res: http.ServerResponse,
+    entry?: FileEntry,
+    clientReq?: http.IncomingMessage,
+    background = false,
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const options: any = {
@@ -506,6 +625,7 @@ export class LocalFileProxy {
         agent: getAgentForUrl(url),
       };
       const mod = parsed.protocol === 'https:' ? https : http;
+      let untrack = () => {};
       const request = mod.request(options, (response: any) => {
         if (response.statusCode === 206 || response.statusCode === 200) {
           const contentRange = response.headers['content-range'];
@@ -533,20 +653,28 @@ export class LocalFileProxy {
           }
           res.writeHead(response.statusCode, headers);
           response.pipe(res, { end: true });
-          response.on('end', resolve);
-          response.on('error', reject);
+          response.on('end', () => { untrack(); resolve(); });
+          response.on('error', (err: Error) => { untrack(); reject(err); });
         } else {
+          untrack();
           reject(new Error(`Remote responded with ${response.statusCode}`));
           response.resume();
         }
       });
-      request.on('error', reject);
-      request.setTimeout(30000, () => { request.destroy(); reject(new Error('Range request timeout')); });
+      untrack = this.trackHttpAbort(clientReq, request, background);
+      request.on('error', (err) => { untrack(); reject(err); });
+      request.setTimeout(30000, () => { request.destroy(); untrack(); reject(new Error('Range request timeout')); });
       request.end();
     });
   }
 
-  private streamHttpToResponse(url: string, res: http.ServerResponse, entry?: FileEntry): Promise<void> {
+  private streamHttpToResponse(
+    url: string,
+    res: http.ServerResponse,
+    entry?: FileEntry,
+    clientReq?: http.IncomingMessage,
+    background = false,
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
       const parsed = new URL(url);
       const options = {
@@ -557,6 +685,7 @@ export class LocalFileProxy {
         agent: getAgentForUrl(url),
       };
       const mod = parsed.protocol === 'https:' ? https : http;
+      let untrack = () => {};
       const request = mod.request(options, (response: any) => {
         if (response.statusCode === 200) {
           const contentLength = parseInt(response.headers['content-length'] || '0', 10);
@@ -571,15 +700,17 @@ export class LocalFileProxy {
           }
           res.writeHead(200, headers);
           response.pipe(res, { end: true });
-          response.on('end', resolve);
-          response.on('error', reject);
+          response.on('end', () => { untrack(); resolve(); });
+          response.on('error', (err: Error) => { untrack(); reject(err); });
         } else {
+          untrack();
           reject(new Error(`Remote responded with ${response.statusCode}`));
           response.resume();
         }
       });
-      request.on('error', reject);
-      request.setTimeout(60000, () => { request.destroy(); reject(new Error('Full file request timeout')); });
+      untrack = this.trackHttpAbort(clientReq, request, background);
+      request.on('error', (err) => { untrack(); reject(err); });
+      request.setTimeout(60000, () => { request.destroy(); untrack(); reject(new Error('Full file request timeout')); });
       request.end();
     });
   }
@@ -658,6 +789,34 @@ export class LocalFileProxy {
       const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
 
       if (isGzip) {
+        const session = this.ensureGzipScan(entry);
+        if (session) {
+          await session.z0.catch(() => null);
+          if (entry.headerCache) {
+            compressResponse(Buffer.from(JSON.stringify(entry.headerCache)), req, res, 'application/json');
+            return;
+          }
+          const idx = entry.gzipIndex || await session.done;
+          if (idx && fsPath) {
+            const headerBytes = await GzipIndex.readRange(fsPath, idx, 0, 544);
+            const header = this.parseEntryHeader(entry, headerBytes);
+            if (header) {
+              entry.headerCache = header;
+              compressResponse(Buffer.from(JSON.stringify(header)), req, res, 'application/json');
+              return;
+            }
+          }
+          const unpack = entry.unpackPath || session.unpackPath;
+          if (unpack) {
+            const headerBytes = await readLocalFilePartial(unpack, 0, 543);
+            const header = this.parseEntryHeader(entry, headerBytes);
+            if (header) {
+              entry.headerCache = header;
+              compressResponse(Buffer.from(JSON.stringify(header)), req, res, 'application/json');
+              return;
+            }
+          }
+        }
         const { header } = await this.loadFileData(entry);
         compressResponse(Buffer.from(JSON.stringify(header)), req, res, 'application/json');
         return;
@@ -675,7 +834,7 @@ export class LocalFileProxy {
         headerBytes = entry.dataCache.slice(0, 544);
       }
 
-      const header = parseNiiHeaderQuick(headerBytes);
+      const header = this.parseEntryHeader(entry, headerBytes);
       if (!header) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Failed to parse NIfTI header' }));
@@ -719,11 +878,12 @@ export class LocalFileProxy {
   }
 
   private async handlePreviewLocalNii(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const fsPath = entry.uri.fsPath!;
+    const headerFs = this.headerPath(entry);
+    const dataFs = this.dataPath(entry);
 
     if (!entry.headerCache) {
-      const headerBytes = await readLocalFilePartial(fsPath, 0, 543);
-      const header = parseNiiHeaderQuick(headerBytes);
+      const headerBytes = await readLocalFilePartial(headerFs, 0, 543);
+      const header = this.parseEntryHeader(entry, headerBytes);
       if (!header) {
         res.writeHead(500);
         res.end('Failed to parse header');
@@ -738,7 +898,7 @@ export class LocalFileProxy {
     const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
     const sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
 
-    const sliceBytes = await readLocalFilePartial(fsPath, sliceStart, sliceEnd - 1);
+    const sliceBytes = await readLocalFilePartial(dataFs, sliceStart, sliceEnd - 1);
     const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
 
     let min = Infinity, max = -Infinity;
@@ -756,31 +916,80 @@ export class LocalFileProxy {
     compressResponse(buf, req, res, 'application/octet-stream');
   }
 
+  private handleGzipMeta(entry: FileEntry, res: http.ServerResponse): void {
+    const index = entry.gzipIndex || entry.gzipScan?.index || null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      indexReady: !!index,
+      indexEntries: index?.entries.length ?? 0,
+    }));
+  }
+
+  private async handlePreviewOrtho(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+    const session = this.ensureGzipScan(entry);
+    if (!session) {
+      res.writeHead(404);
+      res.end('Not a local gzip file');
+      return;
+    }
+    const preview = await session.ortho.catch(() => null);
+    if (!preview) {
+      res.writeHead(404);
+      res.end('Orthogonal preview unavailable');
+      return;
+    }
+    const buf = encodePreviewBinary(
+      preview.header,
+      { axial: preview.axial, coronal: preview.coronal, sagittal: preview.sagittal },
+      preview.min,
+      preview.max,
+      preview.sliceIdx,
+    );
+    compressResponse(buf, req, res, 'application/octet-stream');
+  }
+
   private async handlePreviewLocalGz(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const fsPath = entry.uri.fsPath!;
-    const { header, axialSlice } = await streamingGunzipPreview(fsPath);
-
-    if (!header) {
-      res.writeHead(500);
-      res.end('Failed to parse header');
+    const session = this.ensureGzipScan(entry);
+    const preview = session ? await session.z0.catch(() => null) : null;
+    if (!preview) {
+      const { header, axialSlice } = await streamingGunzipPreview(fsPath);
+      if (!header) {
+        res.writeHead(500);
+        res.end('Failed to parse header');
+        return;
+      }
+      entry.headerCache = header;
+      const { nx, ny, nz } = header;
+      let min = Infinity, max = -Infinity;
+      for (let i = 0; i < axialSlice.length; i++) {
+        if (axialSlice[i] < min) min = axialSlice[i];
+        if (axialSlice[i] > max) max = axialSlice[i];
+      }
+      const slices = {
+        axial: axialSlice,
+        coronal: new Float32Array(nx * nz),
+        sagittal: new Float32Array(ny * nz),
+      };
+      const buf = encodePreviewBinary(header, slices, min, max, {
+        axial: 0,
+        coronal: Math.floor(ny / 2),
+        sagittal: Math.floor(nx / 2),
+      });
+      entry.previewBinaryCache = buf;
+      compressResponse(buf, req, res, 'application/octet-stream');
       return;
     }
 
-    entry.headerCache = header;
+    entry.headerCache = preview.header;
     entry.lastAccess = Date.now();
-
-    const { nx, ny, nz } = header;
-    let min = Infinity, max = -Infinity;
-    for (let i = 0; i < axialSlice.length; i++) {
-      if (axialSlice[i] < min) min = axialSlice[i];
-      if (axialSlice[i] > max) max = axialSlice[i];
-    }
-
-    const emptyCoronal = new Float32Array(nx * nz);
-    const emptySagittal = new Float32Array(ny * nz);
-
-    const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
-    const buf = encodePreviewBinary(header, slices, min, max);
+    const buf = encodePreviewBinary(
+      preview.header,
+      { axial: preview.axial, coronal: preview.coronal, sagittal: preview.sagittal },
+      preview.min,
+      preview.max,
+      preview.sliceIdx,
+    );
     entry.previewBinaryCache = buf;
     compressResponse(buf, req, res, 'application/octet-stream');
   }
@@ -813,7 +1022,7 @@ export class LocalFileProxy {
 
       try {
         const headerBytes = await readHttpPartial(uriStr, 0, 543);
-        const header = parseNiiHeaderQuick(headerBytes);
+        const header = this.parseEntryHeader(entry, headerBytes);
         if (!header) {
           res.writeHead(500);
           res.end('Failed to parse header');
@@ -882,6 +1091,12 @@ export class LocalFileProxy {
         return;
       }
 
+      const fsPath = entry.uri.fsPath;
+      if (fsPath && fsPath.endsWith('.gz')) {
+        await this.handlePreviewLocalGz(entry, res, req);
+        return;
+      }
+
       const { rawData, header } = await this.loadFileData(entry);
       if (!header) {
         res.writeHead(500);
@@ -907,6 +1122,39 @@ export class LocalFileProxy {
       res.writeHead(500);
       res.end(String(err?.message ?? err));
     }
+  }
+
+  private sendPreviewVolumeBuffer(
+    loHeader: any,
+    volume: Float32Array,
+    factor: number,
+    outNx: number,
+    outNy: number,
+    outNz: number,
+    min: number,
+    max: number,
+    slope: number,
+    inter: number,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+  ): void {
+    const headerJson = JSON.stringify(loHeader);
+    const headerBuf = Buffer.from(headerJson, 'utf8');
+    const voxelBuf = Buffer.from(volume.buffer, volume.byteOffset, volume.byteLength);
+    const buf = Buffer.alloc(4 + headerBuf.length + 4 * 7 + voxelBuf.length);
+    let offset = 0;
+    buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
+    headerBuf.copy(buf, offset); offset += headerBuf.length;
+    buf.writeUInt32LE(factor, offset); offset += 4;
+    buf.writeUInt32LE(outNx, offset); offset += 4;
+    buf.writeUInt32LE(outNy, offset); offset += 4;
+    buf.writeUInt32LE(outNz, offset); offset += 4;
+    buf.writeFloatLE(min, offset); offset += 4;
+    buf.writeFloatLE(max, offset); offset += 4;
+    buf.writeFloatLE(slope, offset); offset += 4;
+    buf.writeFloatLE(inter, offset); offset += 4;
+    voxelBuf.copy(buf, offset);
+    compressResponse(buf, req, res, 'application/octet-stream');
   }
 
   /**
@@ -944,22 +1192,41 @@ export class LocalFileProxy {
       // stream) so the first preview lands in seconds instead of minutes.
       const f = isGzip ? Math.max(8, Math.min(32, Math.floor(factor) || 8)) : Math.max(2, Math.min(8, Math.floor(factor) || 4));
 
-      // ── Gzip streaming preview (Stage 2) ──
-      // Stream-download + decompress the .nii.gz and extract a strided
-      // sub-sampled volume, resolving as soon as the needed z-slices are
-      // available — without waiting for the full file to download.
+      // Local gzip: reuse the in-flight inflate (index + coarse volume).
+      // HTTP gzip: sequential inflate until the last sampled z.
       if (isGzip) {
         const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
-        // Only local and HTTP sources support streaming; vscode-remote
-        // falls through to the cached-data path below.
         if (fsPath || isHttpRemote) {
           const ac = new AbortController();
           req.on('close', () => { if (!res.writableEnded) ac.abort(); });
           try {
-            const source = fsPath
-              ? { type: 'file' as const, path: fsPath }
-              : { type: 'http' as const, url: uriStr };
-            const result = await streamingGunzipPreviewVolume(source, f, ac.signal);
+            if (fsPath) {
+              const session = this.ensureGzipScan(entry);
+              const index = entry.gzipIndex || (session ? await session.done : null);
+              const lod = session?.lod;
+              if (lod && lod.factor === f) {
+                this.sendPreviewVolumeBuffer(
+                  lod.header, lod.volume, f, lod.outNx, lod.outNy, lod.outNz,
+                  lod.min, lod.max, lod.header.scl_slope || 1, lod.header.scl_inter || 0,
+                  req, res,
+                );
+                return;
+              }
+              if (index) {
+                const indexed = await extractStridedVolumeFromIndex(fsPath, index, f, ac.signal);
+                this.sendPreviewVolumeBuffer(
+                  indexed.header, indexed.volume, f, indexed.outNx, indexed.outNy, indexed.outNz,
+                  indexed.min, indexed.max, indexed.header.scl_slope || 1, indexed.header.scl_inter || 0,
+                  req, res,
+                );
+                return;
+              }
+            }
+            const result = await streamingGunzipPreviewVolume(
+              fsPath ? { type: 'file', path: fsPath } : { type: 'http', url: uriStr },
+              f,
+              ac.signal,
+            );
             // Build a low-res header (scaled spacings + adjusted sform)
             const loHeader: any = { ...result.header };
             loHeader.nx = result.outNx;
@@ -1024,7 +1291,7 @@ export class LocalFileProxy {
           headerBytes = new Uint8Array(0);
         }
         if (!entry.headerCache) {
-          const header = parseNiiHeaderQuick(headerBytes);
+          const header = this.parseEntryHeader(entry, headerBytes);
           if (!header) {
             res.writeHead(500);
             res.end('Failed to parse NIfTI header');
@@ -1244,22 +1511,30 @@ export class LocalFileProxy {
     }
   }
 
-  private async handleSlice(entry: FileEntry, axis: string, idx: number, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
+  private async handleSlice(entry: FileEntry, axis: string, idx: number, res: http.ServerResponse, req: http.IncomingMessage, timeIdx = 0): Promise<void> {
     try {
-      const cacheKey = `${entry.id}:${axis}:${idx}`;
+      const cacheKey = `${entry.id}:${axis}:${idx}:${timeIdx}`;
       const cached = entry.sliceCache?.get(cacheKey);
       if (cached) {
         compressResponse(cached.data, req, res, 'application/octet-stream');
         return;
       }
 
-      const fsPath = entry.uri.fsPath;
-      const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
+      const headerFs = this.headerPath(entry);
+      const dataFs = entry.unpackPath || this.dataPath(entry);
+      const isGzip = !entry.unpackPath && (dataFs ? dataFs.endsWith('.gz') : (entry.dataUri || entry.uri).toString().endsWith('.gz'));
 
-      if (fsPath && !isGzip) {
+      const reply = (slice: Float32Array) => {
+        const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
+        entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+        compressResponse(buf, req, res, 'application/octet-stream');
+      };
+
+      if (dataFs && !isGzip) {
         if (!entry.headerCache) {
-          const headerBytes = await readLocalFilePartial(fsPath, 0, 543);
-          const header = parseNiiHeaderQuick(headerBytes);
+          const headerReadPath = entry.unpackPath || headerFs || dataFs;
+          const headerBytes = await readLocalFilePartial(headerReadPath, 0, 543);
+          const header = this.parseEntryHeader(entry, headerBytes);
           if (!header) {
             res.writeHead(500);
             res.end('Failed to parse header');
@@ -1269,147 +1544,71 @@ export class LocalFileProxy {
         }
         const header = entry.headerCache;
         const { nx, ny, voxOffset, bytesPerVoxel } = header;
+        const tOff = timepointByteOffset(header, timeIdx);
 
         if (axis === 'axial') {
-          const sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
+          const sliceStart = voxOffset + tOff + idx * nx * ny * bytesPerVoxel;
           const sliceSize = nx * ny * bytesPerVoxel;
-          const sliceBytes = await readLocalFilePartial(fsPath, sliceStart, sliceStart + sliceSize - 1);
-          const slice = extractAxialSliceFromRange(sliceBytes, header);
-          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-          compressResponse(buf, req, res, 'application/octet-stream');
+          const sliceBytes = await readLocalFilePartial(dataFs, sliceStart, sliceStart + sliceSize - 1);
+          reply(extractAxialSliceFromRange(sliceBytes, header));
           return;
         } else if (axis === 'coronal') {
-          const slice = await extractCoronalSliceFromRange(fsPath, header, idx);
+          const slice = await extractCoronalSliceFromRange(dataFs, header, idx, timeIdx);
           if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
-          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-          compressResponse(buf, req, res, 'application/octet-stream');
+          reply(slice);
           return;
         } else {
-          const slice = await extractSagittalSliceFromRange(fsPath, header, idx);
+          const slice = await extractSagittalSliceFromRange(dataFs, header, idx, timeIdx);
           if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
-          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-          compressResponse(buf, req, res, 'application/octet-stream');
+          reply(slice);
           return;
         }
       }
 
-      if (fsPath && isGzip && entry.gzipIndex) {
-        if (!entry.headerCache) {
-          const { header } = await this.loadFileData(entry);
-          if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
+      if (dataFs && isGzip) {
+        const session = this.ensureGzipScan(entry);
+        if (!entry.gzipIndex && session) {
+          const built = await session.done;
+          if (built) entry.gzipIndex = built;
+          if (session.unpackPath) entry.unpackPath = session.unpackPath;
         }
-        const header = entry.headerCache;
-        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
+      }
 
+      if (entry.unpackPath) {
+        return this.handleSlice(entry, axis, idx, res, req, timeIdx);
+      }
+
+      if (dataFs && isGzip && entry.gzipIndex) {
+        if (!entry.headerCache) {
+          const headerBytes = await GzipIndex.readRange(dataFs, entry.gzipIndex, 0, 544);
+          const header = this.parseEntryHeader(entry, headerBytes);
+          if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
+          entry.headerCache = header;
+        }
         try {
-          let sliceStart: number;
-          let sliceSize: number;
-
-          if (axis === 'axial') {
-            sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
-            sliceSize = nx * ny * bytesPerVoxel;
-          } else if (axis === 'coronal') {
-            sliceStart = voxOffset + idx * nx * bytesPerVoxel;
-            sliceSize = nx * bytesPerVoxel;
-          } else {
-            sliceStart = voxOffset + idx * bytesPerVoxel;
-            sliceSize = bytesPerVoxel;
-          }
-
-          if (axis === 'axial') {
-            const sliceBytes = await GzipIndex.readRange(fsPath, entry.gzipIndex, sliceStart, sliceStart + sliceSize);
-            const slice = extractAxialSliceFromRange(sliceBytes, header);
-            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-            compressResponse(buf, req, res, 'application/octet-stream');
-            return;
-          }
-
-          if (axis === 'coronal') {
-            const slice = new Float32Array(nx * nz);
-            const bpv = Math.max(1, header.bitpix / 8);
-            const le = header.littleEndian;
-            const slope = header.scl_slope || 1;
-            const inter = header.scl_inter || 0;
-            for (let z = 0; z < nz; z++) {
-              const rowOffset = voxOffset + (z * ny * nx + idx * nx) * bytesPerVoxel;
-              const rowBytes = await GzipIndex.readRange(fsPath, entry.gzipIndex, rowOffset, rowOffset + nx * bpv);
-              const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
-              for (let x = 0; x < nx; x++) {
-                const off = x * bpv;
-                let val: number;
-                switch (header.datatype) {
-                  case 2: val = rowBytes[off]; break;
-                  case 4: val = view.getInt16(off, le); break;
-                  case 8: val = view.getInt32(off, le); break;
-                  case 16: val = view.getFloat32(off, le); break;
-                  case 64: val = view.getFloat64(off, le); break;
-                  case 256: val = (rowBytes[off] << 24) >> 24; break;
-                  case 512: val = view.getUint16(off, le); break;
-                  case 768: val = view.getUint32(off, le); break;
-                  default: val = 0;
-                }
-                slice[z * nx + x] = val * slope + inter;
-              }
-            }
-            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-            compressResponse(buf, req, res, 'application/octet-stream');
-            return;
-          }
-
-          {
-            const slice = new Float32Array(ny * nz);
-            const bpv = Math.max(1, header.bitpix / 8);
-            const le = header.littleEndian;
-            const slope = header.scl_slope || 1;
-            const inter = header.scl_inter || 0;
-            for (let z = 0; z < nz; z++) {
-              const axialOffset = voxOffset + z * nx * ny * bytesPerVoxel;
-              const axialBytes = await GzipIndex.readRange(fsPath, entry.gzipIndex, axialOffset, axialOffset + nx * ny * bpv);
-              const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
-              for (let y = 0; y < ny; y++) {
-                const off = (y * nx + idx) * bpv;
-                let val: number;
-                switch (header.datatype) {
-                  case 2: val = axialBytes[off]; break;
-                  case 4: val = view.getInt16(off, le); break;
-                  case 8: val = view.getInt32(off, le); break;
-                  case 16: val = view.getFloat32(off, le); break;
-                  case 64: val = view.getFloat64(off, le); break;
-                  case 256: val = (axialBytes[off] << 24) >> 24; break;
-                  case 512: val = view.getUint16(off, le); break;
-                  case 768: val = view.getUint32(off, le); break;
-                  default: val = 0;
-                }
-                slice[z * ny + y] = val * slope + inter;
-              }
-            }
-            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-            compressResponse(buf, req, res, 'application/octet-stream');
-            return;
-          }
+          const slice = await extractSliceFromGzipIndex(dataFs, entry.gzipIndex, entry.headerCache, axis, idx, timeIdx);
+          if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
+          reply(slice);
+          return;
         } catch {
           // fall through to full decompression path
         }
       }
 
-      if (fsPath && isGzip) {
-        this.ensureGzipIndexBuilding(entry);
+      if (dataFs && isGzip && !entry.gzipIndex) {
+        this.ensureGzipScan(entry);
       }
 
-      const uriStr = entry.uri.toString();
-      const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+      const fileUri = entry.dataUri || entry.uri;
+      const uriStr = fileUri.toString();
+      const isHttpRemote = fileUri.scheme === 'http' || fileUri.scheme === 'https';
 
       if (isHttpRemote && !isGzip) {
         if (!entry.headerCache) {
           try {
-            const headerBytes = await readHttpPartial(uriStr, 0, 543);
-            const header = parseNiiHeaderQuick(headerBytes);
+            const headerUri = entry.uri.toString();
+            const headerBytes = await readHttpPartial(headerUri, 0, 543);
+            const header = this.parseEntryHeader(entry, headerBytes);
             if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
             entry.headerCache = header;
           } catch {
@@ -1418,16 +1617,14 @@ export class LocalFileProxy {
         }
         const header = entry.headerCache;
         const { nx, ny, voxOffset, bytesPerVoxel } = header;
+        const tOff = timepointByteOffset(header, timeIdx);
 
         try {
           if (axis === 'axial') {
-            const sliceStart = voxOffset + idx * nx * ny * bytesPerVoxel;
+            const sliceStart = voxOffset + tOff + idx * nx * ny * bytesPerVoxel;
             const sliceEnd = sliceStart + nx * ny * bytesPerVoxel - 1;
             const sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd);
-            const slice = extractAxialSliceFromRange(sliceBytes, header);
-            const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-            entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-            compressResponse(buf, req, res, 'application/octet-stream');
+            reply(extractAxialSliceFromRange(sliceBytes, header));
             return;
           }
 
@@ -1437,13 +1634,11 @@ export class LocalFileProxy {
           // full volume once using parallel chunked ranges and extract locally.
           // Subsequent slice requests are then served from entry.dataCache.
           const { rawData } = await this.loadFileData(entry);
-          const slice = extractSingleSlice(rawData, header, axis, idx);
+          const slice = extractSingleSlice(rawData, header, axis, idx, timeIdx);
           if (!slice) {
             res.writeHead(404); res.end('Slice not found'); return;
           }
-          const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-          entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-          compressResponse(buf, req, res, 'application/octet-stream');
+          reply(slice);
           return;
         } catch {
           res.writeHead(500); res.end('Failed to fetch slice via HTTP Range'); return;
@@ -1457,17 +1652,14 @@ export class LocalFileProxy {
         return;
       }
 
-      const slice = extractSingleSlice(rawData, header, axis, idx);
+      const slice = extractSingleSlice(rawData, header, axis, idx, timeIdx);
       if (!slice) {
         res.writeHead(404);
         res.end('Slice not found');
         return;
       }
 
-      const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-      entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-
-      compressResponse(buf, req, res, 'application/octet-stream');
+      reply(slice);
     } catch (err: any) {
       res.writeHead(500);
       res.end(String(err?.message ?? err));
@@ -1525,37 +1717,45 @@ export class LocalFileProxy {
       return entry.pendingLoad;
     }
 
-    const fsPath = entry.uri.fsPath;
-    const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
+    const fileUri = entry.dataUri || entry.uri;
+    const fsPath = fileUri.fsPath;
+    const isGzip = fsPath ? fsPath.endsWith('.gz') : fileUri.toString().endsWith('.gz');
     const isLocal = !!fsPath;
-    const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
+    const isHttpRemote = fileUri.scheme === 'http' || fileUri.scheme === 'https';
 
     entry.pendingLoad = (async () => {
       try {
         let header: any;
         let rawData: Uint8Array;
 
-        if (isLocal && isGzip) {
+        if (entry.separateImg) {
+          const headerData = await vscode.workspace.fs.readFile(entry.uri);
+          header = this.parseEntryHeader(entry, new Uint8Array(headerData.buffer, headerData.byteOffset, headerData.byteLength));
+          const fullData = await vscode.workspace.fs.readFile(fileUri);
+          rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
+          entry.headerCache = header;
+          entry.dataCache = rawData;
+        } else if (isLocal && isGzip) {
           if (entry.dataCache) {
             rawData = entry.dataCache;
-            header = entry.headerCache || parseNiiHeaderQuick(rawData);
+            header = entry.headerCache || this.parseEntryHeader(entry, rawData);
           } else {
-            const fullData = await vscode.workspace.fs.readFile(entry.uri);
+            const fullData = await vscode.workspace.fs.readFile(fileUri);
             if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
             const decompressed = await gunzipAsync(fullData, signal);
             rawData = decompressed;
-            header = parseNiiHeaderQuick(rawData);
+            header = this.parseEntryHeader(entry, rawData);
             entry.dataCache = rawData;
           }
         } else if (isLocal && !isGzip) {
           if (entry.dataCache) {
             rawData = entry.dataCache;
           } else {
-            const fullData = await vscode.workspace.fs.readFile(entry.uri);
+            const fullData = await vscode.workspace.fs.readFile(fileUri);
             rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
             entry.dataCache = rawData;
           }
-          header = entry.headerCache || parseNiiHeaderQuick(rawData);
+          header = entry.headerCache || this.parseEntryHeader(entry, rawData);
         } else if (isGzip) {
           // Remote gzip files benefit from parallel compressed download followed
           // by local decompression, which is faster than a single HTTP stream on
@@ -1567,12 +1767,12 @@ export class LocalFileProxy {
             if (isHttpRemote) {
               let compressedSize = entry.size;
               if (!compressedSize) {
-                compressedSize = await this.getHttpRemoteSize(entry.uri.toString());
+                compressedSize = await this.getHttpRemoteSize(fileUri.toString());
                 entry.size = compressedSize;
               }
-              compressed = await this.downloadHttpFileInChunks(entry.uri.toString(), compressedSize, signal);
+              compressed = await this.downloadHttpFileInChunks(fileUri.toString(), compressedSize, signal);
             } else {
-              const fullData = await vscode.workspace.fs.readFile(entry.uri);
+              const fullData = await vscode.workspace.fs.readFile(fileUri);
               compressed = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
             }
             if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -1580,7 +1780,7 @@ export class LocalFileProxy {
             rawData = decompressed;
             entry.dataCache = rawData;
           }
-          header = entry.headerCache || parseNiiHeaderQuick(rawData);
+          header = entry.headerCache || this.parseEntryHeader(entry, rawData);
         } else if (isHttpRemote) {
           // Remote uncompressed HTTP(S) file: use parallel Range requests
           // to saturate bandwidth instead of a single sequential read.
@@ -1589,18 +1789,18 @@ export class LocalFileProxy {
           } else {
             let totalSize = entry.size;
             if (!totalSize) {
-              totalSize = await this.getHttpRemoteSize(entry.uri.toString());
+              totalSize = await this.getHttpRemoteSize(fileUri.toString());
               entry.size = totalSize;
             }
-            rawData = await this.downloadHttpFileInChunks(entry.uri.toString(), totalSize, signal);
+            rawData = await this.downloadHttpFileInChunks(fileUri.toString(), totalSize, signal);
             entry.dataCache = rawData;
           }
-          header = entry.headerCache || parseNiiHeaderQuick(rawData);
+          header = entry.headerCache || this.parseEntryHeader(entry, rawData);
         } else {
-          const fullData = await vscode.workspace.fs.readFile(entry.uri);
+          const fullData = await vscode.workspace.fs.readFile(fileUri);
           if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
           rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
-          header = parseNiiHeaderQuick(rawData);
+          header = this.parseEntryHeader(entry, rawData);
           entry.dataCache = rawData;
         }
 
@@ -1690,7 +1890,7 @@ export class LocalFileProxy {
       if (isLocal && !isGzip) {
         if (!entry.headerCache) {
           const headerBytes = await readLocalFilePartial(fsPath!, 0, 543);
-          const header = parseNiiHeaderQuick(headerBytes);
+          const header = this.parseEntryHeader(entry, headerBytes);
           if (!header) return null;
           entry.headerCache = header;
         }
@@ -1732,6 +1932,20 @@ export class LocalFileProxy {
       }
 
       if (isLocal && isGzip) {
+        const session = this.ensureGzipScan(entry);
+        if (session) {
+          const preview = await session.z0;
+          if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+          entry.headerCache = preview.header;
+          return {
+            header: preview.header,
+            slices: { axial: preview.axial, coronal: preview.coronal, sagittal: preview.sagittal },
+            globalMin: preview.min, globalMax: preview.max,
+            sliceIdx: preview.sliceIdx,
+            slope: preview.slope, inter: preview.inter,
+            partialPreview: true,
+          };
+        }
         const { header, axialSlice } = await streamingGunzipPreview(fsPath!, signal);
         if (!header) return null;
         const { nx, ny, nz } = header;
@@ -1779,7 +1993,7 @@ export class LocalFileProxy {
         } else {
           try {
             const headerBytes = await readHttpPartial(uriStr, 0, 543);
-            const header = parseNiiHeaderQuick(headerBytes);
+            const header = this.parseEntryHeader(entry, headerBytes);
             if (!header) return null;
             entry.headerCache = header;
 
