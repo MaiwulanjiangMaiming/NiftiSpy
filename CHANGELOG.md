@@ -2,6 +2,14 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.3.1] - 2026-09-09
+
+### Changed — Remote loading (P0)
+- **Paint z=0 immediately**: streaming / chunked / compressed paths no longer discard `partialPreview`. The first axial slice is shown as soon as it is decompressed instead of waiting for the full volume.
+- **WAN vs local-fast remotes**: `vscode.env.remoteName` is classified. WSL and Dev Containers use the local rapidgzip/mmap path; only SSH / Codespaces / Tunnels are treated as WAN (`X-Remote-Source` is set only for those).
+- **Slice-on-demand for large WAN files** (≥8MB): Remote-SSH no longer downloads the whole `.nii` / `.nii.gz` across the tunnel by default. The host extracts a cheap preview on the remote disk and the webview scrolls via `/slice`. HTTP remotes follow the same preview-first path. Full volume still loads for small files, local/WSL, and when the user needs MIP/registration.
+- **Slow-link preload off**: next-image full-volume prefetch is skipped on low-bandwidth links and in slice-on-demand mode so it cannot starve the current view.
+
 ## [2.3.0] - 2026-08-30
 
 ### Added — Image Registration (Align / To MNI)

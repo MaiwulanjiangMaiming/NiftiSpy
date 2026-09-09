@@ -162,6 +162,10 @@ let isGzip = false;
 let fileName = '';
 let crosshairVisible = true;
 let isRemoteSource = false;
+// When true, do not auto-download the full volume (WAN large files / HTTP
+// remotes). Scrolling uses /slice; MIP/registration still require a manual
+// or explicit full load.
+let deferFullVolume = false;
 // WebviewId assigned by the extension host (used to route fallback
 // requests such as 'remoteHttpFallback' back to the right webview).
 let currentWebviewId = '';
@@ -2192,7 +2196,26 @@ function scheduleActiveImageLoad(index: number): void {
 // mid-download (much shorter wait).  The preload uses 'background' priority
 // so it never cancels or interferes with an active load.
 let preloadTimer: number | null = null;
+function isVerySlowLink(): boolean {
+  return bandwidthEstimator.qualityLevel === 'low';
+}
+
+function maybeScheduleFullVolume(index: number): void {
+  if (deferFullVolume) return;
+  if (viewerConfig.fullVolumePolicy === 'manual') return;
+  if (viewerConfig.fullVolumePolicy === 'eager') {
+    void ensureImageData(index, 'active').catch((err) => {
+      if ((err as any)?.name !== 'AbortError') {
+        loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
+      }
+    });
+    return;
+  }
+  scheduleActiveImageLoad(index);
+}
+
 function scheduleNextImagePreload(currentIdx: number): void {
+  if (deferFullVolume || isVerySlowLink()) return;
   if (preloadTimer) {
     window.clearTimeout(preloadTimer);
     preloadTimer = null;
@@ -2201,6 +2224,7 @@ function scheduleNextImagePreload(currentIdx: number): void {
   // and the user has time to start scrolling before we consume bandwidth.
   preloadTimer = window.setTimeout(() => {
     preloadTimer = null;
+    if (deferFullVolume || isVerySlowLink()) return;
     const nextIdx = currentIdx + 1;
     if (nextIdx >= images.length) return;
     const nextImg = images[nextIdx];
@@ -2271,6 +2295,9 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const result = await loadVolumeViaWorker(loadKey, img.url, (img.name && img.name.endsWith('.gz')) || img.url.endsWith('.gz'), (msg) => {
+          if (msg.type === 'preview' && msg.partialPreview && index === activeImageIdx && !img.data) {
+            showPartialPreviewFromMessage(msg, { fetchMissingSlices: false });
+          }
           if (msg.type === 'previewVolume' && index === activeImageIdx && !img.data) {
             // Low-res preview arrived — render immediately so the user sees
             // something while the full-resolution download continues.
@@ -5110,6 +5137,7 @@ let chunkedState: {
   validationToken: string;
   receiveTime: number;
   generation: number;  // incremented on each new transfer; stale readers check this
+  earlyPreviewSent: boolean;
 } | null = null;
 let chunkedGeneration = 0;
 
@@ -5458,11 +5486,10 @@ window.addEventListener('message', async (e) => {
   }
 
   if (msg.type === 'remoteSshHttp') {
-    // Remote-SSH fast path: the extension host registered the file in the
-    // localhost HTTP proxy and port-forwarded it via asExternalUri. The
-    // Worker now streams the forwarded URL directly — full tunnel
-    // bandwidth, overlapping decompression, early preview — instead of
-    // waiting for one postMessage round trip per chunk.
+    // Remote-SSH small-file path: the extension host registered the file in
+    // the localhost HTTP proxy and port-forwarded it via asExternalUri. The
+    // Worker streams the forwarded URL — full tunnel bandwidth, overlapping
+    // decompression, early preview — instead of one postMessage per chunk.
     directPreviewReceived = true;
     if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
 
@@ -5471,6 +5498,7 @@ window.addEventListener('message', async (e) => {
     fileName = msg.fileName || fileName;
     isGzip = !!msg.isGzip;
     isRemoteSource = true;
+    deferFullVolume = false;
 
     if (msg.validationToken && fileName) {
       broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0 });
@@ -5482,9 +5510,6 @@ window.addEventListener('message', async (e) => {
       });
     }
 
-    // Point the pending image entry at the forwarded URL. Initial open
-    // creates the entry here; a file-switch already pushed a placeholder
-    // (loadNewImage) whose URL we now override.
     if (images.length === 0) {
       images.push({
         header: null as any,
@@ -5516,8 +5541,6 @@ window.addEventListener('message', async (e) => {
 
     void ensureImageData(activeImageIdx, 'active').catch((err: any) => {
       if (err?.name === 'AbortError') return;
-      // The forwarded URL is unreachable (forwarding blocked, tunnel
-      // hiccup) — ask the extension host for the chunked fallback.
       vscode.postMessage({
         type: 'remoteHttpFallback',
         webviewId: currentWebviewId,
@@ -5526,6 +5549,63 @@ window.addEventListener('message', async (e) => {
       loadingText.textContent = 'Retrying with chunked transfer...';
       updateProgress(0.02, 'Retrying with chunked transfer...');
     });
+    return;
+  }
+
+  if (msg.type === 'remoteSliceMode') {
+    // WAN large-file path: preview pixels come from the remote disk; scrolling
+    // uses /slice. The compressed object is NOT pulled across the tunnel.
+    directPreviewReceived = true;
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+
+    fileUrl = msg.url;
+    directUrl = '';
+    fileName = msg.fileName || fileName;
+    isGzip = !!msg.isGzip;
+    isRemoteSource = true;
+    deferFullVolume = true;
+
+    if (msg.validationToken && fileName) {
+      broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0 });
+      broadcastToSliceWorkers({
+        type: 'invalidateCache',
+        fileName,
+        fileSize: msg.fileSize || 0,
+        validationToken: msg.validationToken,
+      });
+    }
+
+    if (msg.header) {
+      showPartialPreviewFromMessage(msg, { fetchMissingSlices: true });
+    } else {
+      loadingText.textContent = 'Loading preview...';
+      setupInteraction();
+      void fetchPreviewData(fileUrl).then((previewData) => {
+        if (!previewData?.header) {
+          vscode.postMessage({
+            type: 'remoteHttpFallback',
+            webviewId: currentWebviewId,
+            reason: 'slice-mode preview unavailable',
+          });
+          return;
+        }
+        applyPreviewData(previewData);
+        setPrimaryImageFromPreview(previewData);
+        updateFileInfo();
+        updateSliderValues();
+        updateImagePicker();
+        renderAllViews();
+        loading.style.display = 'none';
+        showSliceModeBadge();
+        void refreshSlices(['axial', 'coronal', 'sagittal'], false).catch(() => {});
+      }).catch((err) => {
+        vscode.postMessage({
+          type: 'remoteHttpFallback',
+          webviewId: currentWebviewId,
+          reason: (err as Error)?.message || String(err),
+        });
+      });
+    }
     return;
   }
 
@@ -5594,6 +5674,7 @@ window.addEventListener('message', async (e) => {
   fileName = msg.fileName;
   isGzip = fileName.endsWith('.gz');
   isRemoteSource = !!msg.isRemote;
+  deferFullVolume = !!msg.deferFullVolume;
   viewerConfig.previewMode = msg.previewMode || viewerConfig.previewMode;
   applyRenderBackend(msg.renderBackend || viewerConfig.renderBackend);
   viewerConfig.renderBackend = msg.renderBackend || viewerConfig.renderBackend;
@@ -5665,9 +5746,156 @@ function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
   if (val instanceof ArrayBuffer) return new Float32Array(val);
   if (ArrayBuffer.isView(val)) return new Float32Array(val.buffer, val.byteOffset, val.byteLength / 4);
   const arr = msg.slices?.[fallbackKey];
+  if (arr instanceof ArrayBuffer) return new Float32Array(arr);
+  if (ArrayBuffer.isView(arr)) return new Float32Array(arr.buffer, arr.byteOffset, arr.byteLength / 4);
   if (Array.isArray(arr)) return new Float32Array(arr);
   if (Array.isArray(val)) return new Float32Array(val);
   return new Float32Array(0);
+}
+
+function sliceHasSignal(arr: Float32Array): boolean {
+  if (!arr || arr.length === 0) return false;
+  const step = Math.max(1, (arr.length / 64) | 0);
+  for (let i = 0; i < arr.length; i += step) {
+    if (arr[i] !== 0) return true;
+  }
+  return false;
+}
+
+function showSliceModeBadge(): void {
+  if (!lowResBadge) {
+    lowResBadge = document.createElement('div');
+    lowResBadge.id = 'lowres-badge';
+    lowResBadge.style.cssText = 'position:fixed;top:12px;right:12px;background:rgba(0,0,0,0.78);color:#ffd54f;padding:6px 12px;border-radius:6px;font-size:12px;font-family:monospace;z-index:9999;pointer-events:none;border:1px solid rgba(255,213,79,0.45);';
+    document.body.appendChild(lowResBadge);
+  }
+  lowResBadge.textContent = 'Preview · scrolling loads slices (full volume not downloaded)';
+  lowResBadge.style.display = 'block';
+}
+
+function extractAxialZ0(raw: Uint8Array, hdr: NiiHeader): Float32Array | null {
+  const { nx, ny, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = hdr;
+  const sliceBytes = nx * ny * bytesPerVoxel;
+  if (raw.byteLength < voxOffset + sliceBytes) return null;
+  const slope = scl_slope || 1;
+  const inter = scl_inter || 0;
+  const le = littleEndian;
+  const out = new Float32Array(nx * ny);
+  const view = new DataView(raw.buffer, raw.byteOffset + voxOffset, sliceBytes);
+  for (let i = 0; i < nx * ny; i++) {
+    const off = i * bytesPerVoxel;
+    let val: number;
+    switch (datatype) {
+      case 2: val = view.getUint8(off); break;
+      case 4: val = view.getInt16(off, le); break;
+      case 8: val = view.getInt32(off, le); break;
+      case 16: val = view.getFloat32(off, le); break;
+      case 64: val = view.getFloat64(off, le); break;
+      case 256: val = view.getInt8(off); break;
+      case 512: val = view.getUint16(off, le); break;
+      case 768: val = view.getUint32(off, le); break;
+      default: val = 0;
+    }
+    out[i] = val * slope + inter;
+  }
+  return out;
+}
+
+function showPartialPreviewFromMessage(msg: any, opts?: { fetchMissingSlices?: boolean }): void {
+  if (volumeData && fullVolumeLoaded) return;
+  if (msg.deferFullVolume) deferFullVolume = true;
+
+  if (!msg.header) {
+    loadingText.textContent = 'Loading volume...';
+    updateProgress(0.25, 'Reading volume data...');
+    return;
+  }
+
+  header = msg.header;
+  const hdr = header as NiiHeader;
+  computeViewFlips();
+  globalMin = msg.globalMin ?? 0;
+  globalMax = msg.globalMax ?? 1;
+  dataSlope = msg.slope || 1;
+  dataInter = msg.inter || 0;
+  if (msg.sliceIdx) {
+    sliceIdx.axial = msg.sliceIdx.axial ?? 0;
+    sliceIdx.coronal = msg.sliceIdx.coronal ?? Math.floor(hdr.ny / 2);
+    sliceIdx.sagittal = msg.sliceIdx.sagittal ?? Math.floor(hdr.nx / 2);
+  } else {
+    sliceIdx.axial = 0;
+    sliceIdx.coronal = Math.floor(hdr.ny / 2);
+    sliceIdx.sagittal = Math.floor(hdr.nx / 2);
+  }
+
+  const axial = toFloat32Array(msg.axialSlice, 'axial', msg);
+  const coronal = toFloat32Array(msg.coronalSlice, 'coronal', msg);
+  const sagittal = toFloat32Array(msg.sagittalSlice, 'sagittal', msg);
+
+  if (axial.length > 0) {
+    setCurrentSlice('axial', axial, hdr.nx, hdr.ny, 1);
+    if (globalMax <= globalMin) {
+      let mn = Infinity, mx = -Infinity;
+      for (let i = 0; i < axial.length; i++) {
+        if (axial[i] < mn) mn = axial[i];
+        if (axial[i] > mx) mx = axial[i];
+      }
+      if (mn === mx) mx = mn + 1;
+      globalMin = mn;
+      globalMax = mx;
+    }
+  }
+  if (coronal.length > 0 && sliceHasSignal(coronal)) {
+    setCurrentSlice('coronal', coronal, hdr.nx, hdr.nz, 1);
+  }
+  if (sagittal.length > 0 && sliceHasSignal(sagittal)) {
+    setCurrentSlice('sagittal', sagittal, hdr.ny, hdr.nz, 1);
+  }
+
+  windowLevel = 0.5;
+  windowWidth = 1.0;
+  initialWindowWidth = windowWidth;
+  initialWindowLevel = windowLevel;
+
+  if (images.length === 0 || !images[activeImageIdx] || !images[activeImageIdx].header) {
+    setPrimaryImageFromDirectPreview(msg, axial, coronal, sagittal);
+  } else {
+    const img = images[activeImageIdx];
+    img.header = msg.header;
+    img.min = globalMin;
+    img.max = globalMax;
+    img.slope = dataSlope;
+    img.inter = dataInter;
+    img.state = 'preview';
+    img.url = fileUrl;
+    img.directUrl = directUrl;
+    img.preview = {
+      axial,
+      coronal: currentSlices.coronal?.data || coronal,
+      sagittal: currentSlices.sagittal?.data || sagittal,
+    };
+  }
+
+  updateFileInfo();
+  updateSliderValues();
+  updateImagePicker();
+  renderAllViews();
+  loading.style.display = 'none';
+  updateProgress(0.35, deferFullVolume ? 'Slices on demand' : 'Loading volume...');
+  setupInteraction();
+  if (headerPanelVisible) updateHeaderPanel();
+
+  if (deferFullVolume) {
+    showSliceModeBadge();
+    if (opts?.fetchMissingSlices) {
+      const missing: Axis[] = [];
+      if (!currentSlices.coronal) missing.push('coronal');
+      if (!currentSlices.sagittal) missing.push('sagittal');
+      if (missing.length > 0) {
+        void refreshSlices(missing, false).catch(() => {});
+      }
+    }
+  }
 }
 
 function handleDirectPreview(msg: any): void {
@@ -5676,6 +5904,7 @@ function handleDirectPreview(msg: any): void {
   // download + decompress + early slice extraction). Start the Worker
   // immediately instead of falling back to the 800ms preview re-fetch.
   if (msg.remoteStreaming === true) {
+    if (msg.deferFullVolume) deferFullVolume = true;
     // Cancel the fallback timer — the Worker streaming path will provide
     // early preview, no need for the HTTP preview fallback.
     if (directPreviewTimer) { clearTimeout(directPreviewTimer); directPreviewTimer = null; }
@@ -5703,6 +5932,23 @@ function handleDirectPreview(msg: any): void {
     updateProgress(0.02, 'Streaming remote file...', 'Stream');
     setupInteraction();
 
+    if (deferFullVolume) {
+      void fetchPreviewData().then((previewData) => {
+        if (previewData && previewData.header) {
+          applyPreviewData(previewData);
+          setPrimaryImageFromPreview(previewData);
+          updateFileInfo();
+          updateSliderValues();
+          updateImagePicker();
+          renderAllViews();
+          loading.style.display = 'none';
+          showSliceModeBadge();
+          void refreshSlices(['axial', 'coronal', 'sagittal'], false).catch(() => {});
+        }
+      }).catch(() => {});
+      return;
+    }
+
     void ensureImageData(0, 'active').catch((err) => {
       if ((err as any)?.name !== 'AbortError') {
         loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
@@ -5711,12 +5957,13 @@ function handleDirectPreview(msg: any): void {
     return;
   }
 
-  // Partial early preview (e.g. z=0 axial slice only) can look strange and
-  // is quickly replaced by the full volume. Keep the loading spinner visible
-  // instead so users see a clean transition to the correct image.
+  if (msg.deferFullVolume) deferFullVolume = true;
+
+  // z=0 / ortho preview: paint immediately so WAN users see an image
+  // before the full volume (which may never be downloaded in slice mode).
   if (msg.partialPreview) {
-    loadingText.textContent = 'Loading volume...';
-    updateProgress(0.25, 'Reading volume data...');
+    showPartialPreviewFromMessage(msg, { fetchMissingSlices: deferFullVolume });
+    if (!deferFullVolume) maybeScheduleFullVolume(0);
     return;
   }
 
@@ -5757,13 +6004,7 @@ function handleDirectPreview(msg: any): void {
   updateProgress(0.5);
   setupInteraction();
 
-  if (msg.partialPreview || viewerConfig.fullVolumePolicy === 'debounced') {
-    scheduleActiveImageLoad(0);
-  } else if (viewerConfig.fullVolumePolicy === 'eager') {
-    void ensureImageData(0, 'active').catch((err) => {
-      if ((err as any)?.name !== 'AbortError') loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
-    });
-  }
+  maybeScheduleFullVolume(0);
 }
 
 /**
@@ -5810,6 +6051,7 @@ async function handleChunkedVolume(msg: any): Promise<void> {
       validationToken: msg.validationToken,
       receiveTime: performance.now(),
       generation: ++chunkedGeneration,
+      earlyPreviewSent: false,
     };
 
     loadingText.textContent = 'Streaming volume...';
@@ -5896,6 +6138,40 @@ async function readDecompressedStream(decompressedStream: ReadableStream<Uint8Ar
         state.header = parseNiiHeader(buf.buffer as ArrayBuffer, true);
         if (state.header) {
           updateProgress(0.5, 'Decompressing volume...');
+        }
+      }
+
+      // Paint z=0 as soon as the first axial slice is decompressed.
+      if (state.header && !state.earlyPreviewSent) {
+        const needed = state.header.voxOffset + state.header.nx * state.header.ny * state.header.bytesPerVoxel;
+        if (state.decompressedLen >= needed) {
+          const buf = concatUint8Chunks(state.decompressedChunks, state.decompressedLen);
+          const axial = extractAxialZ0(buf, state.header);
+          if (axial) {
+            state.earlyPreviewSent = true;
+            let mn = Infinity, mx = -Infinity;
+            for (let i = 0; i < axial.length; i++) {
+              if (axial[i] < mn) mn = axial[i];
+              if (axial[i] > mx) mx = axial[i];
+            }
+            if (mn === mx) mx = mn + 1;
+            showPartialPreviewFromMessage({
+              header: state.header,
+              axialSlice: axial,
+              coronalSlice: new Float32Array(0),
+              sagittalSlice: new Float32Array(0),
+              globalMin: mn,
+              globalMax: mx,
+              slope: state.header.scl_slope || 1,
+              inter: state.header.scl_inter || 0,
+              sliceIdx: {
+                axial: 0,
+                coronal: Math.floor(state.header.ny / 2),
+                sagittal: Math.floor(state.header.nx / 2),
+              },
+              partialPreview: true,
+            }, { fetchMissingSlices: false });
+          }
         }
       }
     }
@@ -6015,6 +6291,7 @@ async function handleCompressedVolume(msg: any): Promise<void> {
   const reader = (decompressedStream as ReadableStream<Uint8Array>).getReader();
 
   let header: NiiHeader | null = null;
+  let earlyPreviewSent = false;
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -6042,6 +6319,36 @@ async function handleCompressedVolume(msg: any): Promise<void> {
         : concatUint8Chunks(chunks);
       header = parseNiiHeader(view.buffer as ArrayBuffer, true);
       if (header) updateProgress(0.5, 'Reading volume data...');
+    }
+
+    if (header && !earlyPreviewSent) {
+      const needed = header.voxOffset + header.nx * header.ny * header.bytesPerVoxel;
+      if (totalLen >= needed) {
+        const view = preAlloc ? preAlloc.subarray(0, Math.min(totalLen, preAlloc.length))
+          : concatUint8Chunks(chunks);
+        const axial = extractAxialZ0(view, header);
+        if (axial) {
+          earlyPreviewSent = true;
+          let mn = Infinity, mx = -Infinity;
+          for (let i = 0; i < axial.length; i++) {
+            if (axial[i] < mn) mn = axial[i];
+            if (axial[i] > mx) mx = axial[i];
+          }
+          if (mn === mx) mx = mn + 1;
+          showPartialPreviewFromMessage({
+            header,
+            axialSlice: axial,
+            coronalSlice: new Float32Array(0),
+            sagittalSlice: new Float32Array(0),
+            globalMin: mn,
+            globalMax: mx,
+            slope: header.scl_slope || 1,
+            inter: header.scl_inter || 0,
+            sliceIdx: { axial: 0, coronal: Math.floor(header.ny / 2), sagittal: Math.floor(header.nx / 2) },
+            partialPreview: true,
+          }, { fetchMissingSlices: false });
+        }
+      }
     }
   }
 
@@ -6326,11 +6633,12 @@ function handleCachedVolume(msg: any): void {
   loading.style.display = 'none';
   updateProgress(1.0);
   setupInteraction();
+  if (volumeData) hideLowResBadge();
 
   if (headerPanelVisible) updateHeaderPanel();
 
   if (!volumeData) {
-    scheduleActiveImageLoad(0);
+    maybeScheduleFullVolume(0);
   }
 
   // ── Performance report ──
@@ -6512,13 +6820,7 @@ async function fallbackToHttpPreview(): Promise<void> {
         loading.style.display = 'none';
         updateProgress(0.5);
         setupInteraction();
-        if (viewerConfig.fullVolumePolicy === 'eager') {
-          void ensureImageData(0, 'active').catch((err) => {
-            if ((err as any)?.name !== 'AbortError') loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
-          });
-        } else if (viewerConfig.fullVolumePolicy === 'debounced') {
-          scheduleActiveImageLoad(0);
-        }
+        maybeScheduleFullVolume(0);
         return;
       }
     } catch (_) {}
@@ -6601,8 +6903,7 @@ function loadFullVolume() {
       previewReceived = true;
       // Partial early preview (axial z=0 only) is not user-ready; keep loading visible.
       if (d.partialPreview) {
-        // If low-res preview is already shown, don't regress the loading text.
-        if (!isLowResPreview) loadingText.textContent = 'Loading volume...';
+        showPartialPreviewFromMessage(d, { fetchMissingSlices: false });
         return;
       }
       if (!header) {
@@ -6777,7 +7078,7 @@ async function switchToImage(idx: number) {
   updateImagePicker();
   renderAllViews();
   if (!img.data) {
-    scheduleActiveImageLoad(idx);
+    maybeScheduleFullVolume(idx);
   } else {
     scheduledActiveIndex = null;
     if (activeLoadDebounceTimer) {

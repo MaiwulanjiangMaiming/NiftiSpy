@@ -24,6 +24,7 @@ import {
   type VolumePreviewResult,
 } from './io/compression';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
+import { isWanRemote } from './remoteEnv';
 
 interface FileEntry {
   uri: vscode.Uri;
@@ -179,6 +180,41 @@ export class LocalFileProxy {
     return undefined;
   }
 
+  /** Kick gzip random-access indexing in the background (best-effort). */
+  startGzipIndex(entryId: string): void {
+    const entry = this.files.get(entryId);
+    if (entry) this.ensureGzipIndexBuilding(entry);
+  }
+
+  private ensureGzipIndexBuilding(entry: FileEntry): void {
+    const fsPath = entry.uri.fsPath;
+    if (!fsPath || !fsPath.endsWith('.gz')) return;
+    if (entry.gzipIndex || entry.gzipIndexBuilding) return;
+    entry.gzipIndexBuilding = true;
+    loadCachedIndex(fsPath).then(cachedIdx => {
+      if (cachedIdx) {
+        entry.gzipIndex = cachedIdx;
+        entry.gzipIndexBuilding = false;
+        return;
+      }
+      return GzipIndex.buildIndex(fsPath).then(idx => {
+        entry.gzipIndex = idx;
+        entry.gzipIndexBuilding = false;
+        saveCachedIndex(fsPath, idx).catch(() => {});
+      });
+    }).catch(() => {
+      GzipIndex.buildIndex(fsPath).then(idx => {
+        entry.gzipIndex = idx;
+        entry.gzipIndexBuilding = false;
+        saveCachedIndex(fsPath, idx).catch(() => {});
+      }).catch(() => {
+        entry.gzipIndexBuilding = false;
+      });
+    }).catch(() => {
+      entry.gzipIndexBuilding = false;
+    });
+  }
+
   private readonly maxConcurrentRequests = 32;
   private activeRequests = 0;
 
@@ -223,13 +259,10 @@ export class LocalFileProxy {
     _res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     _res.setHeader('Connection', 'keep-alive');
     _res.setHeader('Keep-Alive', 'timeout=30, max=100');
-    // When this proxy runs inside a remote extension host (Remote-SSH,
-    // Dev Container, WSL), every webview request traverses the forwarded
-    // port / SSH tunnel — a WAN path with real RTT, not a loopback. The
-    // Worker keys its chunk-size/concurrency adaptation off this flag;
-    // without it a tunneled 127.0.0.1 URL would be misread as local and
-    // get 32MB chunks that stall slow links for minutes.
-    if (vscode.env.remoteName) {
+    // Only true WAN remotes (SSH / Codespaces / Tunnels) pay a real RTT
+    // on 127.0.0.1: the Worker keys chunk size off this flag. WSL and
+    // Dev Containers are loopback-class and must not be marked remote.
+    if (isWanRemote()) {
       _res.setHeader('X-Remote-Source', 'true');
     }
 
@@ -1365,31 +1398,8 @@ export class LocalFileProxy {
         }
       }
 
-      if (fsPath && isGzip && !entry.gzipIndex && !entry.gzipIndexBuilding) {
-        entry.gzipIndexBuilding = true;
-        // Try loading cached index first, then build if needed
-        loadCachedIndex(fsPath).then(cachedIdx => {
-          if (cachedIdx) {
-            entry.gzipIndex = cachedIdx;
-            entry.gzipIndexBuilding = false;
-          } else {
-            GzipIndex.buildIndex(fsPath).then(idx => {
-              entry.gzipIndex = idx;
-              entry.gzipIndexBuilding = false;
-              saveCachedIndex(fsPath, idx).catch(() => {});
-            }).catch(() => {
-              entry.gzipIndexBuilding = false;
-            });
-          }
-        }).catch(() => {
-          GzipIndex.buildIndex(fsPath).then(idx => {
-            entry.gzipIndex = idx;
-            entry.gzipIndexBuilding = false;
-            saveCachedIndex(fsPath, idx).catch(() => {});
-          }).catch(() => {
-            entry.gzipIndexBuilding = false;
-          });
-        });
+      if (fsPath && isGzip) {
+        this.ensureGzipIndexBuilding(entry);
       }
 
       const uriStr = entry.uri.toString();

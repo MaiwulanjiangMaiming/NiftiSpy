@@ -96,7 +96,8 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
         }
       }
 
-      // Send z=0 slice as instant preview
+      // Send z=0 slice as instant preview, then stop — callers in slice
+      // mode must not pay for a full sequential inflate of a 300MB gzip.
       if (header && totalSize >= firstSliceNeeded && !resolved) {
         const buf = Buffer.concat(chunks);
         const { nx, ny, voxOffset, bytesPerVoxel } = header;
@@ -104,8 +105,9 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
         if (buf.length >= sliceEnd) {
           const sliceBytes = new Uint8Array(buf.buffer, buf.byteOffset + voxOffset, nx * ny * bytesPerVoxel);
           const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-          // Resolve immediately with z=0 for instant display
           resolved = true;
+          fileStream.destroy();
+          gunzip.destroy();
           resolve({ header, axialSlice });
         }
       }

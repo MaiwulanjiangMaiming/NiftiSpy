@@ -7,6 +7,7 @@ import { VolumeCache } from './VolumeCache';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './io/gzipIndex';
 import { downsampleSlice } from './nifti/sliceExtractor';
 import { getNativeBindings } from './nativeBridge';
+import { isWanRemote, shouldUseSliceMode, SLICE_MODE_MIN_BYTES } from './remoteEnv';
 
 interface LoadJob {
   webviewId: string;
@@ -407,12 +408,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           fullVolumePolicy: config.get('fullVolumePolicy', 'debounced'),
           nativeAcceleration: config.get('nativeAcceleration', 'auto'),
           isRemote,
-          // Remote-SSH with a file-scheme URI: the file lives on the remote
-          // host. startLocalLoad will try the port-forwarded HTTP fast path
-          // and send a follow-up 'remoteSshHttp' message; the webview uses
-          // this flag to skip the HTTP-preview fallback timer (the fast
-          // path overlaps download + decompress in the Worker).
-          isRemoteSsh: !isRemote && !!vscode.env.remoteName,
+          // True WAN Remote-SSH (not WSL/Dev Container): startLocalLoad will
+          // try port-forwarded HTTP, then either slice-on-demand (large files)
+          // or a full fetch (small files). The webview skips the HTTP-preview
+          // fallback timer while that message is in flight.
+          isRemoteSsh: !isRemote && isWanRemote(),
+          deferFullVolume: isRemote || shouldUseSliceMode(fileSize),
           fileUrl,
           directUrl: isRemote ? uri.toString() : '',
           fileName: path.basename(uri.fsPath ?? uri.toString()),
@@ -703,7 +704,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   ): Promise<void> {
     const uriKey = uri.toString();
     const cached = this.volumeCache.get(uriKey);
-    if (cached) {
+    if (cached && !shouldUseSliceMode(fileSize)) {
       this.volumeCache.setActive(uriKey, webviewId);
       // Pass the full underlying buffer + voxOffset to avoid a costly
       // buffer.slice() copy on cache-hit (second open of same file).
@@ -755,7 +756,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           let streamStats: { min: number; max: number } | null = null;
           // Hoisted out of the isGzip block so the finalize path's
           // perfExtTiming (which runs for both .nii and .nii.gz) can read it.
-          const isRemoteSSH = !!vscode.env.remoteName;
+          const isRemoteSSH = isWanRemote();
 
           // ── Remote-SSH fast path: HTTP port-forward streaming ──
           // The chunked postMessage path is latency-bound: each 2MB chunk
@@ -792,7 +793,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             //
             // This avoids the "worker fetch of asWebviewUri URLs is unreliable across
             // VS Code versions" problem documented at the asWebviewUri assignment.
-            if (vscode.env.remoteName) {
+            if (isRemoteSSH) {
               const REMOTE_SSH_ONESHOT_MAX_MB = 4;
               const fileMB = fileSize / (1024 * 1024);
               if (fileSize > 0 && fileMB <= REMOTE_SSH_ONESHOT_MAX_MB) {
@@ -1440,13 +1441,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
    * port-forward it via vscode.env.asExternalUri, then let the webview
    * Worker fetch the forwarded URL directly.
    *
-   * Why this is dramatically faster than postMessage: the ext-host→webview
-   * RPC channel adds a serialization + delivery-acknowledgement round trip
-   * per message, so sequentially-awaited 2MB chunks cap throughput at
-   * ~1 chunk/RTT. The forwarded port instead carries a raw TCP stream
-   * multiplexed inside the SSH connection: no per-message overhead, full
-   * tunnel bandwidth, natural backpressure — while the Worker overlaps
-   * decompression and renders an early preview during the download.
+   * Large files (≥8MB) use slice-on-demand: the host extracts a cheap
+   * z=0 / ortho preview on the remote disk and the webview scrolls via
+   * /slice. Small files still stream the whole compressed object — the
+   * extra round trips of slice mode are a net loss below that size.
    *
    * Returns true if the fast path was dispatched (webview will drive the
    * load); false if port forwarding is unavailable (caller falls back to
@@ -1468,17 +1466,63 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
       const proxyUrl = this.proxy.registerFile(uri);
+      const entryId = proxyUrl.split('/').pop()!;
       // Ask VS Code to forward the remote-side localhost port so the local
       // webview can reach it. Throws when forwarding is unavailable
       // (e.g. restricted remote environments).
       const external = await vscode.env.asExternalUri(vscode.Uri.parse(proxyUrl));
 
-      // Stash the fallback context BEFORE posting: if the webview fetch
-      // fails, it reports back and we resume the chunked transfer.
+      const sliceMode = shouldUseSliceMode(fileSize);
+      const isGzip = fsPath.endsWith('.gz');
+
       this.remoteHttpFallbacks.set(webviewId, {
         webview, fsPath, fileSize, validationToken, signal,
-        isGzip: fsPath.endsWith('.gz'),
+        isGzip,
       });
+
+      if (sliceMode) {
+        this.proxy.startGzipIndex(entryId);
+        let preview: Awaited<ReturnType<LocalFileProxy['extractPreviewForWebview']>> = null;
+        try {
+          preview = await this.proxy.extractPreviewForWebview(entryId, signal);
+        } catch (err) {
+          this.logPerf(`[remote-ssh-slice] preview extract failed (${String(err)}) — still dispatching slice URL`);
+        }
+        if (signal.aborted) {
+          this.remoteHttpFallbacks.delete(webviewId);
+          return true;
+        }
+
+        const ok = await webview.postMessage({
+          type: 'remoteSliceMode',
+          url: external.toString(),
+          fileName: path.basename(fsPath),
+          fileSize,
+          validationToken,
+          isGzip,
+          deferFullVolume: true,
+          header: preview?.header,
+          globalMin: preview?.globalMin ?? 0,
+          globalMax: preview?.globalMax ?? 1,
+          slope: preview?.slope ?? 1,
+          inter: preview?.inter ?? 0,
+          sliceIdx: preview?.sliceIdx,
+          axialSlice: preview?.slices.axial,
+          coronalSlice: preview?.slices.coronal,
+          sagittalSlice: preview?.slices.sagittal,
+          partialPreview: true,
+          perfExtTiming: {
+            isRemoteSSH: true,
+            path: 'remote-ssh-slice',
+          },
+        });
+        if (!ok) {
+          this.remoteHttpFallbacks.delete(webviewId);
+          return false;
+        }
+        this.logPerf(`[remote-ssh-slice] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`);
+        return true;
+      }
 
       const ok = await webview.postMessage({
         type: 'remoteSshHttp',
@@ -1486,7 +1530,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         fileName: path.basename(fsPath),
         fileSize,
         validationToken,
-        isGzip: fsPath.endsWith('.gz'),
+        isGzip,
         perfExtTiming: {
           isRemoteSSH: true,
           path: 'remote-ssh-http',
@@ -1820,34 +1864,38 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     signal: AbortSignal
   ): void {
     const uriKey = uri.toString();
+    const isRemote = uri.scheme !== 'file';
     const cached = this.volumeCache.get(uriKey);
 
     if (cached) {
-      this.volumeCache.setActive(uriKey, webviewId);
-      const voxelBuffer = cached.voxelData.buffer.slice(
-        cached.voxelData.byteOffset,
-        cached.voxelData.byteOffset + cached.voxelData.byteLength
-      );
-      webview.postMessage({
-        type: 'cachedVolume',
-        header: cached.header,
-        globalMin: cached.min,
-        globalMax: cached.max,
-        slope: cached.slope,
-        inter: cached.inter,
-        sliceIdx: {
-          axial: Math.floor(cached.header.nz / 2),
-          coronal: Math.floor(cached.header.ny / 2),
-          sagittal: Math.floor(cached.header.nx / 2),
-        },
-        voxelData: voxelBuffer,
-        datatype: cached.header.datatype,
-      });
-      return;
+      const cachedBytes = cached.voxelData.byteLength;
+      const skipCachedVolume = isRemote && cachedBytes >= SLICE_MODE_MIN_BYTES;
+      if (!skipCachedVolume) {
+        this.volumeCache.setActive(uriKey, webviewId);
+        const voxelBuffer = cached.voxelData.buffer.slice(
+          cached.voxelData.byteOffset,
+          cached.voxelData.byteOffset + cached.voxelData.byteLength
+        );
+        webview.postMessage({
+          type: 'cachedVolume',
+          header: cached.header,
+          globalMin: cached.min,
+          globalMax: cached.max,
+          slope: cached.slope,
+          inter: cached.inter,
+          sliceIdx: {
+            axial: Math.floor(cached.header.nz / 2),
+            coronal: Math.floor(cached.header.ny / 2),
+            sagittal: Math.floor(cached.header.nx / 2),
+          },
+          voxelData: voxelBuffer,
+          datatype: cached.header.datatype,
+        });
+        return;
+      }
     }
 
     const isActive = this.isWebviewActive(webviewId);
-    const isRemote = uri.scheme !== 'file';
 
     this.loadQueue.enqueue({
       webviewId,
@@ -1874,9 +1922,26 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const isHttpRemote = uriScheme === 'http' || uriScheme === 'https';
 
           if (isRemote && isHttpRemote) {
-            // For HTTP(S) remotes: send a minimal "preview pending" message
-            // so the webview knows to start the worker immediately without
-            // waiting for the 800ms fallback timer.
+            // HTTP(S) remotes: extract a cheap preview on the proxy (Range
+            // for .nii, stream-to-z=0 for .gz) and let the webview scroll
+            // via /slice. Do not start a full-volume worker download.
+            const preview = await this.proxy!.extractPreviewForWebview(entryId, signal);
+            if (signal.aborted) return;
+            if (preview) {
+              webview.postMessage({
+                type: 'preview',
+                header: preview.header,
+                globalMin: preview.globalMin, globalMax: preview.globalMax,
+                slope: preview.slope, inter: preview.inter,
+                sliceIdx: preview.sliceIdx,
+                axialSlice: preview.slices.axial,
+                coronalSlice: preview.slices.coronal,
+                sagittalSlice: preview.slices.sagittal,
+                partialPreview: true,
+                deferFullVolume: true,
+              });
+              return;
+            }
             webview.postMessage({
               type: 'preview',
               header: null,
@@ -1887,7 +1952,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               coronalSlice: new Float32Array(0),
               sagittalSlice: new Float32Array(0),
               partialPreview: true,
-              remoteStreaming: true,  // signal: start worker now
+              remoteStreaming: true,
+              deferFullVolume: true,
             });
             return;
           }
@@ -1909,6 +1975,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               coronalSlice: slices.coronal,
               sagittalSlice: slices.sagittal,
               partialPreview: true,
+              deferFullVolume: true,
             });
             return;
           }
