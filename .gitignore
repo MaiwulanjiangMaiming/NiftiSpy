@@ -1,32 +1,72 @@
+# Dependencies and generated builds
 node_modules/
-dist/
+/dist/
 *.vsix
+*.map
+*.tsbuildinfo
+/native/target/
+/native/index.node
+/native-wasm/target/
+*.wasm
+
+# Local editor settings
 .vscode/
+.idea/
+
+# Assistant configuration, instructions, sessions, and local notes
+.cursor/
 .claude/
+.codex/
 .trae/
-good-examples/
+.continue/
+.windsurf/
+.roo/
+.kilocode/
+.cline/
+.agent/
+.agents/
+.gemini/
+.opencode/
+.aider*
+.cursorrules
+.cursorignore
+.cursorindexingignore
+.windsurfrules
+.clinerules
+.roomodes
+.mcp.json
+.mcp.local.json
+AGENTS.md
+AGENTS.override.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
+.github/copilot-instructions.md
+.github/instructions/
+.github/prompts/
+/.local/
+/Opinions/
+/good-examples/
+
+# Local image data and generated volume sidecars
 *.nii
 *.nii.gz
 *.hdr
-.DS_Store
-Thumbs.db
-*.map
-native/target/
-native/index.node
-native-wasm/target/
-*.wasm
-.niftispy-index
+*.img
+*.img.gz
+*.niftispy-index
 *.niftispy-unpack.nii
 
-# Benchmark/generated artifacts
-benchmarks/tmp/
+# Benchmarks, diagnostics, and caches
+/benchmarks/tmp/
 *.log
 .eslintcache
-*.tsbuildinfo
 .cache/
 coverage/
 
-# OS/Editor droppings
+# OS and editor temporary files
+.DS_Store
+Thumbs.db
 *.swp
 *.swo
 *~

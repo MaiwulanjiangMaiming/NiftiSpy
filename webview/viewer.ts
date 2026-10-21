@@ -209,6 +209,8 @@ const currentLOD: Record<Axis, number> = { axial: 2, coronal: 2, sagittal: 2 };
 let enableLOD = true;
 let lodUpgradeTimer: number | null = null;
 let lastScrollTime = 0;
+let remotePreviewStartedAt = 0;
+let remotePreviewToken = '';
 
 const MAX_RESIDENT_IMAGE_DATA = 4;
 const MAX_PARALLEL_VOLUME_LOADS = 2;
@@ -229,6 +231,7 @@ let nextStreamRequestId = 2000;
 const workerStreamHandlers = new Map<number, (msg: any) => void>();
 let activeVolumeLoadKey: string | null = null;
 const volumeWorkers = new Map<string, Worker>();
+const volumeWorkerCancels = new Map<string, () => void>();
 const volumeLoadReasons = new Map<string, VolumeLoadReason>();
 let activeLoadDebounceTimer: number | null = null;
 let scheduledActiveIndex: number | null = null;
@@ -251,6 +254,8 @@ const viewFlips: Record<string, { flipX: boolean, flipY: boolean }> = {
 const perfMonitor = {
   previewLoads: [] as number[],
   fullLoads: [] as number[],
+  sliceTimings: [] as any[],
+  renderTimes: [] as number[],
   failures: 0,
   evictions: 0,
 };
@@ -319,6 +324,8 @@ function publishPerfMonitor() {
   (window as any).__niftiPerf = {
     previewLoads: [...perfMonitor.previewLoads],
     fullLoads: [...perfMonitor.fullLoads],
+    sliceTimings: [...perfMonitor.sliceTimings],
+    renderTimes: [...perfMonitor.renderTimes],
     failures: perfMonitor.failures,
     evictions: perfMonitor.evictions,
     queuedLoads: volumeLoadQueue.length,
@@ -1836,12 +1843,27 @@ class SliceWorkerPool {
   }
 
   private exec(worker: Worker, payload: Record<string, any>, resolve: (v: any) => void, reject: (e: any) => void): void {
+    // AbortSignal cannot be structured-cloned into a Worker. Keep it on the
+    // caller side (requestSliceFrame ignores replies after abort) and skip
+    // queued requests that have already become obsolete.
+    const { signal, ...message } = payload;
+    if (signal?.aborted) {
+      reject(makeAbortError());
+      this.release(worker);
+      return;
+    }
     const id = nextWorkerRequestId++;
     workerRequests.set(id, {
       resolve: (msg: any) => { resolve(msg); this.release(worker); },
       reject: (err: any) => { reject(err); this.release(worker); },
     });
-    worker.postMessage({ ...payload, id });
+    try {
+      worker.postMessage({ ...message, id });
+    } catch (err) {
+      workerRequests.delete(id);
+      reject(err);
+      this.release(worker);
+    }
   }
 
   private release(worker: Worker): void {
@@ -1877,6 +1899,7 @@ class SliceWorkerPool {
 }
 
 let slicePool: SliceWorkerPool | null = null;
+let slicePoolInit: Promise<void> | null = null;
 
 async function ensureWorkerBlobUrl(): Promise<string> {
   if ((window as any).__NII_WORKER_BLOB_URL__) return (window as any).__NII_WORKER_BLOB_URL__;
@@ -1896,6 +1919,7 @@ function attachWorkerRouter(worker: Worker) {
   worker.onmessage = (ev) => {
     const msg = ev.data;
     if (msg?.type === 'bandwidthSample') {
+      if (msg.timing) { perfMonitor.sliceTimings.push(msg.timing); if (perfMonitor.sliceTimings.length > 100) perfMonitor.sliceTimings.shift(); }
       bandwidthEstimator.addSample(msg.bytes || 0, msg.durationMs || 0);
       return;
     }
@@ -1930,10 +1954,19 @@ function attachWorkerRouter(worker: Worker) {
 async function getSlicePool(): Promise<SliceWorkerPool> {
   if (!slicePool) {
     const maxWorkers = Math.min(navigator.hardwareConcurrency || 4, 6);
-    slicePool = new SliceWorkerPool(maxWorkers);
-    await slicePool.init();
+    const pool = new SliceWorkerPool(maxWorkers);
+    slicePool = pool;
+    slicePoolInit = pool.init().catch((err) => {
+      pool.terminate();
+      slicePool = null;
+      slicePoolInit = null;
+      throw err;
+    });
   }
-  return slicePool;
+  // All three axes can request their first slice concurrently. Every caller
+  // must wait until the pool has a blob URL and its initial workers.
+  await slicePoolInit;
+  return slicePool!;
 }
 
 async function getSliceWorker(axis: Axis): Promise<Worker> {
@@ -1975,6 +2008,11 @@ function unregisterWorkerStream(requestId: number) {
 
 function cancelVolumeLoadByKey(key: string | null): void {
   if (!key) return;
+  const cancel = volumeWorkerCancels.get(key);
+  if (cancel) {
+    cancel();
+    return;
+  }
   const worker = volumeWorkers.get(key);
   volumeLoadReasons.delete(key);
   if (!worker) return;
@@ -2161,6 +2199,7 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
   header = img.header;
   computeViewFlips();
   volumeData = img.data;
+  fullVolumeLoaded = !!img.data;
   dataSlope = img.slope;
   dataInter = img.inter;
   globalMin = img.min;
@@ -2192,6 +2231,31 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
   if (headerPanelVisible) updateHeaderPanel();
 }
 
+// Both worker downloads and IndexedDB restores must finish the visible UI.
+// Worker "done" only means parsing finished; the image is ready after render.
+function displayLoadedImage(img: VolumeImage): void {
+  const h = img.header;
+  if (isLowResPreview && lowResFactor > 1) {
+    sliceIdx.axial = Math.min(h.nz - 1, Math.round(sliceIdx.axial * lowResFactor));
+    sliceIdx.coronal = Math.min(h.ny - 1, Math.round(sliceIdx.coronal * lowResFactor));
+    sliceIdx.sagittal = Math.min(h.nx - 1, Math.round(sliceIdx.sagittal * lowResFactor));
+  } else if (!header || (!volumeData && sliceIdx.axial === 0)) {
+    // No preview, or only the early z=0 preview: start at the volume center.
+    sliceIdx.axial = Math.floor(h.nz / 2);
+    sliceIdx.coronal = Math.floor(h.ny / 2);
+    sliceIdx.sagittal = Math.floor(h.nx / 2);
+  }
+  applyImageState(img, true);
+  hideLowResBadge();
+  updateFileInfo();
+  updateSliderValues();
+  renderAllViews();
+  updateImagePicker();
+  updateProgress(1, '', '');
+  loading.style.display = 'none';
+  setupInteraction();
+}
+
 async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void, directFetchUrl?: string): Promise<any> {
   const worker = new Worker(await ensureWorkerBlobUrl());
   const requestId = nextStreamRequestId++;
@@ -2199,10 +2263,17 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
     volumeWorkers.set(loadKey, worker);
     publishPerfMonitor();
     const cleanup = () => {
-      if (volumeWorkers.get(loadKey) === worker) volumeWorkers.delete(loadKey);
+      if (volumeWorkers.get(loadKey) === worker) {
+        volumeWorkers.delete(loadKey);
+        volumeWorkerCancels.delete(loadKey);
+      }
       worker.terminate();
       publishPerfMonitor();
     };
+    volumeWorkerCancels.set(loadKey, () => {
+      cleanup();
+      reject(makeAbortError());
+    });
     worker.onmessage = (ev) => {
       const msg = ev.data;
       if (msg.id !== requestId) return;
@@ -2374,14 +2445,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
         img.lastAccess = Date.now();
         perfMonitor.fullLoads.push(performance.now() - startedAt);
         publishPerfMonitor();
-        if (index === activeImageIdx) {
-          applyImageState(img, true);
-          hideLowResBadge();
-          updateFileInfo();
-          updateSliderValues();
-          renderAllViews();
-          updateImagePicker();
-        }
+        if (images[activeImageIdx] === img) displayLoadedImage(img);
         evictInactiveImageData([index, activeImageIdx]);
         if (index === activeImageIdx) scheduleNextImagePreload(index);
         return;
@@ -2394,10 +2458,10 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
         const result = await loadVolumeViaWorker(loadKey, img.url, (img.name && img.name.endsWith('.gz')) || img.url.endsWith('.gz'), (msg) => {
-          if (msg.type === 'preview' && msg.partialPreview && index === activeImageIdx && !img.data) {
+          if (msg.type === 'preview' && !isLowResPreview && images[activeImageIdx] === img && !img.data) {
             showPartialPreviewFromMessage(msg, { fetchMissingSlices: false });
           }
-          if (msg.type === 'previewVolume' && index === activeImageIdx && !img.data) {
+          if (msg.type === 'previewVolume' && images[activeImageIdx] === img && !img.data) {
             // Low-res preview arrived — render immediately so the user sees
             // something while the full-resolution download continues.
             img.header = msg.header;
@@ -2430,7 +2494,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
             showLowResBadge(msg.factor || 4);
             updateImagePicker();
           }
-          if (index === activeImageIdx && msg.type === 'progress') {
+          if (images[activeImageIdx] === img && msg.type === 'progress') {
             updateProgress(0.5 + msg.value * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
           }
         }, img.directUrl);
@@ -2454,7 +2518,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
           getVolumeCacheDB().put({
             key: loadKey,
             header: result.header,
-            voxelData: volBuf,
+            voxelData: volBuf instanceof ArrayBuffer ? volBuf : new Uint8Array(volBuf).slice().buffer,
             datatype: result.header.datatype,
             min: result.globalMin,
             max: result.globalMax,
@@ -2463,22 +2527,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
           }).catch(() => {});
         }
 
-        if (index === activeImageIdx) {
-          // If a low-res preview was shown, scale slice indices back to
-          // full-resolution voxel space before swapping in the full volume.
-          if (isLowResPreview && lowResFactor > 1) {
-            const newH = result.header;
-            sliceIdx.axial = Math.min(newH.nz - 1, Math.round(sliceIdx.axial * lowResFactor));
-            sliceIdx.coronal = Math.min(newH.ny - 1, Math.round(sliceIdx.coronal * lowResFactor));
-            sliceIdx.sagittal = Math.min(newH.nx - 1, Math.round(sliceIdx.sagittal * lowResFactor));
-          }
-          applyImageState(img, true);
-          hideLowResBadge();
-          updateFileInfo();
-          updateSliderValues();
-          renderAllViews();
-          updateImagePicker();
-        }
+        if (images[activeImageIdx] === img) displayLoadedImage(img);
         evictInactiveImageData([index, activeImageIdx]);
         if (index === activeImageIdx) scheduleNextImagePreload(index);
         return;
@@ -2565,7 +2614,11 @@ async function refreshSlices(axes: Axis[], interactive = false) {
   if (!header) return;
   const factor = interactive ? getActiveDownsample() : 1;
   await Promise.all(axes.map((axis) => requestSliceFrame(axis, factor)));
+  const renderAt = performance.now();
   renderAllViews();
+  perfMonitor.renderTimes.push(performance.now() - renderAt);
+  if (perfMonitor.renderTimes.length > 100) perfMonitor.renderTimes.shift();
+  publishPerfMonitor();
   if (interactive && factor > 1) {
     for (const axis of axes) {
       if (sliceQualityTimers[axis]) window.clearTimeout(sliceQualityTimers[axis]);
@@ -5629,7 +5682,7 @@ window.addEventListener('message', async (e) => {
     deferFullVolume = false;
 
     if (msg.validationToken && fileName) {
-      broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0 });
+      broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0, identity: `${msg.sourceIdentity || msg.url || fileUrl}|${msg.validationToken || ''}` });
       broadcastToSliceWorkers({
         type: 'invalidateCache',
         fileName,
@@ -5681,6 +5734,8 @@ window.addEventListener('message', async (e) => {
   }
 
   if (msg.type === 'remoteSliceMode') {
+    remotePreviewStartedAt = Date.now();
+    remotePreviewToken = msg.validationToken || '';
     // Large Remote-SSH files: preview pixels come from the remote disk;
     // scrolling uses /slice. The compressed object is not pulled across
     // the tunnel.
@@ -5696,7 +5751,7 @@ window.addEventListener('message', async (e) => {
     if (msg.fileSize) currentFileSize = msg.fileSize;
 
     if (msg.validationToken && fileName) {
-      broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0 });
+      broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0, identity: `${msg.sourceIdentity || msg.url || fileUrl}|${msg.validationToken || ''}` });
       broadcastToSliceWorkers({
         type: 'invalidateCache',
         fileName,
@@ -5742,26 +5797,7 @@ window.addEventListener('message', async (e) => {
   }
 
   if (msg.type === 'previewOrtho') {
-    if (volumeData && fullVolumeLoaded) return;
-    const hdr = (msg.header || header) as NiiHeader | null;
-    if (!hdr) return;
-    const coronal = toFloat32Array(msg.coronalSlice, 'coronal', msg);
-    const sagittal = toFloat32Array(msg.sagittalSlice, 'sagittal', msg);
-    if (coronal.length > 0 && sliceHasSignal(coronal)) {
-      setCurrentSlice('coronal', coronal, hdr.nx, hdr.nz, 1);
-    }
-    if (sagittal.length > 0 && sliceHasSignal(sagittal)) {
-      setCurrentSlice('sagittal', sagittal, hdr.ny, hdr.nz, 1);
-    }
-    if (msg.sliceIdx) {
-      sliceIdx.coronal = msg.sliceIdx.coronal ?? sliceIdx.coronal;
-      sliceIdx.sagittal = msg.sliceIdx.sagittal ?? sliceIdx.sagittal;
-    }
-    if (typeof msg.globalMin === 'number' && typeof msg.globalMax === 'number' && msg.globalMax > msg.globalMin) {
-      globalMin = msg.globalMin;
-      globalMax = msg.globalMax;
-    }
-    renderAllViews();
+    applyRemoteOrthoPreview(msg);
     return;
   }
 
@@ -5958,6 +5994,32 @@ function extractAxialZ0(raw: Uint8Array, hdr: NiiHeader): Float32Array | null {
   return out;
 }
 
+function applyRemoteOrthoPreview(msg: any): void {
+  if ((volumeData && fullVolumeLoaded) || (msg.url && msg.url !== fileUrl)) return;
+  if (msg.validationToken && msg.validationToken !== remotePreviewToken) return;
+  // Scrolling transfers ownership of all planes to the interactive slice pipeline.
+  if (lastScrollTime >= remotePreviewStartedAt) return;
+  const hdr = (msg.header || header) as NiiHeader | null;
+  if (!hdr) return;
+  for (const axis of ['axial', 'coronal', 'sagittal'] as Axis[]) {
+    const plane = toFloat32Array(msg[`${axis}Slice`], axis, msg);
+    const w = axis === 'sagittal' ? hdr.ny : hdr.nx;
+    const h = axis === 'axial' ? hdr.ny : hdr.nz;
+    if (plane.length === w * h) {
+      setCurrentSlice(axis, plane, w, h, 1);
+      sliceIdx[axis] = msg.sliceIdx?.[axis] ?? sliceIdx[axis];
+    }
+  }
+  if (msg.globalMax > msg.globalMin) { globalMin = msg.globalMin; globalMax = msg.globalMax; }
+  const img = images[activeImageIdx];
+  if (img) {
+    img.min = globalMin; img.max = globalMax;
+    img.preview = { axial: currentSlices.axial!.data, coronal: currentSlices.coronal!.data, sagittal: currentSlices.sagittal!.data };
+  }
+  updateSliderValues();
+  renderAllViews();
+}
+
 function showPartialPreviewFromMessage(msg: any, opts?: { fetchMissingSlices?: boolean }): void {
   if (volumeData && fullVolumeLoaded) return;
   if (msg.deferFullVolume) deferFullVolume = true;
@@ -6014,7 +6076,7 @@ function showPartialPreviewFromMessage(msg: any, opts?: { fetchMissingSlices?: b
   initialWindowWidth = windowWidth;
   initialWindowLevel = windowLevel;
 
-  if (images.length === 0 || !images[activeImageIdx] || !images[activeImageIdx].header) {
+  if (!images[activeImageIdx]) {
     setPrimaryImageFromDirectPreview(msg, axial, coronal, sagittal);
   } else {
     const img = images[activeImageIdx];

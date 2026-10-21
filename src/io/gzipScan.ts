@@ -1,7 +1,10 @@
+import * as fs from 'fs';
+import { serialize, deserialize } from 'v8';
+import { createHash } from 'crypto';
 import { parseNiiHeaderQuick, timepointByteOffset } from '../nifti/headerParser';
-import { decodeVoxel, extractAxialSliceFromRange } from '../nifti/sliceExtractor';
+import { decodeVoxel, extractAxialSliceFromRange, extractLocalSlice } from '../nifti/sliceExtractor';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './gzipIndex';
-import { unpackGzipToCache } from './gzipUnpack';
+import { unpackGzipToCache, persistGzipPreview, GzipCacheOptions } from './gzipUnpack';
 import { readLocalFilePartial } from './fileReader';
 
 export const GZIP_LOD_FACTOR = 8;
@@ -45,11 +48,7 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-/**
- * One sequential inflate of a local `.nii.gz`: first axial slice as soon as
- * it exists, mid-plane coronal/sagittal as z advances, a coarse strided
- * volume, and a random-access gzip index for later `/slice` requests.
- */
+/** One shared scan publishes useful previews and prepares seekable remote reads. */
 export class GzipScanSession {
   header: any = null;
   axial0: Float32Array | null = null;
@@ -58,16 +57,18 @@ export class GzipScanSession {
   lod: GzipLodVolume | null = null;
   index: GzipIndex | null = null;
   unpackPath: string | null = null;
-
   readonly z0: Promise<GzipOrthoPreview>;
   readonly ortho: Promise<GzipOrthoPreview>;
   readonly done: Promise<GzipIndex | null>;
-
   private readonly z0Defer = deferred<GzipOrthoPreview>();
   private readonly orthoDefer = deferred<GzipOrthoPreview>();
   private readonly doneDefer = deferred<GzipIndex | null>();
   private z0Settled = false;
   private orthoSettled = false;
+  private completed = false;
+  private latest: GzipOrthoPreview | null = null;
+  private listeners = new Set<(preview: GzipOrthoPreview) => void>();
+  private static active = new Map<string, GzipScanSession>();
 
   constructor() {
     this.z0 = this.z0Defer.promise;
@@ -77,86 +78,104 @@ export class GzipScanSession {
     this.ortho.catch(() => {});
   }
 
-  static start(
-    fsPath: string,
-    signal?: AbortSignal,
-    onProgress?: (pct: number) => void,
-  ): GzipScanSession {
+  subscribe(listener: (preview: GzipOrthoPreview) => void): () => void {
+    this.listeners.add(listener);
+    if (this.latest) listener(this.latest);
+    return () => this.listeners.delete(listener);
+  }
+
+  static start(fsPath: string, signal?: AbortSignal, onProgress?: (pct: number) => void, options: GzipCacheOptions = {}): GzipScanSession {
+    // Stat-based identity also prevents sharing a scan after the source changed.
+    let key = fsPath;
+    try { const st = fs.statSync(fsPath); key += `:${st.size}:${st.mtimeMs}:${st.ctimeMs}`; } catch {}
+    const active = this.active.get(key);
+    if (active && !active.completed && !signal) return active;
     const session = new GzipScanSession();
-    void session.run(fsPath, signal, onProgress);
+    if (!signal) this.active.set(key, session);
+    void session.run(fsPath, signal, onProgress, options).finally(() => {
+      if (this.active.get(key) === session) this.active.delete(key);
+    });
     return session;
   }
 
-  private async run(
-    fsPath: string,
-    signal?: AbortSignal,
-    onProgress?: (pct: number) => void,
-  ): Promise<void> {
-    try {
-      const cached = await loadCachedIndex(fsPath);
-      if (cached && !signal?.aborted) {
-        try {
-          const preview = await previewFromGzipIndex(fsPath, cached, signal);
-          this.index = cached;
-          this.header = preview.header;
-          this.axial0 = preview.axial;
-          this.coronal = preview.coronal;
-          this.sagittal = preview.sagittal;
-          this.settleZ0(preview);
-          this.settleOrtho(preview);
-          this.doneDefer.resolve(cached);
-          return;
-        } catch {
-          // Sidecar present but unusable — rebuild from the gzip stream.
-        }
-      }
+  private publish(preview: GzipOrthoPreview): void {
+    this.latest = preview;
+    for (const listener of this.listeners) { try { listener(preview); } catch {} }
+  }
 
-      const collector = new NiftiInflateCollector();
-      const index = await GzipIndex.buildIndex(fsPath, signal, onProgress, (chunk, offset) => {
-        collector.push(chunk, offset);
-        if (collector.header && !this.header) this.header = collector.header;
-        if (collector.axial0 && !this.z0Settled) {
-          this.axial0 = collector.axial0;
-          this.coronal = collector.coronal;
-          this.sagittal = collector.sagittal;
-          this.settleZ0(collector.snapshot(true));
+  private async run(fsPath: string, signal?: AbortSignal, onProgress?: (pct: number) => void, options: GzipCacheOptions = {}): Promise<void> {
+    let collector = new NiftiInflateCollector();
+    let lastPublished = 0, centerPublished = false;
+    const step = () => {
+      if (collector.header) this.header = collector.header;
+      if (collector.axial0 && !this.z0Settled) this.settleZ0(collector.snapshot(true));
+      const now = Date.now();
+      if (collector.centerReady && (!centerPublished || now - lastPublished >= 500) && !collector.orthoComplete) {
+        const h = collector.header;
+        if (4 * (h.nx * h.ny + h.nx * h.nz + h.ny * h.nz) <= 4 * 1024 ** 2) {
+          this.publish(collector.snapshot(false));
+          lastPublished = now;
+          centerPublished = true;
         }
-        if (collector.orthoComplete && !this.orthoSettled) {
-          this.coronal = collector.coronal;
-          this.sagittal = collector.sagittal;
-          this.lod = collector.lod;
-          this.settleOrtho(collector.snapshot(false));
+      }
+    };
+    collector.onSlice = step;
+    const consume = (chunk: Uint8Array, offset: number) => collector.push(chunk, offset);
+    try {
+      const unpacked = await unpackGzipToCache(fsPath, { ...options, signal, onProgress, onChunk: consume });
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (unpacked) {
+        this.unpackPath = unpacked;
+        if (!collector.orthoComplete) {
+          if (!(await this.restorePreview(unpacked))) {
+            await this.previewFromUnpack(unpacked, signal);
+            this.lod = await extractStridedVolumeFromFile(unpacked, this.header, GZIP_LOD_FACTOR, signal);
+            await this.savePreview(unpacked, options.budgetBytes);
+          }
+        } else {
+          this.finishCollector(collector);
+          await this.savePreview(unpacked, options.budgetBytes);
         }
-      });
-      this.index = index;
-      this.header = collector.header || this.header;
-      this.axial0 = collector.axial0 || this.axial0;
-      this.coronal = collector.coronal || this.coronal;
-      this.sagittal = collector.sagittal || this.sagittal;
-      this.lod = collector.lod || this.lod;
-      if (this.header && this.axial0 && !this.z0Settled) {
-        this.settleZ0(collector.snapshot(true));
+        this.completed = true; this.doneDefer.resolve(null);
+        return;
       }
-      if (this.header && this.coronal && this.sagittal && !this.orthoSettled) {
-        this.settleOrtho(collector.snapshot(false));
+      // Read-only / quota-limited hosts retain the gzip checkpoint fallback.
+      collector = new NiftiInflateCollector();
+      collector.onSlice = step;
+      const cached = await loadCachedIndex(fsPath);
+      if (cached) {
+        const preview = await previewFromGzipIndex(fsPath, cached, signal);
+        this.header = preview.header;
+        this.settleZ0(preview);
+        this.settleOrtho(preview);
+        this.publish(preview);
+        this.index = cached;
+      } else {
+        this.index = await GzipIndex.buildIndex(fsPath, signal, onProgress, consume);
+        if (!collector.orthoComplete) throw new Error('Incomplete NIfTI volume');
+        this.finishCollector(collector);
+        await saveCachedIndex(fsPath, this.index);
       }
-      await saveCachedIndex(fsPath, index);
-      this.doneDefer.resolve(index);
-    } catch (err: any) {
-      try {
-        const unpacked = await unpackGzipToCache(fsPath);
-        if (unpacked) {
-          this.unpackPath = unpacked;
-          await this.settleFromUnpack(unpacked);
-        }
-      } catch {
-        // Unpack is best-effort; /slice may still fall back to a full inflate.
-      }
+      this.completed = true; this.doneDefer.resolve(this.index);
+    } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
       if (!this.z0Settled) this.z0Defer.reject(error);
       if (!this.orthoSettled) this.orthoDefer.reject(error);
-      this.doneDefer.resolve(null);
-    }
+      this.completed = true; this.doneDefer.resolve(null);
+    } finally { this.listeners.clear(); }
+  }
+
+  private finishCollector(collector: NiftiInflateCollector): void {
+    if (!collector.orthoComplete) throw new Error('Truncated NIfTI volume');
+    this.header = collector.header;
+    this.axial0 = collector.axial0;
+    this.coronal = collector.coronal;
+    this.sagittal = collector.sagittal;
+    this.lod = collector.lod;
+    const preview = collector.snapshot(false);
+    this.settleZ0(preview);
+    this.settleOrtho(preview);
+    this.publish(preview);
   }
 
   private settleZ0(preview: GzipOrthoPreview): void {
@@ -164,44 +183,58 @@ export class GzipScanSession {
     this.z0Settled = true;
     this.z0Defer.resolve(preview);
   }
-
   private settleOrtho(preview: GzipOrthoPreview): void {
     if (this.orthoSettled) return;
     this.orthoSettled = true;
     this.orthoDefer.resolve(preview);
   }
 
-  private async settleFromUnpack(unpackPath: string): Promise<void> {
+  private async previewFromUnpack(file: string, signal?: AbortSignal): Promise<void> {
+    const header = parseNiiHeaderQuick(await readLocalFilePartial(file, 0, 543));
+    if (!header) throw new Error('Invalid unpacked NIfTI header');
+    const sliceIdx = { axial: Math.floor(header.nz / 2), coronal: Math.floor(header.ny / 2), sagittal: Math.floor(header.nx / 2) };
+    const [axial, coronal, sagittal] = await Promise.all((['axial', 'coronal', 'sagittal'] as const).map(axis => extractLocalSlice(file, header, axis, sliceIdx[axis], 0, 1, signal)));
+    if (!axial || !coronal || !sagittal) throw new Error('Incomplete cached preview');
+    let min = Infinity, max = -Infinity;
+    for (const plane of [axial, coronal, sagittal]) for (const v of plane) if (Number.isFinite(v)) { min = Math.min(min, v); max = Math.max(max, v); }
+    const preview = { header, axial, coronal, sagittal, sliceIdx, min: min === Infinity ? 0 : min, max: max > min ? max : min + 1, slope: header.scl_slope || 1, inter: header.scl_inter || 0 };
+    this.header = header;
+    this.settleZ0(preview);
+    this.settleOrtho(preview);
+    this.publish(preview);
+  }
+
+  private async savePreview(file: string, budgetBytes?: number): Promise<void> {
+    if (!this.latest) return;
+    const payload = serialize({ version: 1, preview: this.latest, lod: this.lod });
+    // Preview storage is bounded independently of source dimensions.
+    if (payload.length > 16 * 1024 ** 2) return;
+    const checksum = createHash('sha256').update(payload).digest();
+    try { await persistGzipPreview(file, Buffer.concat([checksum, payload]), budgetBytes); }
+    catch { /* The seekable volume remains usable without a persisted preview. */ }
+  }
+
+  private async restorePreview(file: string): Promise<boolean> {
     try {
-      const headerBytes = await readLocalFilePartial(unpackPath, 0, 543);
-      const header = parseNiiHeaderQuick(headerBytes);
-      if (!header) return;
-      this.header = header;
-      const { nx, ny, voxOffset, bytesPerVoxel } = header;
-      const sliceSize = nx * ny * Math.max(1, bytesPerVoxel);
-      const axialBytes = await readLocalFilePartial(unpackPath, voxOffset, voxOffset + sliceSize - 1);
-      const axial = extractAxialSliceFromRange(axialBytes, header);
-      let min = Infinity, max = -Infinity;
-      for (let i = 0; i < axial.length; i++) {
-        if (axial[i] < min) min = axial[i];
-        if (axial[i] > max) max = axial[i];
-      }
-      if (min === max) max = min + 1;
-      const preview: GzipOrthoPreview = {
-        header,
-        axial,
-        coronal: new Float32Array(nx * header.nz),
-        sagittal: new Float32Array(ny * header.nz),
-        min, max,
-        sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
-        slope: header.scl_slope || 1,
-        inter: header.scl_inter || 0,
-      };
-      this.axial0 = axial;
-      this.settleZ0(preview);
-    } catch {
-      // Preview from the unpack sidecar is optional.
-    }
+      const st = await fs.promises.stat(file + '.preview');
+      if (st.size > 16 * 1024 ** 2 + 32) return false;
+      const bytes = await fs.promises.readFile(file + '.preview');
+      if (!createHash('sha256').update(bytes.subarray(32)).digest().equals(bytes.subarray(0, 32))) return false;
+      const value = deserialize(bytes.subarray(32)), p = value.preview;
+      if (value.version !== 1 || !(p?.axial instanceof Float32Array) || !(p.coronal instanceof Float32Array) || !(p.sagittal instanceof Float32Array)) return false;
+      const h = p.header;
+      if (!h || p.axial.length !== h.nx * h.ny || p.coronal.length !== h.nx * h.nz || p.sagittal.length !== h.ny * h.nz) return false;
+      const actual = parseNiiHeaderQuick(await readLocalFilePartial(file, 0, 543));
+      if (!actual || ['nx', 'ny', 'nz', 'datatype', 'voxOffset', 'scl_slope', 'scl_inter'].some(k => actual[k] !== h[k])) return false;
+      this.header = h;
+      const lod = value.lod;
+      if (lod && (!(lod.volume instanceof Float32Array) || lod.factor !== GZIP_LOD_FACTOR || lod.volume.length !== lod.outNx * lod.outNy * lod.outNz || lod.outNx !== Math.max(1, Math.floor(h.nx / lod.factor)) || lod.outNy !== Math.max(1, Math.floor(h.ny / lod.factor)) || lod.outNz !== Math.max(1, Math.floor(h.nz / lod.factor)))) return false;
+      this.lod = lod;
+      this.settleZ0(p);
+      this.settleOrtho(p);
+      this.publish(p);
+      return true;
+    } catch { return false; }
   }
 }
 
@@ -212,6 +245,9 @@ class NiftiInflateCollector {
   sagittal: Float32Array | null = null;
   lod: GzipLodVolume | null = null;
   orthoComplete = false;
+  centerReady = false;
+  onSlice?: () => void;
+  private axialIndex = 0;
 
   private buf = Buffer.alloc(0);
   private bufStart = 0;
@@ -227,6 +263,7 @@ class NiftiInflateCollector {
   private outNz = 0;
 
   push(chunk: Uint8Array, decompressedOffset: number): void {
+    if (this.orthoComplete) return;
     if (this.buf.length === 0) this.bufStart = decompressedOffset;
     this.buf = Buffer.concat([this.buf, chunk]);
 
@@ -244,6 +281,7 @@ class NiftiInflateCollector {
       const rel = sliceStart - this.bufStart;
       const sliceBuf = this.buf.subarray(rel, rel + this.sliceBytes);
       this.consumeSlice(sliceBuf, this.z);
+      this.onSlice?.();
       this.z++;
       const nextStart = voxOffset + this.z * this.sliceBytes;
       if (nextStart > this.bufStart) {
@@ -265,13 +303,13 @@ class NiftiInflateCollector {
     const { nx, ny, nz } = header;
     return {
       header,
-      axial: this.axial0 || new Float32Array(nx * ny),
-      coronal: axialOnly ? new Float32Array(nx * nz) : (this.coronal || new Float32Array(nx * nz)),
-      sagittal: axialOnly ? new Float32Array(ny * nz) : (this.sagittal || new Float32Array(ny * nz)),
+      axial: this.axial0 ? this.axial0.slice() : new Float32Array(nx * ny),
+      coronal: axialOnly ? new Float32Array(0) : (this.coronal?.slice() || new Float32Array(nx * nz)),
+      sagittal: axialOnly ? new Float32Array(0) : (this.sagittal?.slice() || new Float32Array(ny * nz)),
       min: this.min === Infinity ? 0 : this.min,
       max: this.max === -Infinity || this.max === this.min ? (this.min === Infinity ? 1 : this.min + 1) : this.max,
       sliceIdx: {
-        axial: 0,
+        axial: this.axialIndex,
         coronal: this.coMid,
         sagittal: this.saMid,
       },
@@ -298,6 +336,7 @@ class NiftiInflateCollector {
     loHeader.dy = (this.header.dy || 1) * this.lodFactor;
     loHeader.dz = (this.header.dz || 1) * this.lodFactor;
     loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
+    for (const key of ['srow_x', 'srow_y', 'srow_z']) if (Array.isArray(this.header[key])) loHeader[key] = this.header[key].map((v: number, i: number) => i < 3 ? v * this.lodFactor : v);
     if (Array.isArray(this.header.sform)) {
       const sform = this.header.sform.map((row: number[]) => [...row]);
       for (const row of sform) { row[0] *= this.lodFactor; row[1] *= this.lodFactor; row[2] *= this.lodFactor; }
@@ -321,14 +360,20 @@ class NiftiInflateCollector {
     const bpv = Math.max(1, header.bytesPerVoxel);
     const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
 
-    if (z === 0) {
-      this.axial0 = extractAxialSliceFromRange(sliceBytes, header);
-      for (let i = 0; i < this.axial0.length; i++) {
-        const v = this.axial0[i];
-        if (v < this.min) this.min = v;
-        if (v > this.max) this.max = v;
+    // Skip uniform background planes, but always provide a center plane for empty volumes.
+    if (!this.axial0 || z === Math.floor(header.nz / 2)) {
+      const axial = extractAxialSliceFromRange(sliceBytes, header);
+      let lo = Infinity, hi = -Infinity;
+      for (const v of axial) if (Number.isFinite(v)) { lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      const background = header.scl_inter || 0;
+      if (hi > lo || hi !== background || z === Math.floor(header.nz / 2)) {
+        this.axial0 = axial;
+        this.axialIndex = z;
+        this.min = Math.min(this.min, lo);
+        this.max = Math.max(this.max, hi);
       }
     }
+    if (z === Math.floor(header.nz / 2)) this.centerReady = true;
 
     if (this.coronal) {
       for (let x = 0; x < nx; x++) {
@@ -374,10 +419,14 @@ export async function previewFromGzipIndex(
   const headerBytes = await GzipIndex.readRange(fsPath, index, 0, 544, signal);
   const header = parseNiiHeaderQuick(headerBytes);
   if (!header) throw new Error('Failed to parse NIfTI header from gzip index');
-  const { nx, ny, voxOffset, bytesPerVoxel } = header;
-  const sliceSize = nx * ny * Math.max(1, bytesPerVoxel);
-  const axialBytes = await GzipIndex.readRange(fsPath, index, voxOffset, voxOffset + sliceSize, signal);
-  const axial = extractAxialSliceFromRange(axialBytes, header);
+  const { nx, ny, nz } = header;
+  const axialIndex = Math.floor(nz / 2);
+  const [axial, coronal, sagittal] = await Promise.all([
+    extractSliceFromGzipIndex(fsPath, index, header, 'axial', axialIndex, 0, signal),
+    extractSliceFromGzipIndex(fsPath, index, header, 'coronal', Math.floor(ny / 2), 0, signal),
+    extractSliceFromGzipIndex(fsPath, index, header, 'sagittal', Math.floor(nx / 2), 0, signal),
+  ]);
+  if (!axial || !coronal || !sagittal) throw new Error('Incomplete indexed preview');
   let min = Infinity, max = -Infinity;
   for (let i = 0; i < axial.length; i++) {
     if (axial[i] < min) min = axial[i];
@@ -387,13 +436,30 @@ export async function previewFromGzipIndex(
   return {
     header,
     axial,
-    coronal: new Float32Array(nx * header.nz),
-    sagittal: new Float32Array(ny * header.nz),
+    coronal,
+    sagittal,
     min, max,
-    sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
+    sliceIdx: { axial: axialIndex, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
     slope: header.scl_slope || 1,
     inter: header.scl_inter || 0,
   };
+}
+
+export async function extractStridedVolumeFromFile(file: string, header: any, factor: number, signal?: AbortSignal): Promise<GzipLodVolume> {
+  const f = Math.max(2, Math.min(32, factor));
+  const outNx = Math.max(1, Math.floor(header.nx / f)), outNy = Math.max(1, Math.floor(header.ny / f)), outNz = Math.max(1, Math.floor(header.nz / f));
+  const volume = new Float32Array(outNx * outNy * outNz);
+  let min = Infinity, max = -Infinity;
+  for (let z = 0; z < outNz; z++) {
+    const plane = await extractLocalSlice(file, header, 'axial', z * f, 0, f, signal);
+    if (!plane) throw new Error('Incomplete low-resolution cache');
+    volume.set(plane, z * outNx * outNy);
+    for (const v of plane) { min = Math.min(min, v); max = Math.max(max, v); }
+  }
+  const loHeader = { ...header, nx: outNx, ny: outNy, nz: outNz, dx: header.dx * f, dy: header.dy * f, dz: header.dz * f };
+  loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
+  for (const key of ['srow_x', 'srow_y', 'srow_z']) if (Array.isArray(header[key])) loHeader[key] = header[key].map((v: number, i: number) => i < 3 ? v * f : v);
+  return { header: loHeader, factor: f, volume, outNx, outNy, outNz, min, max: max > min ? max : min + 1 };
 }
 
 export async function extractStridedVolumeFromIndex(

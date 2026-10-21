@@ -1,4 +1,5 @@
 import * as http from 'http';
+import { isWanRemote } from '../remoteEnv';
 import * as https from 'https';
 import * as fs from 'fs';
 import * as stream from 'stream';
@@ -9,12 +10,10 @@ import { getAgentForUrl } from './fileReader';
 
 export function shouldCompress(req: http.IncomingMessage): boolean {
   const acceptEncoding = req.headers['accept-encoding'] || '';
-  if (!acceptEncoding.includes('gzip')) return false;
-  // Skip compression for localhost — the data crosses a loopback
-  // connection where bandwidth is effectively infinite and gzip
-  // only adds CPU latency. This is critical for large volumes.
+  if (!acceptEncoding.split(',').some(part => /^\s*gzip\s*(?:;\s*q=(?!0(?:\.0*)?\s*$)[0-9.]+)?\s*$/i.test(part))) return false;
+  // A localhost port forwarded by Remote-SSH still crosses the network.
   const host = req.headers['host'] || '';
-  if (host.startsWith('127.0.0.1') || host.startsWith('localhost')) return false;
+  if (!isWanRemote() && /^(127\.0\.0\.1|localhost|\[::1\])(?::|$)/i.test(host)) return false;
   return true;
 }
 
@@ -24,25 +23,24 @@ export function compressResponse(data: Buffer, req: http.IncomingMessage, res: h
     ...extraHeaders,
   };
 
-  if (shouldCompress(req)) {
-    if (data.length < 1024 * 1024) {
-      // Small data: use synchronous gzip for lower latency
-      const compressed = zlib.gzipSync(data, { level: 1 });
-      headers['Content-Encoding'] = 'gzip';
-      headers['Content-Length'] = String(compressed.length);
-      res.writeHead(200, headers);
-      res.end(compressed);
-    } else {
-      // Large data: stream to avoid blocking
-      headers['Content-Encoding'] = 'gzip';
-      res.writeHead(200, headers);
-      stream.Readable.from(data, { highWaterMark: 1024 * 1024 }).pipe(zlib.createGzip({ level: 1 })).pipe(res);
-    }
-  } else {
-    headers['Content-Length'] = String(data.length);
+  const queuedTiming = res.getHeader('Server-Timing');
+  if (queuedTiming && extraHeaders?.['Server-Timing']) headers['Server-Timing'] = `${queuedTiming}, ${extraHeaders['Server-Timing']}`;
+  res.setHeader('Vary', 'Accept-Encoding');
+  const encodeStartedAt = performance.now();
+  const send = (compressed?: Buffer) => {
+    if (res.destroyed || res.writableEnded) return;
+    const body = compressed && compressed.length < data.length ? compressed : data;
+    if (body !== data) headers['Content-Encoding'] = 'gzip';
+    headers['Content-Length'] = String(body.length);
+    if (headers['Server-Timing']) headers['Server-Timing'] += `, encode;dur=${(performance.now() - encodeStartedAt).toFixed(2)}`;
     res.writeHead(200, headers);
-    res.end(data);
-  }
+    res.end(body);
+  };
+  if (data.length >= 1024 && shouldCompress(req)) {
+    // Larger planes use libuv's zlib worker pool, leaving the extension host responsive.
+    if (data.length < 64 * 1024) send(zlib.gzipSync(data, { level: 1 }));
+    else zlib.gzip(data, { level: 1 }, (error, compressed) => send(error ? undefined : compressed));
+  } else send();
 }
 
 export function gunzipAsync(data: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
@@ -281,9 +279,8 @@ export interface VolumePreviewResult {
  * sub-sampled volume, resolving as soon as all needed z-slices have been
  * decompressed — WITHOUT waiting for the full file to download.
  *
- * For a 256³ Float32 volume at factor=8, only 32 z-slices (12.5% of the
- * decompressed data) are needed, so the HTTP connection can be closed
- * early once those slices are extracted.
+ * Subsampling reduces output bytes and voxel conversion work. Gzip still
+ * requires sequential inflation through the last sampled z (near EOF).
  */
 export function streamingGunzipPreviewVolume(
   source: { type: 'file'; path: string } | { type: 'http'; url: string },

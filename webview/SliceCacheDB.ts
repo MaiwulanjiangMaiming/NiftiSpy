@@ -4,7 +4,7 @@
  * Database : niftispy-slice-cache
  * Store    : slices (keyPath = "key", index on lastAccess)
  * Entry    : { key, data: ArrayBuffer, lastAccess, size, validationToken? }
- * Key fmt  : ${fileHash}_${axis}_${sliceIndex}
+ * Key fmt  : ${fileHash}_v2_${axis}_${sliceIndex}_t${timeIdx}_f${factor}
  */
 
 const DB_NAME = 'niftispy-slice-cache';
@@ -509,15 +509,16 @@ export function deriveFileHash(fileName: string, fileSize: number): string {
 }
 
 /**
- * Build a cache key: ${fileHash}_${axis}_${sliceIndex}
+ * Versioned, dimensioned slice identity including timepoint and downsample factor.
  */
 export function makeSliceCacheKey(
   fileHash: string,
   axis: string,
   sliceIndex: number,
   timeIdx = 0,
+  factor = 1,
 ): string {
-  return timeIdx ? `${fileHash}_${axis}_${sliceIndex}_t${timeIdx}` : `${fileHash}_${axis}_${sliceIndex}`;
+  return `${fileHash}_v2_${axis}_${sliceIndex}_t${timeIdx}_f${factor}`;
 }
 
 // Singleton for convenient shared usage

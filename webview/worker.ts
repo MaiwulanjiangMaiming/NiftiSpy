@@ -1,3 +1,4 @@
+import { encodeSliceFrame, decodeSliceFrame } from './sliceFrame';
 import { gunzip } from 'fflate';
 import { parseNiiHeader, type NiiHeader } from './nii-parser';
 import { getCachedChunk, setCachedChunk, makeCacheKey, recordCacheHit, recordCacheMiss, recordL4Fetch } from './cache';
@@ -54,8 +55,8 @@ async function ensureSliceCacheDB(): Promise<SliceCacheDB> {
 
 // Track file hash for cache key generation
 let currentFileHash = '';
-function setFileHashForCache(fileName: string, fileSize: number): void {
-  currentFileHash = deriveFileHash(fileName, fileSize);
+function setFileHashForCache(fileName: string, fileSize: number, identity = ''): void {
+  currentFileHash = deriveFileHash(fileName + '|' + identity, fileSize);
 }
 
 let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; datatype: number } | null = null;
@@ -84,7 +85,7 @@ self.onmessage = async (e: MessageEvent) => {
         datatype: e.data.datatype ?? 16,
       };
     } else if (type === 'setFileHash') {
-      setFileHashForCache(e.data.fileName || '', e.data.fileSize || 0);
+      setFileHashForCache(e.data.fileName || '', e.data.fileSize || 0, e.data.identity || '');
     } else if (type === 'invalidateCache') {
       await handleInvalidateCache(e.data);
     } else if (type === 'getCacheStats') {
@@ -384,8 +385,8 @@ async function fetchRangeBytesWithRetry(
   throw lastErr || new Error('Range fetch failed after retries');
 }
 
-function getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): string {
-  return `${url}|${axis}|${index}|${factor}|t${timeIdx}`;
+function getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0, identity = currentFileHash): string {
+  return `${identity}|${url}|${axis}|${index}|${factor}|t${timeIdx}`;
 }
 
 function getCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): CachedSlice | null {
@@ -397,8 +398,8 @@ function getCachedSlice(url: string, axis: SliceAxis, index: number, factor: num
   return cached;
 }
 
-function setCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, slice: CachedSlice, timeIdx = 0): void {
-  const key = getSliceCacheKey(url, axis, index, factor, timeIdx);
+function setCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, slice: CachedSlice, timeIdx = 0, identity = currentFileHash): void {
+  const key = getSliceCacheKey(url, axis, index, factor, timeIdx, identity);
   sliceCache.delete(key);
   sliceCache.set(key, slice);
   while (sliceCache.size > MAX_SLICE_CACHE) {
@@ -432,18 +433,19 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
   const pending = pendingSliceFetches.get(cacheKey);
   if (pending) return pending;
 
+  const fileHash = currentFileHash;
   const request = (async () => {
     // Check new SliceCacheDB first (primary L3 disk cache)
-    if (currentFileHash) {
+    if (fileHash) {
       try {
         const db = await ensureSliceCacheDB();
-        const dbKey = makeSliceCacheKey(currentFileHash, axis, index, timeIdx);
+        const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
         const dbData = await db.get(dbKey);
-        if (dbData) {
+        const frame = dbData ? decodeSliceFrame(dbData, factor) : null;
+        if (frame) {
           recordCacheHit('l3');
-          const data = new Float32Array(dbData);
-          const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
-          setCachedSlice(url, axis, index, factor, slice, timeIdx);
+          const slice: CachedSlice = { ...frame, timestamp: Date.now() };
+          setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
           return slice;
         }
       } catch {
@@ -452,13 +454,13 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     }
 
     // Fall back to legacy IndexedDB cache
-    const idbKey = makeCacheKey(url, axis, index) + (timeIdx ? `|t${timeIdx}` : '');
+    const idbKey = `v2|${fileHash}|${makeCacheKey(url, axis, index)}|t${timeIdx}|f${factor}`;
     const idbData = await getCachedChunk(idbKey);
-    if (idbData) {
+    const legacyFrame = idbData ? decodeSliceFrame(idbData, factor) : null;
+    if (legacyFrame) {
       recordCacheHit('l3');
-      const data = new Float32Array(idbData);
-      const slice: CachedSlice = { data, width: 0, height: 0, timestamp: Date.now() };
-      setCachedSlice(url, axis, index, factor, slice, timeIdx);
+      const slice: CachedSlice = { ...legacyFrame, timestamp: Date.now() };
+      setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
       return slice;
     }
     recordCacheMiss('l3');
@@ -471,35 +473,41 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
       throw new Error(`Slice fetch failed: ${resp.status}`);
     }
 
+    const headersAt = performance.now();
     const width = Number(resp.headers.get('X-Width') || 0);
     const height = Number(resp.headers.get('X-Height') || 0);
     const buffer = await resp.arrayBuffer();
+    if (!width || !height || buffer.byteLength !== width * height * 4) throw new Error('Invalid slice dimensions or payload');
+    const decodeAt = performance.now();
     const data = new Float32Array(buffer);
+    const persisted = encodeSliceFrame(data, width, height, factor);
     const slice: CachedSlice = {
       data,
       width,
       height,
       timestamp: Date.now(),
     };
-    setCachedSlice(url, axis, index, factor, slice, timeIdx);
+    setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
 
     // Store in new SliceCacheDB (primary)
-    if (currentFileHash) {
-      const db = await ensureSliceCacheDB();
-      const dbKey = makeSliceCacheKey(currentFileHash, axis, index, timeIdx);
-      db.put(dbKey, buffer).catch(() => {});
-      // Background eviction
-      db.evictLRU().catch(() => {});
+    if (fileHash) {
+      try {
+        const db = await ensureSliceCacheDB();
+        const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
+        db.put(dbKey, persisted).catch(() => {});
+        db.evictLRU().catch(() => {});
+      } catch { /* An unavailable disk cache must not fail a successful slice fetch. */ }
     }
 
     // Also store in legacy cache for backward compatibility
-    setCachedChunk(idbKey, buffer).catch(() => {});
+    setCachedChunk(idbKey, persisted).catch(() => {});
 
     self.postMessage({
       id: -1,
       type: 'bandwidthSample',
-      bytes: buffer.byteLength,
-      durationMs: performance.now() - startedAt,
+      bytes: Number(resp.headers.get('Content-Length')) || buffer.byteLength,
+      durationMs: Math.max(1, decodeAt - headersAt),
+      timing: { ttfbMs: headersAt - startedAt, transferMs: decodeAt - headersAt, decodeMs: performance.now() - decodeAt, server: resp.headers.get('Server-Timing') },
     });
     return slice;
   })().finally(() => {
@@ -1877,15 +1885,15 @@ async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: Abort
     let header: any;
     try { header = JSON.parse(headerJson); } catch { return false; }
 
-    if (offset + 28 > data.length) return false;
+    if (offset + 32 > data.length) return false;
     const factor = dv.getUint32(offset, true); offset += 4;
     const outNx = dv.getUint32(offset, true); offset += 4;
     const outNy = dv.getUint32(offset, true); offset += 4;
     const outNz = dv.getUint32(offset, true); offset += 4;
     const min = dv.getFloat32(offset, true); offset += 4;
     const max = dv.getFloat32(offset, true); offset += 4;
-    const slope = dv.getFloat32(offset, true); offset += 4;
-    const inter = dv.getFloat32(offset, true); offset += 4;
+    // The proxy has already applied slope/inter to its Float32 voxels.
+    offset += 8;
 
     const voxelCount = outNx * outNy * outNz;
     const voxelBytes = voxelCount * 4;
@@ -1893,25 +1901,25 @@ async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: Abort
 
     // Copy voxel data into a fresh, transferable Float32Array so we can
     // transfer its buffer to the main thread without neutering the response.
-    const voxelData = new Float32Array(voxelCount);
-    voxelData.set(new Float32Array(ab, offset, voxelCount));
+    // JSON has arbitrary byte length, so the voxel offset need not be aligned.
+    const voxelData = new Float32Array(ab.slice(offset, offset + voxelBytes));
 
     self.postMessage({
       id,
       type: 'previewVolume',
-      header,
+      header: { ...header, datatype: 16, bitpix: 32, bytesPerVoxel: 4, scl_slope: 1, scl_inter: 0 },
       voxelData,
       globalMin: min,
       globalMax: max,
-      slope,
-      inter,
+      slope: 1,
+      inter: 0,
       factor,
       datatype: 16, // Float32
     }, [voxelData.buffer]);
 
-    // Cache the low-res header so processRawVolume can skip redundant parse
+    // This header describes the subsampled Float32 preview, not the source.
+    // Only headers parsed from source bytes may be reused by processRawVolume.
     earlyPreviewSent.add(id);
-    earlyPreviewHeaders.set(id, header);
     return true;
   } catch (err: any) {
     if (err?.name === 'AbortError') throw err;

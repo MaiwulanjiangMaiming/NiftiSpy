@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as zlib from 'zlib';
+import * as os from 'os';
 import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
 import { downsampleSlice } from './nifti/sliceExtractor';
@@ -394,7 +395,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           if (!isRemote && pair.dataUri.fsPath) {
             const stat = await fs.promises.stat(pair.dataUri.fsPath);
             fileSize = stat.size;
-            validationToken = `${stat.mtimeMs}:${stat.size}`;
+            validationToken = `${stat.mtimeMs}:${stat.ctimeMs}:${stat.size}:${stat.ino}`;
           } else if (isRemote) {
             try {
               const stat = await vscode.workspace.fs.stat(pair.dataUri);
@@ -1455,30 +1456,15 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       if (sliceMode) {
         if (isGzip) {
           const statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-          statusItem.text = '$(sync~spin) Building gzip index...';
+          statusItem.text = '$(sync~spin) Preparing remote volume...';
           statusItem.show();
           this.gzipIndexStatusItems.set(webviewId, statusItem);
           this.proxy.startGzipIndex(entryId, (pct: number) => {
-            statusItem.text = `$(sync~spin) Building gzip index... ${pct}%`;
+            statusItem.text = `$(sync~spin) Preparing remote volume... ${pct}%`;
           });
           void this.proxy.whenGzipIndexReady(entryId).then(() => {
             statusItem.dispose();
             this.gzipIndexStatusItems.delete(webviewId);
-          });
-          void this.proxy.whenGzipOrthoReady(entryId).then((ortho) => {
-            if (!ortho || signal.aborted) return;
-            void webview.postMessage({
-              type: 'previewOrtho',
-              header: ortho.header,
-              globalMin: ortho.min,
-              globalMax: ortho.max,
-              slope: ortho.slope,
-              inter: ortho.inter,
-              sliceIdx: ortho.sliceIdx,
-              axialSlice: ortho.axial,
-              coronalSlice: ortho.coronal,
-              sagittalSlice: ortho.sagittal,
-            });
           });
         }
         let preview: Awaited<ReturnType<LocalFileProxy['extractPreviewForWebview']>> = null;
@@ -1494,6 +1480,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
         const ok = await webview.postMessage({
           type: 'remoteSliceMode',
+          sourceIdentity: `${os.hostname()}|${uri.toString()}`,
           url: external.toString(),
           fileName: path.basename(fsPath),
           fileSize,
@@ -1519,12 +1506,26 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.remoteHttpFallbacks.delete(webviewId);
           return false;
         }
+        if (isGzip) {
+          const unsubscribe = this.proxy.subscribeGzipPreview(entryId, (ortho) => {
+            if (signal.aborted) return;
+            void webview.postMessage({
+              type: 'previewOrtho', url: external.toString(), validationToken,
+              header: ortho.header, globalMin: ortho.min, globalMax: ortho.max,
+              slope: ortho.slope, inter: ortho.inter, sliceIdx: ortho.sliceIdx,
+              axialSlice: ortho.axial, coronalSlice: ortho.coronal, sagittalSlice: ortho.sagittal,
+            });
+          });
+          signal.addEventListener('abort', unsubscribe, { once: true });
+          void this.proxy.whenGzipIndexReady(entryId).finally(() => signal.removeEventListener('abort', unsubscribe));
+        }
         this.logPerf(`[remote-ssh-slice] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`);
         return true;
       }
 
       const ok = await webview.postMessage({
         type: 'remoteSshHttp',
+        sourceIdentity: `${os.hostname()}|${uri.toString()}`,
         url: external.toString(),
         fileName: path.basename(fsPath),
         fileSize,

@@ -329,7 +329,7 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
 
     this.device.queue.writeTexture(
       { texture },
-      f32 as ArrayBufferView,
+      (f32.buffer instanceof ArrayBuffer ? f32 : new Float32Array(f32)) as Float32Array<ArrayBuffer>,
       { bytesPerRow, rowsPerImage: ny },
       { width: nx, height: ny, depthOrArrayLayers: nz }
     );

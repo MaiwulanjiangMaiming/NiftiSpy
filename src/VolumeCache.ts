@@ -115,7 +115,7 @@ export class VolumeCache {
     return this._totalBytes;
   }
 
-  private evictIfNeeded(): void {
+  evictIfNeeded(): void {
     // Evict from tail (LRU) until under both limits.
     // Skip entries with active webviews instead of stopping —
     // previously a single active entry at the tail would block

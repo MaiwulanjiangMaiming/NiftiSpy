@@ -2,7 +2,7 @@
   "name": "niftispy",
   "displayName": "NiftiSpy",
   "description": "High-performance NIfTI medical image viewer with streaming, Range requests, and WebWorker parsing",
-  "version": "2.3.2",
+  "version": "2.3.3",
   "publisher": "MaiwulanjiangMaiming",
   "repository": {
     "type": "git",
@@ -209,6 +209,17 @@
           "type": "boolean",
           "default": false,
           "description": "Initial state of debug mode. Once the extension is active, click the $(bug) NiftiSpy Debug status bar item to toggle perf reports on/off interactively. This setting is read only once at startup."
+        },
+        "niftispy.remoteCacheBudgetMB": {
+          "type": "number",
+          "default": 4096,
+          "minimum": 0,
+          "description": "Disk budget in MiB for seekable remote gzip caches and previews. Old entries are evicted by last access. Set to 0 to use gzip indexes without an unpacked cache."
+        },
+        "niftispy.remoteCacheDirectory": {
+          "type": "string",
+          "default": "",
+          "description": "Remote extension-host directory for gzip caches. Empty uses the host temporary directory. Original images are never modified."
         }
       }
     }
@@ -229,7 +240,8 @@
     "bench:remote": "node benchmarks/remote-sim-benchmark.js",
     "lint": "eslint src/**/*.ts webview/**/*.ts",
     "format": "prettier --write 'src/**/*.ts' 'webview/**/*.ts'",
-    "format:check": "prettier --check 'src/**/*.ts' 'webview/**/*.ts'"
+    "format:check": "prettier --check 'src/**/*.ts' 'webview/**/*.ts'",
+    "bench:host": "node benchmarks/remote-gzip-profile.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

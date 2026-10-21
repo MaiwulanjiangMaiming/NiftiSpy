@@ -2,6 +2,29 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [2.3.3] - 2026-10-15
+
+### Fixed — Remote loading and display
+- Complete the visible loading state after a Worker volume arrives or is restored from IndexedDB. The Remote-SSH fast path no longer leaves `Streaming volume (fast path)... / done...` covering a rendered image.
+- Keep the pending image and its load promise when an early preview arrives; initialize center slices when there was no usable preview and update full-volume readiness when switching images.
+- Reject cancelled volume loads so their queue slots are released instead of leaving later downloads waiting forever.
+- Keep `AbortSignal` out of Worker messages to prevent `DataCloneError` during on-demand slice navigation. Concurrent first slices wait for the same pool initialization, and failed message sends release their worker.
+- Correct the preview-volume binary payload size and unaligned Float32 decoding, avoid applying intensity scaling twice, and keep subsampled preview headers out of full-resolution parsing.
+
+### Improved — Remote image loading
+- Honor slice downsampling on the server, publish exact response dimensions, and preserve dimensions, factor, timepoint and file identity in persistent slice caches.
+- Compress Remote-SSH slice responses losslessly even when VS Code forwards a localhost port. Large responses compress asynchronously; existing `.nii.gz` file downloads are not recompressed.
+- Prefer a seekable disk cache built with native streaming gzip. Validate source identity, publish atomically, deduplicate concurrent builds, enforce a configurable disk budget with LRU eviction, and clean up failed or cancelled builds. Keep gzip indexes as the disk-limited fallback. Two new settings control this: `niftispy.remoteCacheBudgetMB` (default `4096`, `0` disables the unpacked cache) and `niftispy.remoteCacheDirectory` (empty uses the host temporary directory).
+- Bound orthogonal slice reads to one file handle and an 8 MiB scratch buffer instead of reading every axial plane concurrently.
+- Show the first slice containing signal, then the center slice and completed orthogonal views. Persist verified previews and coarse volumes for repeat opens; publish partial orthogonal progress within size/time limits.
+- Prevent late previews from changing a file or slice position after navigation. Report server queue/read/encode timing separately from transfer/decode and viewer rendering.
+
+### Validation
+- Add regression coverage for loading completion, cache lifecycle, endian/scaling/4D slices, preview persistence, navigation races, Worker pool initialization, and real proxy-to-Worker `.nii` / `.nii.gz` round trips.
+
+### Packaging
+- Shrink `Icon.png` from 1024×1024 to 512×512 (297 KB) so it stays under the Marketplace's 1024 KB icon limit, and keep the unused 1 MB `File-Icons.png` out of the VSIX.
+
 ## [2.3.2] - 2026-09-09
 
 ### Changed — Gzip random access

@@ -1,3 +1,4 @@
+import * as fs from 'fs';
 import { readLocalFilePartial } from '../io/fileReader';
 import { timepointByteOffset } from './headerParser';
 
@@ -52,90 +53,84 @@ export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any):
   return slice;
 }
 
-export async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
-  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-  if (idx < 0 || idx >= ny) return null;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const slice = new Float32Array(nx * nz);
-  const tOff = timepointByteOffset(header, timeIdx);
-
-  const rowSize = nx * bpv;
-  const promises: Promise<{ rowBytes: Uint8Array; z: number }>[] = [];
-  for (let z = 0; z < nz; z++) {
-    const rowOffset = voxOffset + tOff + (z * ny * nx + idx * nx) * bpv;
-    promises.push(
-      readLocalFilePartial(fsPath, rowOffset, rowOffset + rowSize - 1)
-        .then(rowBytes => ({ rowBytes, z }))
-    );
-  }
-  const rows = await Promise.all(promises);
-
-  for (const { rowBytes, z } of rows) {
-    const view = new DataView(rowBytes.buffer, rowBytes.byteOffset, rowBytes.byteLength);
-    for (let x = 0; x < nx; x++) {
-      const off = x * bpv;
-      let val: number;
-      switch (datatype) {
-        case 2: val = rowBytes[off]; break;
-        case 4: val = view.getInt16(off, le); break;
-        case 8: val = view.getInt32(off, le); break;
-        case 16: val = view.getFloat32(off, le); break;
-        case 64: val = view.getFloat64(off, le); break;
-        case 256: val = (rowBytes[off] << 24) >> 24; break;
-        case 512: val = view.getUint16(off, le); break;
-        case 768: val = view.getUint32(off, le); break;
-        default: val = 0;
-      }
-      slice[z * nx + x] = val * slope + inter;
+/** A single file handle and an 8 MiB scratch budget, independent of volume depth. */
+export async function extractLocalSlice(
+  fsPath: string, header: any, axis: string, idx: number, timeIdx = 0, factor = 1,
+  signal?: AbortSignal,
+): Promise<Float32Array | null> {
+  const { nx, ny, nz, voxOffset } = header;
+  const limit = axis === 'axial' ? nz : axis === 'coronal' ? ny : nx;
+  if (!Number.isInteger(idx) || idx < 0 || idx >= limit) return null;
+  const f = Math.max(1, Math.min(32, Math.floor(factor) || 1));
+  const width = axis === 'sagittal' ? ny : nx;
+  const height = axis === 'axial' ? ny : nz;
+  const w = Math.max(1, Math.floor(width / f)), h = Math.max(1, Math.floor(height / f));
+  const out = new Float32Array(w * h);
+  const bpv = Math.max(1, header.bitpix / 8), rowBytes = nx * bpv;
+  const base = voxOffset + timepointByteOffset(header, timeIdx);
+  const fd = await fs.promises.open(fsPath, 'r');
+  const scratch = Buffer.allocUnsafe(Math.min(8 * 1024 * 1024, axis === 'sagittal' ? rowBytes * ny : rowBytes));
+  const read = async (position: number, bytes: number) => {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    let done = 0;
+    while (done < bytes) {
+      const r = await fd.read(scratch, done, bytes - done, position + done);
+      if (!r.bytesRead) throw new Error('Truncated NIfTI voxel data');
+      done += r.bytesRead;
     }
-  }
-  return slice;
+    return new DataView(scratch.buffer, scratch.byteOffset, bytes);
+  };
+  try {
+    for (let oy = 0; oy < h; oy++) {
+      if (axis !== 'sagittal') {
+        const z = axis === 'axial' ? idx : oy * f;
+        const y = axis === 'axial' ? oy * f : idx;
+        // Rows larger than the scratch budget are read in tiles.
+        for (let first = 0; first < w;) {
+          const count = Math.min(w - first, Math.max(1, Math.floor(scratch.length / (f * bpv))));
+          const bytes = ((count - 1) * f + 1) * bpv;
+          const view = await read(base + ((z * ny + y) * nx + first * f) * bpv, bytes);
+          for (let x = 0; x < count; x++) out[oy * w + first + x] = decodeVoxel(scratch, x * f * bpv, header, view);
+          first += count;
+        }
+      } else {
+        // Read bounded slabs within one axial plane, then select the column.
+        const rowsPerSlab = Math.max(1, Math.floor(scratch.length / rowBytes));
+        for (let firstY = 0; firstY < ny; firstY += rowsPerSlab) {
+          const rows = Math.min(rowsPerSlab, ny - firstY);
+          if (rowBytes > scratch.length) {
+            // Extremely wide data: pread the selected voxel instead of a row.
+            for (let y = firstY; y < firstY + rows; y++) if (y % f === 0 && y / f < w) {
+              const view = await read(base + ((oy * f * ny + y) * nx + idx) * bpv, bpv);
+              out[oy * w + y / f] = decodeVoxel(scratch, 0, header, view);
+            }
+          } else {
+            const view = await read(base + (oy * f * ny + firstY) * rowBytes, rows * rowBytes);
+            for (let y = firstY; y < firstY + rows; y++) if (y % f === 0 && y / f < w) {
+              out[oy * w + y / f] = decodeVoxel(scratch, ((y - firstY) * nx + idx) * bpv, header, view);
+            }
+          }
+        }
+      }
+    }
+    return out;
+  } finally { await fd.close(); }
+}
+
+export async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
+  return extractLocalSlice(fsPath, header, 'coronal', idx, timeIdx);
 }
 
 export async function extractSagittalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
-  const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-  if (idx < 0 || idx >= nx) return null;
-  const bpv = Math.max(1, header.bitpix / 8);
-  const le = littleEndian;
-  const slope = scl_slope || 1;
-  const inter = scl_inter || 0;
-  const slice = new Float32Array(ny * nz);
-  const tOff = timepointByteOffset(header, timeIdx);
+  return extractLocalSlice(fsPath, header, 'sagittal', idx, timeIdx);
+}
 
-  const axialSize = nx * ny * bpv;
-  const promises: Promise<{ axialBytes: Uint8Array; z: number }>[] = [];
-  for (let z = 0; z < nz; z++) {
-    const axialOffset = voxOffset + tOff + z * nx * ny * bpv;
-    promises.push(
-      readLocalFilePartial(fsPath, axialOffset, axialOffset + axialSize - 1)
-        .then(axialBytes => ({ axialBytes, z }))
-    );
-  }
-  const axialSlices = await Promise.all(promises);
-
-  for (const { axialBytes, z } of axialSlices) {
-    const view = new DataView(axialBytes.buffer, axialBytes.byteOffset, axialBytes.byteLength);
-    for (let y = 0; y < ny; y++) {
-      const off = (y * nx + idx) * bpv;
-      let val: number;
-      switch (datatype) {
-        case 2: val = axialBytes[off]; break;
-        case 4: val = view.getInt16(off, le); break;
-        case 8: val = view.getInt32(off, le); break;
-        case 16: val = view.getFloat32(off, le); break;
-        case 64: val = view.getFloat64(off, le); break;
-        case 256: val = (axialBytes[off] << 24) >> 24; break;
-        case 512: val = view.getUint16(off, le); break;
-        case 768: val = view.getUint32(off, le); break;
-        default: val = 0;
-      }
-      slice[z * ny + y] = val * slope + inter;
-    }
-  }
-  return slice;
+export function sampleSlice(data: Float32Array, w: number, h: number, factor: number): Float32Array {
+  if (factor <= 1) return data;
+  const nw = Math.max(1, Math.floor(w / factor)), nh = Math.max(1, Math.floor(h / factor));
+  const out = new Float32Array(nw * nh);
+  for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) out[y * nw + x] = data[y * factor * w + x * factor];
+  return out;
 }
 
 export function extractPreviewSlices(rawData: Uint8Array, header: any): { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array } | null {
