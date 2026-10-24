@@ -2,6 +2,7 @@ import { NiiHeader, DATATYPE_NAMES, parseNiiHeader } from './nii-parser';
 import { WebGPURenderer } from './webgpuRenderer';
 import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
 import { deriveFileHash, getVolumeCacheDB, makeTypedArrayFromBuffer } from './SliceCacheDB';
+import { shouldAutoloadFullVolume as evaluateFullVolumePolicy, SLICE_MODE_MIN_BYTES } from '../src/volumePolicy';
 import { initWasmBindings, getWasmBindings } from './wasmBridge';
 
 declare function acquireVsCodeApi(): any;
@@ -575,19 +576,14 @@ class BandwidthEstimator {
 }
 
 const bandwidthEstimator = new BandwidthEstimator();
-const SLICE_MODE_MIN_BYTES = 8 * 1024 * 1024;
-const LARGE_FILE_BYTES = 80 * 1024 * 1024;
 
 function shouldAutoloadFullVolume(): boolean {
-  const policy = viewerConfig.fullVolumePolicy;
-  if (policy === 'manual') return false;
-  if (policy === 'eager') return true;
-  if (policy === 'debounced') return !deferFullVolume;
-  const small = currentFileSize > 0 && currentFileSize <= SLICE_MODE_MIN_BYTES;
-  const large = currentFileSize <= 0 || currentFileSize > LARGE_FILE_BYTES;
-  if (small || !deferFullVolume) return true;
-  if (large || bandwidthEstimator.qualityLevel === 'low') return false;
-  return true;
+  return evaluateFullVolumePolicy({
+    policy: viewerConfig.fullVolumePolicy,
+    fileSize: currentFileSize,
+    sliceMode: deferFullVolume,
+    quality: bandwidthEstimator.qualityLevel,
+  });
 }
 
 function volumeHasTimepoint(t: number): boolean {

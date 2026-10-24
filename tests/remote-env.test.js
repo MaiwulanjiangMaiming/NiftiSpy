@@ -34,6 +34,6 @@ test('src/remoteEnv.ts keeps WSL/container as localFast and SSH as sshWan', () =
   assert.match(src, /case 'dev-container':/);
   assert.match(src, /return 'localFast'/);
   assert.match(src, /return 'sshWan'/);
-  assert.match(policy, /SLICE_MODE_MIN_BYTES = 8 \* 1024 \* 1024/);
+  assert.match(policy, /SLICE_MODE_MIN_BYTES = 2 \* 1024 \* 1024/);
   assert.match(policy, /LARGE_FILE_BYTES = 80 \* 1024 \* 1024/);
 });

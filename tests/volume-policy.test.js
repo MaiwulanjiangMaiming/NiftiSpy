@@ -29,7 +29,7 @@ async function load() {
 
 test('adaptive: small and local files autoload; large/slow stay on slices', async () => {
   await load();
-  assert.equal(SLICE_MODE_MIN_BYTES, 8 * 1024 * 1024);
+  assert.equal(SLICE_MODE_MIN_BYTES, 2 * 1024 * 1024);
   assert.equal(LARGE_FILE_BYTES, 80 * 1024 * 1024);
 
   assert.equal(shouldAutoloadFullVolume({
@@ -42,8 +42,11 @@ test('adaptive: small and local files autoload; large/slow stay on slices', asyn
     policy: 'debounced', fileSize: 20e6, sliceMode: true, quality: 'high',
   }), false);
   assert.equal(shouldAutoloadFullVolume({
-    policy: 'adaptive', fileSize: 4e6, sliceMode: true, quality: 'low',
+    policy: 'adaptive', fileSize: 1e6, sliceMode: true, quality: 'low',
   }), true);
+  assert.equal(shouldAutoloadFullVolume({
+    policy: 'adaptive', fileSize: 4e6, sliceMode: true, quality: 'low',
+  }), false);
   assert.equal(shouldAutoloadFullVolume({
     policy: 'adaptive', fileSize: 20e6, sliceMode: true, quality: 'high',
   }), true);

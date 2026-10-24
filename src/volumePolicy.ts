@@ -1,5 +1,9 @@
-/** Files at or above this size use on-demand slices on SSH remotes. */
-export const SLICE_MODE_MIN_BYTES = 8 * 1024 * 1024;
+/**
+ * Files at or above this size use on-demand slices on SSH remotes. Small
+ * files still download once, but a 2 MiB cutoff means a slow link gets the
+ * slice preview immediately instead of waiting for a several-MB transfer.
+ */
+export const SLICE_MODE_MIN_BYTES = 2 * 1024 * 1024;
 
 /** Above this size, never auto-download the full volume on a remote link. */
 export const LARGE_FILE_BYTES = 80 * 1024 * 1024;
