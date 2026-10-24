@@ -5,7 +5,6 @@ import * as zlib from 'zlib';
 import * as os from 'os';
 import { LocalFileProxy } from './LocalFileProxy';
 import { VolumeCache } from './VolumeCache';
-import { downsampleSlice } from './nifti/sliceExtractor';
 import { getNativeBindings } from './nativeBridge';
 import { parseNiiHeaderQuick } from './nifti/headerParser';
 import { prepareParsedPayload } from './formats/payload';
@@ -1141,12 +1140,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           // Update the ext timing with actual sync time for the report
           streamTiming.postMessageSync = +(postMsgEnd - postMsgStart).toFixed(1);
 
-          // Defer LOD generation to background — don't block initial display
-          setTimeout(() => {
-            if (!signal.aborted) {
-              this.generateAndSendLOD(webview, header, voxelOnly, signal, fsPath);
-            }
-          }, 500);
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Local load error:', err);
@@ -2155,8 +2148,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             },
           });
 
-          // Generate LOD levels in background for progressive loading
-          this.generateAndSendLOD(webview, header, voxelOnly, signal);
         } catch (err: any) {
           if (err?.name !== 'AbortError') {
             console.error('Preview load error:', err);
@@ -2449,11 +2440,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       },
     });
 
-    // LOD levels are derived in the background from the same voxel buffer
-    // (no native mmap LOD path here because the source is not a NIfTI file).
-    setTimeout(() => {
-      if (!signal.aborted) this.generateAndSendLOD(webview, header, voxelOnly, signal);
-    }, 500);
   }
 
   private isWebviewActive(webviewId: string): boolean {
@@ -2474,223 +2460,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     if (this.chunkProgressItem) {
       this.chunkProgressItem.hide();
     }
-  }
-
-  private async generateAndSendLOD(
-    webview: vscode.Webview,
-    header: any,
-    voxelOnly: Uint8Array,
-    signal: AbortSignal,
-    fsPath?: string
-  ): Promise<void> {
-    const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, bytesPerVoxel } = header;
-    const n = nx * ny * nz;
-    const bpv = Math.max(1, bytesPerVoxel);
-    const le = littleEndian;
-    const slope = scl_slope || 1;
-    const inter = scl_inter || 0;
-
-    // Convert voxel data to Float32Array for downsampling
-    const floatData = new Float32Array(n);
-    const view = new DataView(voxelOnly.buffer, voxelOnly.byteOffset, Math.min(voxelOnly.byteLength, n * bpv));
-    for (let i = 0; i < n; i++) {
-      const off = i * bpv;
-      let val: number;
-      switch (datatype) {
-        case 2: val = voxelOnly[off]; break;
-        case 4: val = view.getInt16(off, le); break;
-        case 8: val = view.getInt32(off, le); break;
-        case 16: val = view.getFloat32(off, le); break;
-        case 64: val = view.getFloat64(off, le); break;
-        case 256: val = (voxelOnly[off] << 24) >> 24; break;
-        case 512: val = view.getUint16(off, le); break;
-        case 768: val = view.getUint32(off, le); break;
-        default: val = 0;
-      }
-      floatData[i] = val * slope + inter;
-    }
-
-    // Try native mmap_extract_slice_batch for efficient batch slice extraction
-    const native = getNativeBindings();
-    let nativeBatchAvailable = false;
-    if (native?.mmapExtractSliceBatch && fsPath && !fsPath.endsWith('.gz')) {
-      nativeBatchAvailable = true;
-    }
-
-    // Generate LOD2 (1/4 resolution) — send immediately
-    if (signal.aborted) return;
-    try {
-      let axialSliceLod2: { data: Float32Array; w: number; h: number } | null = null;
-      let coronalSliceLod2: { data: Float32Array; w: number; h: number } | null = null;
-      let sagittalSliceLod2: { data: Float32Array; w: number; h: number } | null = null;
-
-      // Use mmap_extract_slice_batch for efficient batch extraction from local .nii files
-      if (nativeBatchAvailable) {
-        try {
-          const axialIdx = Math.floor(nz / 2);
-          const coronalIdx = Math.floor(ny / 2);
-          const sagittalIdx = Math.floor(nx / 2);
-          const axialSlices = native!.mmapExtractSliceBatch!(fsPath!, header, 'axial', [axialIdx]);
-          const coronalSlices = native!.mmapExtractSliceBatch!(fsPath!, header, 'coronal', [coronalIdx]);
-          const sagittalSlices = native!.mmapExtractSliceBatch!(fsPath!, header, 'sagittal', [sagittalIdx]);
-          if (axialSlices && axialSlices[0]) {
-            const dstW = Math.max(1, Math.floor(nx / 4));
-            const dstH = Math.max(1, Math.floor(ny / 4));
-            const resampled = native!.fastResampleSlice?.(axialSlices[0], nx, ny, dstW, dstH);
-            axialSliceLod2 = resampled ? { data: resampled, w: dstW, h: dstH } : null;
-          }
-          if (coronalSlices && coronalSlices[0]) {
-            const dstW = Math.max(1, Math.floor(nx / 4));
-            const dstH = Math.max(1, Math.floor(nz / 4));
-            const resampled = native!.fastResampleSlice?.(coronalSlices[0], nx, nz, dstW, dstH);
-            coronalSliceLod2 = resampled ? { data: resampled, w: dstW, h: dstH } : null;
-          }
-          if (sagittalSlices && sagittalSlices[0]) {
-            const dstW = Math.max(1, Math.floor(ny / 4));
-            const dstH = Math.max(1, Math.floor(nz / 4));
-            const resampled = native!.fastResampleSlice?.(sagittalSlices[0], ny, nz, dstW, dstH);
-            sagittalSliceLod2 = resampled ? { data: resampled, w: dstW, h: dstH } : null;
-          }
-        } catch {
-          // Fall through to JS path
-        }
-      }
-
-      // Fallback to JS-based extraction
-      if (!axialSliceLod2) {
-        axialSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2), 4);
-      }
-      if (!coronalSliceLod2) {
-        coronalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2), 4);
-      }
-      if (!sagittalSliceLod2) {
-        sagittalSliceLod2 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2), 4);
-      }
-
-      if (axialSliceLod2 && !signal.aborted) {
-        // Convert Float32Array to ArrayBuffer for efficient transfer
-        const axialBuf = axialSliceLod2.data.buffer.slice(
-          axialSliceLod2.data.byteOffset,
-          axialSliceLod2.data.byteOffset + axialSliceLod2.data.byteLength
-        );
-        const coronalBuf = coronalSliceLod2 ? coronalSliceLod2.data.buffer.slice(
-          coronalSliceLod2.data.byteOffset,
-          coronalSliceLod2.data.byteOffset + coronalSliceLod2.data.byteLength
-        ) : null;
-        const sagittalBuf = sagittalSliceLod2 ? sagittalSliceLod2.data.buffer.slice(
-          sagittalSliceLod2.data.byteOffset,
-          sagittalSliceLod2.data.byteOffset + sagittalSliceLod2.data.byteLength
-        ) : null;
-
-        webview.postMessage({
-          type: 'lodData',
-          level: 2,
-          axial: axialBuf,
-          axialW: axialSliceLod2.w,
-          axialH: axialSliceLod2.h,
-          coronal: coronalBuf,
-          coronalW: coronalSliceLod2?.w ?? 0,
-          coronalH: coronalSliceLod2?.h ?? 0,
-          sagittal: sagittalBuf,
-          sagittalW: sagittalSliceLod2?.w ?? 0,
-          sagittalH: sagittalSliceLod2?.h ?? 0,
-        });
-      }
-    } catch { /* ignore */ }
-
-    // Generate LOD1 (1/2 resolution) — send after short delay
-    await new Promise<void>(r => setTimeout(r, 100));
-    if (signal.aborted) return;
-    try {
-      const axialSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'axial', Math.floor(nz / 2), 2);
-      const coronalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'coronal', Math.floor(ny / 2), 2);
-      const sagittalSliceLod1 = this.extractLODSlice(floatData, nx, ny, nz, 'sagittal', Math.floor(nx / 2), 2);
-      if (axialSliceLod1 && !signal.aborted) {
-        // Convert Float32Array to ArrayBuffer for efficient transfer
-        const axialBuf = axialSliceLod1.data.buffer.slice(
-          axialSliceLod1.data.byteOffset,
-          axialSliceLod1.data.byteOffset + axialSliceLod1.data.byteLength
-        );
-        const coronalBuf = coronalSliceLod1 ? coronalSliceLod1.data.buffer.slice(
-          coronalSliceLod1.data.byteOffset,
-          coronalSliceLod1.data.byteOffset + coronalSliceLod1.data.byteLength
-        ) : null;
-        const sagittalBuf = sagittalSliceLod1 ? sagittalSliceLod1.data.buffer.slice(
-          sagittalSliceLod1.data.byteOffset,
-          sagittalSliceLod1.data.byteOffset + sagittalSliceLod1.data.byteLength
-        ) : null;
-
-        webview.postMessage({
-          type: 'lodData',
-          level: 1,
-          axial: axialBuf,
-          axialW: axialSliceLod1.w,
-          axialH: axialSliceLod1.h,
-          coronal: coronalBuf,
-          coronalW: coronalSliceLod1?.w ?? 0,
-          coronalH: coronalSliceLod1?.h ?? 0,
-          sagittal: sagittalBuf,
-          sagittalW: sagittalSliceLod1?.w ?? 0,
-          sagittalH: sagittalSliceLod1?.h ?? 0,
-        });
-      }
-    } catch { /* ignore */ }
-
-    // LOD0 is the full volume already sent via cachedVolume — just notify
-    await new Promise<void>(r => setTimeout(r, 200));
-    if (signal.aborted) return;
-    webview.postMessage({ type: 'lodData', level: 0 });
-  }
-
-  private extractLODSlice(
-    floatData: Float32Array,
-    nx: number, ny: number, nz: number,
-    axis: 'axial' | 'coronal' | 'sagittal',
-    idx: number,
-    factor: number = 2
-  ): { data: Float32Array; w: number; h: number } | null {
-    let slice: Float32Array;
-    let w: number, h: number;
-
-    if (axis === 'axial') {
-      if (idx < 0 || idx >= nz) return null;
-      slice = new Float32Array(nx * ny);
-      const base = idx * ny * nx;
-      for (let i = 0; i < nx * ny; i++) slice[i] = floatData[base + i];
-      w = nx; h = ny;
-    } else if (axis === 'coronal') {
-      if (idx < 0 || idx >= ny) return null;
-      slice = new Float32Array(nx * nz);
-      for (let z = 0; z < nz; z++) {
-        const base = z * ny * nx + idx * nx;
-        for (let x = 0; x < nx; x++) slice[z * nx + x] = floatData[base + x];
-      }
-      w = nx; h = nz;
-    } else {
-      if (idx < 0 || idx >= nx) return null;
-      slice = new Float32Array(ny * nz);
-      for (let z = 0; z < nz; z++) {
-        const base = z * ny * nx;
-        for (let y = 0; y < ny; y++) slice[z * ny + y] = floatData[base + y * nx + idx];
-      }
-      w = ny; h = nz;
-    }
-
-    // Use native fast_resample_slice for bilinear interpolation when available
-    const dstW = Math.max(1, Math.floor(w / factor));
-    const dstH = Math.max(1, Math.floor(h / factor));
-    const native = getNativeBindings();
-    if (native?.fastResampleSlice) {
-      try {
-        const resampled = native.fastResampleSlice(slice, w, h, dstW, dstH);
-        if (resampled) return { data: resampled, w: dstW, h: dstH };
-      } catch {
-        // Fall through to JS fallback
-      }
-    }
-
-    const ds = downsampleSlice(slice, w, h, factor);
-    return { data: ds.data, w: ds.w, h: ds.h };
   }
 
   private buildHtml(
