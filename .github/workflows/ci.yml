@@ -19,6 +19,8 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run lint
       - run: npm run build
       - name: Test
         run: npm test
@@ -83,7 +85,7 @@ jobs:
           node-version: 22.x
           cache: npm
       - run: npm ci
-      - run: npm run build
+      - run: npm run build:prod
       # Download all 5 platform binaries and place them at repo root,
       # exactly where nativeBridge.ts looks them up.
       - uses: actions/download-artifact@v4

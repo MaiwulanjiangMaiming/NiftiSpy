@@ -87,7 +87,7 @@ export class GzipScanSession {
   static start(fsPath: string, signal?: AbortSignal, onProgress?: (pct: number) => void, options: GzipCacheOptions = {}): GzipScanSession {
     // Stat-based identity also prevents sharing a scan after the source changed.
     let key = fsPath;
-    try { const st = fs.statSync(fsPath); key += `:${st.size}:${st.mtimeMs}:${st.ctimeMs}`; } catch {}
+    try { const st = fs.statSync(fsPath); key += `:${st.size}:${st.mtimeMs}:${st.ctimeMs}`; } catch { /* source may have vanished */ }
     const active = this.active.get(key);
     if (active && !active.completed && !signal) return active;
     const session = new GzipScanSession();
@@ -100,7 +100,7 @@ export class GzipScanSession {
 
   private publish(preview: GzipOrthoPreview): void {
     this.latest = preview;
-    for (const listener of this.listeners) { try { listener(preview); } catch {} }
+    for (const listener of this.listeners) { try { listener(preview); } catch { /* a subscriber must not break the stream */ } }
   }
 
   private async run(fsPath: string, signal?: AbortSignal, onProgress?: (pct: number) => void, options: GzipCacheOptions = {}): Promise<void> {

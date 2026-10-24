@@ -306,9 +306,9 @@ export function streamingGunzipPreviewVolume(
     let req: http.ClientRequest | null = null;
 
     const cleanup = (): void => {
-      try { gunzip.destroy(); } catch {}
-      try { (sourceStream as any)?.destroy?.(); } catch {}
-      try { req?.destroy(); } catch {}
+      try { gunzip.destroy(); } catch { /* best-effort cleanup */ }
+      try { (sourceStream as any)?.destroy?.(); } catch { /* best-effort cleanup */ }
+      try { req?.destroy(); } catch { /* best-effort cleanup */ }
     };
 
     const onAbort = (): void => {
