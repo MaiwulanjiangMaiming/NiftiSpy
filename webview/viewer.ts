@@ -6,7 +6,7 @@ import { COLORMAPS } from './viewer/colormaps';
 import { computeMIP, rotAxisAngle, mul3 } from './viewer/mip';
 import { drawMeasurements, type Measurement } from './viewer/measure';
 import { showToast, initTooltipSystem } from './viewer/ui';
-import { BufferPool, Float32Pool, BandwidthEstimator } from './viewer/pools';
+import { Float32Pool, BandwidthEstimator } from './viewer/pools';
 import { voxelToWorld, worldToVoxel } from './viewer/geometry';
 import {
   getAnatomicalAxisDir,
@@ -14,8 +14,8 @@ import {
   computeOrientationFromQform,
   computeFlipsForHeader,
 } from './viewer/orientation';
-import { VolumeRaycaster, TransferFunctionPoint, RayMarchingConfig } from './volumeRaycaster';
-import { deriveFileHash, getVolumeCacheDB, makeTypedArrayFromBuffer } from './SliceCacheDB';
+import { VolumeRaycaster } from './volumeRaycaster';
+import { getVolumeCacheDB, makeTypedArrayFromBuffer } from './SliceCacheDB';
 import { shouldAutoloadFullVolume as evaluateFullVolumePolicy, SLICE_MODE_MIN_BYTES } from '../src/volumePolicy';
 import { initWasmBindings, getWasmBindings } from './wasmBridge';
 
@@ -252,7 +252,7 @@ try { sabAvailable = typeof SharedArrayBuffer !== 'undefined'; } catch { sabAvai
 
 function verifySABSupport(): boolean {
   try {
-    const testBuf = new SharedArrayBuffer(1024);
+    new SharedArrayBuffer(1024);
     // If we got here, SAB is available
     sabAvailable = true;
     return true;
@@ -299,7 +299,6 @@ let windowWidth = 1.0;
 let windowLevel = 0.5;
 let pendingAddImageIdx = -1;
 let overlayOpacity = 0.5;
-let overlayColormap = 'hot';
 type CompareLayout = 'overlay' | 'sideBySide';
 let compareLayout: CompareLayout = 'overlay';
 // Indices of the two images taking part in compare mode, chosen via the
@@ -347,7 +346,7 @@ let measureClickPending: { x: number; y: number; axis: Axis } | null = null;
 
 // Accessibility state
 let highContrastPreferred = false;
-try { highContrastPreferred = window.matchMedia('(prefers-contrast: more)').matches; } catch {}
+try { highContrastPreferred = window.matchMedia('(prefers-contrast: more)').matches; } catch { /* optional API unavailable */ }
 let focusedCanvas: Axis | null = null;
 
 // LOD (Level of Detail) progressive loading
@@ -385,7 +384,6 @@ interface QueuedVolumeLoad {
 }
 const volumeLoadQueue: QueuedVolumeLoad[] = [];
 let nextStreamRequestId = 2000;
-const workerStreamHandlers = new Map<number, (msg: WorkerStreamMessage) => void>();
 let activeVolumeLoadKey: string | null = null;
 const volumeWorkers = new Map<string, Worker>();
 const volumeWorkerCancels = new Map<string, () => void>();
@@ -552,7 +550,7 @@ function detectBestRenderBackendSync(): RenderBackend {
       if (max3D >= 256) return 'webgl3d';
       return 'webgl2d';
     }
-  } catch { }
+  } catch { /* optional API unavailable */ }
   return 'canvas2d';
 }
 
@@ -592,7 +590,6 @@ let lastVolumeMouseY = 0;
 
 
 
-const bufferPool = new BufferPool();
 const float32Pool = new Float32Pool();
 const bandwidthEstimator = new BandwidthEstimator();
 
@@ -713,7 +710,7 @@ function detectPerformance(): PerformanceProfile {
         max3DTextureSize = gl.getParameter(gl.MAX_3D_TEXTURE_SIZE) || 0;
       }
     }
-  } catch { }
+  } catch { /* optional API unavailable */ }
 
   let tier: 'high' | 'medium' | 'low';
   if (cores >= 8 && memoryMB >= 4096 && gpuAvailable) {
@@ -801,12 +798,6 @@ function validateWindowLevel(ww: number, wl: number): { windowWidth: number; win
   };
 }
 
-function validateVolumeData(hdr: NiiHeader | null, data: Float32Array | null): boolean {
-  if (!hdr || !data) return false;
-  const expectedLen = hdr.nx * hdr.ny * hdr.nz;
-  return data.length >= expectedLen;
-}
-
 function restartCrashedWorker(axis: Axis): void {
   const idx = AXIS_TO_WORKER_IDX[axis];
   const oldWorker = sliceWorkers[idx];
@@ -830,7 +821,7 @@ const canvases = {
   mip: document.getElementById('mip') as HTMLCanvasElement,
 };
 
-let sliceWorkers: Worker[] = [];
+const sliceWorkers: Worker[] = [];
 const AXIS_TO_WORKER_IDX: Record<Axis, number> = { axial: 0, coronal: 1, sagittal: 2 };
 let cachedBlobUrl: string | null = null;
 
@@ -954,11 +945,6 @@ function attachWorkerRouter(worker: Worker) {
       bandwidthEstimator.addSample(msg.bytes || 0, msg.durationMs || 0);
       return;
     }
-    const streamHandler = workerStreamHandlers.get(msg.id);
-    if (streamHandler) {
-      streamHandler(msg);
-      return;
-    }
     const pending = workerRequests.get(msg.id);
     if (pending && msg?.type !== 'progress' && msg?.type !== 'preview' && msg?.type !== 'volume') {
       workerRequests.delete(msg.id);
@@ -1000,16 +986,6 @@ async function getSlicePool(): Promise<SliceWorkerPool> {
   return slicePool!;
 }
 
-async function getSliceWorker(axis: Axis): Promise<Worker> {
-  const pool = await getSlicePool();
-  const idx = AXIS_TO_WORKER_IDX[axis];
-  if (sliceWorkers[idx]) return sliceWorkers[idx];
-  const worker = new Worker(await ensureWorkerBlobUrl());
-  attachWorkerRouter(worker);
-  sliceWorkers[idx] = worker;
-  return worker;
-}
-
 async function ensureAllSliceWorkers(): Promise<void> {
   await getSlicePool();
 }
@@ -1019,22 +995,6 @@ function broadcastToSliceWorkers(message: Record<string, unknown>): void {
   for (const worker of sliceWorkers) {
     if (worker) worker.postMessage(message);
   }
-}
-
-function sendWorkerRequest<T = unknown>(worker: Worker, payload: Record<string, unknown>): Promise<T> {
-  const id = nextWorkerRequestId++;
-  return new Promise<T>((resolve, reject) => {
-    workerRequests.set(id, { resolve: v => resolve(v as T), reject });
-    worker.postMessage({ ...payload, id });
-  });
-}
-
-function registerWorkerStream(requestId: number, handler: (msg: WorkerStreamMessage) => void) {
-  workerStreamHandlers.set(requestId, handler);
-}
-
-function unregisterWorkerStream(requestId: number) {
-  workerStreamHandlers.delete(requestId);
 }
 
 function cancelVolumeLoadByKey(key: string | null): void {
@@ -1801,7 +1761,7 @@ class PrefetchPriorityQueue {
     await new Promise<void>(resolve => {
       requestIdleCallback(() => {
         if (job.cancelled || !header || !volumeData) { resolve(); return; }
-        const { nx, ny, nz, dx, dy, dz } = header;
+        const { nx, ny, nz } = header;
         const slice = extractSlice(job.axis as 'axial' | 'coronal' | 'sagittal', job.sliceIdx);
         let w: number, h: number;
         if (job.axis === 'axial') { w = nx; h = ny; }
@@ -2525,7 +2485,7 @@ function getContainerSize(axis: string): { width: number; height: number } {
   return size;
 }
 
-function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, cw: number, ch: number) {
+function updateCrosshair(axis: string, w: number, h: number, zoom: number, panX: number, panY: number, _cw: number, _ch: number) {
   const container = canvases[axis as keyof typeof canvases]?.parentElement;
   if (!container) return;
   const crosshair = container.querySelector('.crosshair') as HTMLDivElement;
@@ -2733,12 +2693,6 @@ function updateDirectionLabels(axis: string) {
     else if (pos === 'dir-a') el.textContent = labelsY.top;
     else if (pos === 'dir-p') el.textContent = labelsY.bottom;
   });
-}
-
-function updateAllDirectionLabels() {
-  updateDirectionLabels('axial');
-  updateDirectionLabels('coronal');
-  updateDirectionLabels('sagittal');
 }
 
 function renderAllViews() {
@@ -3115,16 +3069,8 @@ function resampleOverlaySlice(
   if (!d0 || !d1) return { data: result, w: outW, h: outH };
 
   const n1x = h1.nx, n1y = h1.ny, n1z = h1.nz;
-  const elem1 = h1.datatype === 64 ? 8 : h1.datatype === 8 || h1.datatype === 16 || h1.datatype === 768 ? 4 : h1.datatype === 4 || h1.datatype === 512 ? 2 : 1;
   const slope1 = img1.slope || 1;
   const inter1 = img1.inter || 0;
-
-  const getVoxel1 = (vx: number, vy: number, vz: number): number => {
-    const ix = Math.round(vx), iy = Math.round(vy), iz = Math.round(vz);
-    if (ix < 0 || ix >= n1x || iy < 0 || iy >= n1y || iz < 0 || iz >= n1z) return NaN;
-    const idx = iz * n1y * n1x + iy * n1x + ix;
-    return (d1 as ArrayLike<number>)[idx] * slope1 + inter1;
-  };
 
   const getVoxel1Lerp = (vx: number, vy: number, vz: number): number => {
     if (vx < -0.5 || vx > n1x - 0.5 || vy < -0.5 || vy > n1y - 0.5 || vz < -0.5 || vz > n1z - 0.5) return NaN;
@@ -3327,7 +3273,7 @@ function paintSideBySideSlice(axis: string, data0: Float32Array, data1: Float32A
   w0: number, h0_: number, w1: number, h1_: number,
   pw0: number, ph0: number, pw1: number, ph1: number,
   img0: VolumeImage, img1: VolumeImage,
-  idx0: number, idx1: number) {
+  _idx0: number, _idx1: number) {
   const canvas = canvases[axis as keyof typeof canvases];
   // The right half may be absent while img1 is still loading — draw img0 only.
   if (!canvas || !data0 || data0.length === 0) return;
@@ -3726,7 +3672,7 @@ function autoContrast() {
   // This matches how renderSliceToTempCanvas applies W/L: each image is
   // independently normalized before the global W/L is applied, so the
   // W/L must be computed in normalized space to work for all images.
-  let samples: number[] = [];
+  const samples: number[] = [];
 
   // Primary volume (img0)
   if (volumeData && volumeData.length > 0) {
@@ -4430,7 +4376,6 @@ function enterCompareOverlayUI(): void {
   const overlayCmapSelect = document.getElementById('overlay-colormap') as HTMLSelectElement | null;
   if (overlayCmapSelect && img1) {
     overlayCmapSelect.value = img1.colormap;
-    overlayColormap = img1.colormap;
   }
   renderColormapPreview();
   sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
@@ -5585,7 +5530,7 @@ function handleCachedVolume(msg: CachedVolumeMessage): void {
         voxelBuffer = arr.buffer;
         voxOffset = 0;
       }
-    } catch {}
+    } catch { /* optional API unavailable */ }
   }
 
   if (voxelBuffer) {
@@ -5886,7 +5831,7 @@ async function fallbackToHttpPreview(): Promise<void> {
         maybeScheduleFullVolume(0);
         return;
       }
-    } catch (_) {}
+    } catch { /* optional preview path unavailable */ }
 
     loadFullVolume();
   } catch (err) {
@@ -6132,7 +6077,6 @@ async function switchToImage(idx: number) {
   }
   if (overlayCmapSelect && cmpImg(1)) {
     overlayCmapSelect.value = cmpImg(1)!.colormap;
-    overlayColormap = cmpImg(1)!.colormap;
   }
   renderColormapPreview();
 
@@ -6459,8 +6403,7 @@ function setupInteraction() {
       }
       if (overlayCmapSelect && img1) {
         overlayCmapSelect.value = img1.colormap;
-        overlayColormap = img1.colormap;
-      }
+          }
       renderColormapPreview();
       sliceIdx.axial = Math.min(sliceIdx.axial, img0.header.nz - 1);
       sliceIdx.coronal = Math.min(sliceIdx.coronal, img0.header.ny - 1);
@@ -6524,7 +6467,6 @@ function setupInteraction() {
   overlayCmapSelect?.addEventListener('change', () => {
     const overlayImg = cmpImg(1);
     if (overlayImg) overlayImg.colormap = overlayCmapSelect.value;
-    overlayColormap = overlayCmapSelect.value;
     if (compareMode) renderAllViews();
   });
 
@@ -7063,7 +7005,6 @@ function setupInteraction() {
           return;
         }
         const h0 = img0.header;
-        const h1 = img1.header;
         const vs = viewState[axis];
 
         if (compareLayout === 'sideBySide') {
@@ -7342,11 +7283,15 @@ function setupInteraction() {
     // context and never emits webglcontextlost.
   }
 
+  // Volume-mode drag/zoom only matters when the raycaster is in use, but the
+  // listeners are inert in slice mode and are registered exactly once here.
+  setupVolumeInteraction();
+
   // High contrast media query listener
   try {
     window.matchMedia('(prefers-contrast: more)').addEventListener('change', (e) => {
       highContrastPreferred = e.matches;
       renderAllViews();
     });
-  } catch {}
+  } catch { /* optional API unavailable */ }
 }

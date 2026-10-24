@@ -344,7 +344,7 @@
     "bench:load": "node benchmarks/load-benchmark.js",
     "bench:multi": "node benchmarks/multi-load-benchmark.js",
     "bench:remote": "node benchmarks/remote-sim-benchmark.js",
-    "lint": "eslint src/**/*.ts webview/**/*.ts",
+    "lint": "eslint \"src/**/*.ts\" \"webview/**/*.ts\"",
     "format": "prettier --write 'src/**/*.ts' 'webview/**/*.ts'",
     "format:check": "prettier --check 'src/**/*.ts' 'webview/**/*.ts'",
     "bench:host": "node benchmarks/remote-gzip-profile.js"

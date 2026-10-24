@@ -1,5 +1,3 @@
-type Axis = 'axial' | 'coronal' | 'sagittal';
-
 declare const COLORMAPS: Record<string, (t: number) => [number, number, number]>;
 
 interface WebGPUVolumeState {

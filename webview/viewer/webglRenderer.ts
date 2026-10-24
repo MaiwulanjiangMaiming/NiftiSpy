@@ -1,3 +1,5 @@
+import { computeChunkBands } from './chunkBands';
+
 export type ColormapFn = (t: number) => [number, number, number];
 export type TypedArray = Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
 
@@ -76,6 +78,9 @@ export class WebGLRenderer {
   private u3d_inter: WebGLUniformLocation | null = null;
   private u3d_dataMin: WebGLUniformLocation | null = null;
   private u3d_dataRange: WebGLUniformLocation | null = null;
+  /** Chunk-local z mapping: zLocal = (globalZ - zStart) / chunkDepth. */
+  private u3d_zStart: WebGLUniformLocation | null = null;
+  private u3d_chunkDepth: WebGLUniformLocation | null = null;
   private u3d_programCached: WebGLProgram | null = null;
   // Cached LUT data buffer
   private cachedLutData: Uint8Array = new Uint8Array(256 * 4);
@@ -168,17 +173,24 @@ uniform float u_slope;
 uniform float u_inter;
 uniform float u_dataMin;
 uniform float u_dataRange;
+uniform float u_zStart;
+uniform float u_chunkDepth;
 out vec4 fragColor;
 void main() {
   float fx = (u_flipX == 1) ? 1.0 - v_texCoord.x : v_texCoord.x;
   float fy = (u_flipY == 1) ? 1.0 - v_texCoord.y : v_texCoord.y;
+  // Chunked uploads split the volume along z. Map the global z coordinate
+  // (axial slice index, or the screen-vertical axis for coronal/sagittal)
+  // into the currently bound chunk's local [0,1] range.
+  float globalZ = (u_axis == 0) ? u_sliceIndex : fy * u_volumeSize.z;
+  float zLocal = clamp((globalZ - u_zStart) / max(u_chunkDepth, 1.0), 0.0, 1.0);
   vec3 uvw;
   if (u_axis == 0) {
-    uvw = vec3(fx, fy, u_sliceIndex / u_volumeSize.z);
+    uvw = vec3(fx, fy, zLocal);
   } else if (u_axis == 1) {
-    uvw = vec3(fx, u_sliceIndex / u_volumeSize.y, fy);
+    uvw = vec3(fx, u_sliceIndex / max(u_volumeSize.y, 1.0), zLocal);
   } else {
-    uvw = vec3(u_sliceIndex / u_volumeSize.x, fx, fy);
+    uvw = vec3(u_sliceIndex / max(u_volumeSize.x, 1.0), fx, zLocal);
   }
   float rawValue = ${fetch};
   float scaledValue = rawValue * u_slope + u_inter;
@@ -639,24 +651,7 @@ void main() {
 
     gl2.useProgram(program);
 
-    // Bind the correct 3D texture (single or chunked)
-    gl2.activeTexture(gl2.TEXTURE0);
-    if (this.chunkCount > 0) {
-      // Chunked: select the correct chunk based on slice index
-      // TODO: For axis=1 (coronal), sliceIndex is y-direction index but chunks are split along z.
-      //       The effectiveSliceZ should ideally be the z-coordinate, not the sliceIndex.
-      //       Currently all branches resolve to sliceIndex, which may be incorrect for non-axial views.
-      const effectiveSliceZ = sliceIndex;
-      const chunkIdx = Math.min(Math.floor(effectiveSliceZ / this.chunkZSize), this.chunkCount - 1);
-      const tex = this.texture3DChunks[chunkIdx];
-      if (!tex) return false;
-      gl2.bindTexture(gl2.TEXTURE_3D, tex);
-    } else {
-      if (!this.texture3D) return false;
-      gl2.bindTexture(gl2.TEXTURE_3D, this.texture3D);
-    }
-
-    // Update colormap 1D LUT texture if changed
+    // Update colormap 1D LUT texture if changed (shared by every chunk).
     if (this.currentCmap3D !== cmapName) {
       this.createColormapTexture(cmapName);
       this.currentCmap3D = cmapName;
@@ -680,6 +675,8 @@ void main() {
       this.u3d_inter = gl2.getUniformLocation(program, 'u_inter');
       this.u3d_dataMin = gl2.getUniformLocation(program, 'u_dataMin');
       this.u3d_dataRange = gl2.getUniformLocation(program, 'u_dataRange');
+      this.u3d_zStart = gl2.getUniformLocation(program, 'u_zStart');
+      this.u3d_chunkDepth = gl2.getUniformLocation(program, 'u_chunkDepth');
       this.u3d_programCached = program;
     }
     gl2.uniform1i(this.u3d_volume, 0);
@@ -708,23 +705,60 @@ void main() {
     // background fill.
     gl2.clearColor(0, 0, 0, 1);
     gl2.clear(gl2.COLOR_BUFFER_BIT);
-    const quad = ndcQuad(canvas, dst);
-    gl2.bindBuffer(gl2.ARRAY_BUFFER, this.posBuffer);
-    gl2.bufferData(gl2.ARRAY_BUFFER, quad, gl2.DYNAMIC_DRAW);
-    gl2.enableVertexAttribArray(aPos);
-    gl2.vertexAttribPointer(aPos, 2, gl2.FLOAT, false, 0, 0);
+    const fullQuad = ndcQuad(canvas, dst);
+    const base = dst ?? { x: 0, y: 0, w: canvas.width, h: canvas.height };
 
-    gl2.bindBuffer(gl2.ARRAY_BUFFER, this.texCoordBuffer);
-    // Vertex order bl,br,tl,tr with texCoords (0,0),(1,0),(0,1),(1,1):
-    // texture row 0 lands at the canvas BOTTOM, matching the CPU painter
-    // (drawImage with scaleY<0 puts image row 0 at the bottom for
-    // flipY=false). The old layout put row 0 at the top — a vertical flip
-    // versus every CPU-rendered frame.
-    gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl2.STATIC_DRAW);
-    gl2.enableVertexAttribArray(aTex);
-    gl2.vertexAttribPointer(aTex, 2, gl2.FLOAT, false, 0, 0);
+    const drawChunk = (
+      texture: WebGLTexture,
+      zStart: number,
+      chunkDepth: number,
+      quad: Float32Array,
+      ty0: number,
+      ty1: number,
+    ): void => {
+      gl2.activeTexture(gl2.TEXTURE0);
+      gl2.bindTexture(gl2.TEXTURE_3D, texture);
+      gl2.uniform1f(this.u3d_zStart, zStart);
+      gl2.uniform1f(this.u3d_chunkDepth, chunkDepth);
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, this.posBuffer);
+      gl2.bufferData(gl2.ARRAY_BUFFER, quad, gl2.DYNAMIC_DRAW);
+      gl2.enableVertexAttribArray(aPos);
+      gl2.vertexAttribPointer(aPos, 2, gl2.FLOAT, false, 0, 0);
+      gl2.bindBuffer(gl2.ARRAY_BUFFER, this.texCoordBuffer);
+      // Vertex order bl,br,tl,tr with y=0 at the BOTTOM vertex: texture row 0
+      // lands at the canvas bottom, matching the CPU painter.
+      gl2.bufferData(gl2.ARRAY_BUFFER, new Float32Array([0, ty0, 1, ty0, 0, ty1, 1, ty1]), gl2.DYNAMIC_DRAW);
+      gl2.enableVertexAttribArray(aTex);
+      gl2.vertexAttribPointer(aTex, 2, gl2.FLOAT, false, 0, 0);
+      gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
+    };
 
-    gl2.drawArrays(gl2.TRIANGLE_STRIP, 0, 4);
+    if (this.chunkCount <= 0) {
+      if (!this.texture3D) return false;
+      drawChunk(this.texture3D, 0, nz, fullQuad, 0, 1);
+    } else if (axis === 0) {
+      // Axial: one z plane — bind only the chunk that contains it.
+      const chunkIdx = Math.min(Math.floor(sliceIndex / this.chunkZSize), this.chunkCount - 1);
+      const texture = this.texture3DChunks[chunkIdx];
+      if (!texture) return false;
+      const zStart = chunkIdx * this.chunkZSize;
+      drawChunk(texture, zStart, Math.min(this.chunkZSize, nz - zStart), fullQuad, 0, 1);
+    } else {
+      // Coronal/sagittal span the whole z range, so compose the slice from
+      // every chunk: each chunk owns the horizontal band whose normalized
+      // vertical coordinate falls inside that chunk's z interval.
+      const bands = computeChunkBands(nz, this.chunkZSize, flipY);
+      for (let c = 0; c < bands.length; c++) {
+        const texture = this.texture3DChunks[c];
+        if (!texture) return false;
+        const band = bands[c];
+        const bandY = base.y + base.h * (1 - band.ty1);
+        const bandH = base.h * (band.ty1 - band.ty0);
+        if (bandH <= 0) continue;
+        drawChunk(texture, band.zStart, band.chunkDepth,
+          ndcQuad(canvas, { x: base.x, y: bandY, w: base.w, h: bandH }), band.ty0, band.ty1);
+      }
+    }
     if (gl2.getError() !== gl2.NO_ERROR) return false;
     return this.blitToDisplay(canvas);
   }

@@ -466,7 +466,6 @@ function patternSearch(
   const tStart = Date.now();
   const dirs = cur.length;
   while (Date.now() - tStart < budgetLeftMs) {
-    const evalBefore = ctx.evalCount;
     let improved = false;
     for (let d = 0; d < dirs; d++) {
       const saved = cur[d];

@@ -905,7 +905,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     uriKey: string,
     header: NiiHeader,
     rawData: Uint8Array,
-    signal: AbortSignal
+    _signal: AbortSignal
   ): void {
     const slope = header.scl_slope || 1;
     const inter = header.scl_inter || 0;

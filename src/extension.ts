@@ -103,21 +103,6 @@ code{color:#00d9ff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 </html>`;
 }
 
-function isZarrDirectory(uri: vscode.Uri): boolean {
-  const fsPath = uri.fsPath;
-  if (!fsPath) return false;
-  // Check if the path ends with .zarr or if it's a directory containing .zarray
-  if (fsPath.endsWith('.zarr')) return true;
-  try {
-    if (fs.statSync(fsPath).isDirectory()) {
-      return fs.existsSync(path.join(fsPath, '.zarray'));
-    }
-  } catch {
-    // Not a directory or doesn't exist
-  }
-  return false;
-}
-
 export async function activate(context: vscode.ExtensionContext) {
   // Migrate old niiFastView.* settings to niftispy.*
   const oldConfig = vscode.workspace.getConfiguration('niiFastView');

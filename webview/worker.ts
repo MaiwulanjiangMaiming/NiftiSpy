@@ -3,7 +3,7 @@ import { parseNiiHeader, type NiiHeader } from './nii-parser';
 import { SliceCacheDB, deriveFileHash, getSliceCacheDB } from './SliceCacheDB';
 import { SliceService } from './worker/slices';
 import { asError, errorMessage, isAbortError } from '../src/errors';
-import { initWasmBindings, getWasmBindings, type WasmBindings } from './wasmBridge';
+import { initWasmBindings } from './wasmBridge';
 
 // Initialize WASM SIMD module (async, non-blocking)
 let wasmReady = false;
@@ -270,7 +270,7 @@ async function readBodyWithWatchdog(
   const reader = resp.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
-  while (true) {
+  for (;;) {
     throwIfAborted(signal);
     let result: ReadableStreamReadResult<Uint8Array>;
     try {
@@ -383,235 +383,6 @@ function getPreferredChunkSize(url: string): number {
 function getPreferredConcurrency(url: string): number {
   if (url.includes('127.0.0.1')) return LOCALHOST_MAX_CONCURRENT;
   return REMOTE_MAX_CONCURRENT;
-}
-
-/**
- * Stream-decompress a gzip response and emit a preview as soon as enough data
- * is available (header + middle axial slice), then continue decompressing the
- * rest of the volume.  This cuts the "time-to-first-preview" from the full
- * download+decompress cycle to just the time needed for ~50% of the data.
- */
-async function nativeDecompressWithEarlyPreview(
-  resp: Response,
-  id: number,
-  signal: AbortSignal,
-  isGzip: boolean,
-): Promise<Uint8Array> {
-  const ds = new DecompressionStream('gzip');
-  const decompressedStream = resp.body!.pipeThrough(ds);
-  const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
-
-  // Collect decompressed chunks; try to parse header & send preview early
-  const chunks: Uint8Array[] = [];
-  let totalSize = 0;
-  let previewSent = false;
-
-  // Pre-allocate if Content-Length is known (decompressed size)
-  const declaredLength = Number(resp.headers.get('Content-Length') || 0);
-  let preAlloc: Uint8Array | null = declaredLength > 0 ? new Uint8Array(declaredLength) : null;
-  let writeOffset = 0;
-
-  // Incremental contiguous buffer for early preview — avoids O(n²) chunk
-  // concatenation on every iteration. Grows geometrically like a vector.
-  let previewBuf: Uint8Array | null = null;
-  let previewBufLen = 0;
-
-  while (true) {
-    throwIfAborted(signal);
-    // Watchdog: the decompressed stream is network-fed — a stalled tunnel
-    // must surface as TimeoutError instead of an eternal pending read().
-    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
-    if (done) break;
-
-    const chunk = value!;
-
-    if (preAlloc) {
-      if (writeOffset + chunk.byteLength <= preAlloc.length) {
-        preAlloc.set(chunk, writeOffset);
-        writeOffset += chunk.byteLength;
-      } else {
-        // Overflow — fall back to chunk collection
-        chunks.push(preAlloc.slice(0, writeOffset));
-        chunks.push(chunk);
-        preAlloc = null;
-      }
-    }
-    if (!preAlloc) {
-      chunks.push(chunk);
-    }
-    totalSize += chunk.byteLength;
-
-    // Maintain incremental contiguous buffer for early preview parsing
-    if (!previewSent) {
-      if (!previewBuf) {
-        previewBuf = new Uint8Array(Math.max(chunk.byteLength * 4, 1 << 20));
-      }
-      while (previewBufLen + chunk.byteLength > previewBuf!.length) {
-        const grown: Uint8Array = new Uint8Array(previewBuf!.length * 2);
-        grown.set(previewBuf!.subarray(0, previewBufLen), 0);
-        previewBuf = grown;
-      }
-      previewBuf!.set(chunk, previewBufLen);
-      previewBufLen += chunk.byteLength;
-    }
-
-    // ── Early preview: try once we have enough decompressed data ──
-    if (!previewSent && previewBufLen >= 544) {
-      try {
-        const buf = previewBuf!.subarray(0, previewBufLen);
-
-        const header = parseNiiHeader(buf.buffer as ArrayBuffer, isGzip);
-        const { nx, ny, nz, voxOffset, bytesPerVoxel, scl_slope, scl_inter, littleEndian, datatype } = header;
-        // Use z=0 slice for instant preview (right after header, ~0% of data)
-        // instead of center slice which requires ~45% of data to be decompressed
-        const firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
-
-        if (previewBufLen >= firstSliceNeeded) {
-          // We have enough data to extract the first axial slice
-          const slope = scl_slope || 1;
-          const inter = scl_inter || 0;
-          const le = littleEndian;
-          const needsConversion = slope !== 1 || inter !== 0;
-          const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
-
-          // Extract z=0 axial preview slice (instant — right after header)
-          const sliceStart = voxOffset;
-          const sliceEnd = voxOffset + nx * ny * bytesPerVoxel;
-          const axialSlice = new Float32Array(nx * ny);
-          const sliceView = new DataView(buf.buffer, buf.byteOffset + sliceStart, nx * ny * bytesPerVoxel);
-          const byteOff = buf.byteOffset + sliceStart;
-          const canUseTA = (byteOff % elemSize === 0) && le;
-
-          if (canUseTA && datatype === 16 && !needsConversion) {
-            axialSlice.set(new Float32Array(buf.buffer, byteOff, nx * ny));
-          } else if (canUseTA && datatype === 16 && needsConversion) {
-            const src = new Float32Array(buf.buffer, byteOff, nx * ny);
-            for (let i = 0; i < nx * ny; i++) axialSlice[i] = src[i] * slope + inter;
-          } else {
-            for (let i = 0; i < nx * ny; i++) {
-              let val: number;
-              switch (datatype) {
-                case 2: val = buf[buf.byteOffset + sliceStart + i]; break;
-                case 4: val = sliceView.getInt16(i * 2, le); break;
-                case 8: val = sliceView.getInt32(i * 4, le); break;
-                case 16: val = sliceView.getFloat32(i * 4, le); break;
-                case 64: val = sliceView.getFloat64(i * 8, le); break;
-                case 256: val = (buf[buf.byteOffset + sliceStart + i] << 24) >> 24; break;
-                case 512: val = sliceView.getUint16(i * 2, le); break;
-                case 768: val = sliceView.getUint32(i * 4, le); break;
-                default: val = 0;
-              }
-              axialSlice[i] = val * slope + inter;
-            }
-          }
-
-          // Quick min/max from preview slice
-          let min = Infinity, max = -Infinity;
-          for (let i = 0; i < axialSlice.length; i++) {
-            if (axialSlice[i] < min) min = axialSlice[i];
-            if (axialSlice[i] > max) max = axialSlice[i];
-          }
-          if (min === max) max = min + 1;
-
-          const coMid = Math.floor(ny / 2);
-          const saMid = Math.floor(nx / 2);
-
-          self.postMessage({
-            id, type: 'preview',
-            partialPreview: true,
-            header,
-            slices: {
-              axial: axialSlice,
-              coronal: new Float32Array(0),  // placeholder — GPU will render
-              sagittal: new Float32Array(0), // placeholder — GPU will render
-            },
-            globalMin: min, globalMax: max,
-            sliceIdx: { axial: 0, coronal: coMid, sagittal: saMid },
-            slope, inter,
-          }, [axialSlice.buffer]);
-
-          previewSent = true;
-          earlyPreviewSent.add(id);
-          previewBuf = null;  // Release preview buffer memory
-          self.postMessage({ id, type: 'progress', value: 0.5, stage: 'decompressing (native)' });
-        }
-      } catch {
-        // Header not parseable yet — continue streaming
-      }
-    }
-
-    // Progress updates
-    if (!previewSent) {
-      self.postMessage({ id, type: 'progress', value: 0.1 + (totalSize / (declaredLength || totalSize * 2)) * 0.2, stage: 'decompressing (native)' });
-    } else {
-      self.postMessage({ id, type: 'progress', value: 0.5 + (totalSize / (declaredLength || totalSize * 2)) * 0.2, stage: 'decompressing (native)' });
-    }
-  }
-
-  // Assemble final result
-  if (preAlloc) {
-    if (writeOffset !== declaredLength) return preAlloc.slice(0, writeOffset);
-    return preAlloc;
-  }
-
-  const result = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
-}
-
-async function nativeDecompress(resp: Response, signal?: AbortSignal): Promise<Uint8Array> {
-  const ds = new DecompressionStream('gzip');
-  const decompressedStream = resp.body!.pipeThrough(ds);
-
-  // Try to pre-allocate from Content-Length if available
-  const declaredLength = Number(resp.headers.get('Content-Length') || 0);
-  let result: Uint8Array | null = null;
-  let writeOffset = 0;
-
-  if (declaredLength > 0) {
-    result = new Uint8Array(declaredLength);
-  }
-
-  const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
-  const chunks: Uint8Array[] = [];
-  let totalSize = 0;
-
-  while (true) {
-    throwIfAborted(signal);
-    // Watchdog: network-fed decompressed stream — a stalled tunnel must
-    // surface as TimeoutError instead of an eternal pending read().
-    const { done, value } = await readStreamChunkWithWatchdog(reader, DEFAULT_IDLE_TIMEOUT_MS);
-    if (done) break;
-    if (result) {
-      // Write directly into pre-allocated buffer
-      result.set(value!, writeOffset);
-      writeOffset += value!.byteLength;
-    } else {
-      chunks.push(value!);
-      totalSize += value!.byteLength;
-    }
-  }
-
-  if (result) {
-    // Trim if actual size differs from declared
-    if (writeOffset !== declaredLength) {
-      return result.slice(0, writeOffset);
-    }
-    return result;
-  }
-
-  // Fallback: concatenate collected chunks
-  result = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return result;
 }
 
 async function downloadChunked(url: string, id: number, isGzip: boolean, signal?: AbortSignal): Promise<Uint8Array> {
@@ -845,8 +616,7 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
   self.postMessage({ id, type: 'progress', value: 0.85, stage: 'transferring volume' });
 
   // Always send native data — GPU shader handles slope/inter
-  let voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
-  voxelData = nativeData;
+  const voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array = nativeData;
   nativeData = null as unknown as typeof nativeData; // release reference for GC
 
   self.postMessage({ id, type: 'progress', value: 1.0, stage: 'done' });
@@ -1219,7 +989,7 @@ async function parallelGzipDownload(
 
   // Concurrent decompression reader — runs alongside downloads
   const decompressPromise = (async () => {
-    while (true) {
+    for (;;) {
       throwIfAborted(signal);
       const { done, value } = await reader.read();
       if (done) break;
@@ -1404,8 +1174,8 @@ async function parallelGzipDownload(
     downloadError = downloadError || (err as Error);
   } finally {
     // Ensure stream resources are cleaned up on error/abort
-    try { writer.abort(); } catch {}
-    try { reader.releaseLock(); } catch {}
+    try { writer.abort(); } catch { /* stream cleanup is best effort */ }
+    try { reader.releaseLock(); } catch { /* stream cleanup is best effort */ }
   }
 
   if (downloadError) throw downloadError;
@@ -1521,7 +1291,7 @@ async function streamingGzipLoadFromResponse(
   let writeOffset = 0;
   let previewSent = false;
 
-  while (true) {
+  for (;;) {
     throwIfAborted(signal);
     // Watchdog: network-fed decompressed stream — a stalled tunnel must
     // surface as TimeoutError instead of an eternal pending read().
@@ -1565,7 +1335,7 @@ async function streamingNiiLoadFromResponse(
   let totalSize = 0;
   let previewSent = false;
 
-  while (true) {
+  for (;;) {
     throwIfAborted(signal);
     // Watchdog: raw network stream — a stalled tunnel must surface as
     // TimeoutError instead of an eternal pending read().
@@ -1865,7 +1635,7 @@ async function streamingGzipLoadWithEarlyPreview(url: string, id: number, signal
 
   const contentLength = Number(resp.headers.get('Content-Length') || 0);
 
-  while (true) {
+  for (;;) {
     throwIfAborted(signal);
     // Watchdog: network-fed decompressed stream — a stalled tunnel must
     // surface as TimeoutError instead of an eternal pending read().
@@ -1998,7 +1768,7 @@ async function streamingNiiLoadWithEarlyPreview(url: string, id: number, signal:
   // Parse preview directly from result buffer — no separate previewBuf
   let previewSent = false;
 
-  while (true) {
+  for (;;) {
     throwIfAborted(signal);
     // Watchdog: raw network stream — a stalled tunnel must surface as
     // TimeoutError instead of an eternal pending read().
@@ -2160,7 +1930,7 @@ async function nativeDecompressFromBuffer(compressed: Uint8Array, signal?: Abort
   let result = new Uint8Array(Math.max(estimatedSize, 16 * 1024 * 1024));
   let writeOffset = 0;
 
-  while (true) {
+  for (;;) {
     throwIfAborted(signal);
     const { done, value } = await reader.read();
     if (done) break;
@@ -2201,7 +1971,7 @@ async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuf
         const reader = ds.readable.getReader();
         const chunks: Uint8Array[] = [];
         let totalSize = 0;
-        while (true) {
+        for (;;) {
           throwIfAborted(signal);
           const { done, value } = await reader.read();
           if (done) break;
