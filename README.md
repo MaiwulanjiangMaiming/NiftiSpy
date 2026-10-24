@@ -13,7 +13,7 @@
 
 </div>
 
-Open `.nii`, `.nii.gz`, and `.hdr` volumes directly inside VS Code. The extension is optimized for both local files and VS Code Remote / SSH workflows, with fast preview-first loading, worker-based decoding, slice-on-demand fetches, and optional native acceleration.
+Open NIfTI, NumPy, NRRD, MetaImage, MRC, DICOM and FreeSurfer volumes directly inside VS Code. The extension is optimized for both local files and VS Code Remote / SSH workflows, with fast preview-first loading, worker-based decoding, slice-on-demand fetches, and optional native acceleration.
 
 ## Highlights
 
@@ -36,7 +36,37 @@ Open `.nii`, `.nii.gz`, and `.hdr` volumes directly inside VS Code. The extensio
 - `.nii`
 - `.nii.gz`
 - `.hdr`
+- `.npy`, `.npz` (NumPy arrays and archives, 1D–4D)
+- `.nrrd`, `.nhdr` (raw, gzip, ASCII; attached or detached data)
+- `.mha`, `.mhd` (MetaImage, attached or detached data)
+- `.mrc`, `.mrcs` (MRC / MRC2014, modes 0/1/2/6)
+- `.mgh`, `.mgz` (FreeSurfer, big-endian and gzip)
+- `.dcm`, `.dicom`, `.ima` (uncompressed single-file DICOM, single- or multi-frame)
 - `.zarr` (Zarr v2 format)
+
+## NumPy Support
+
+- **Formats**: `.npy` files (v1–v3 headers), C or Fortran order; `.npz` archives (stored or deflated members)
+- **Dtypes**: uint8/int8/uint16/int16/uint32/int32/float16/float32/float64, 64-bit ints and bools
+- **Layout**: 2D arrays open as an axial slice; 3D/4D arrays map to NIfTI x-fastest voxel order
+- **How to open**: Double-click a `.npy` / `.npz` file; no conversion step or temporary files
+- **Limitations**: complex/structured dtypes are rejected; no write support
+
+## Other Volume Formats
+
+Every non-NIfTI format is parsed in the extension host into the same NIfTI-shaped header the viewer already uses, so caching, LOD, statistics, rendering and registration behave identically.
+
+- **Remote-SSH**: raw layouts (`.mrc`, `.npy`, raw NRRD, MetaImage) are sliced on the remote disk through the local proxy, so scrolling never transfers the whole volume. Large WAN volumes use slice mode; small files stream once through the forwarded proxy.
+- **Compressed / big-endian**: `.npz`, `.mgz`, gzip NRRD, compressed MetaImage and big-endian data are materialized once into a little-endian temporary file, so each slice request is a random read instead of a re-inflation.
+- **Detached headers**: `.nhdr` / `.mhd` resolve their external data file relative to the header and are read directly.
+- **Limitations**: read-only; complex/structured NumPy dtypes and MRC complex/float16 modes are rejected.
+
+## DICOM Support
+
+- **Layouts**: single-frame and multi-frame (enhanced) DICOM, explicit/implicit VR little endian and explicit VR big endian
+- **Metadata**: PixelSpacing, slice spacing/thickness, and rescale slope/intercept are applied to the intensity scale
+- **Remote-SSH**: uncompressed little-endian files are sliced straight from the remote disk; big-endian files are byte-swapped once
+- **Limitations**: compressed transfer syntaxes (JPEG, JPEG-LS, JPEG 2000, RLE, deflated) and DICOM series folders are not supported; export an uncompressed copy or a NIfTI volume for those
 
 ## Zarr Support
 
@@ -94,7 +124,7 @@ The binary is keyed by platform and architecture (`niftispy_native.darwin-arm64.
 
 ## Usage
 
-1. Open a `.nii`, `.nii.gz`, or `.hdr` file.
+1. Open a `.nii`, `.nii.gz`, `.hdr`, or `.npy` file.
 2. The custom viewer opens automatically.
 3. Scroll to change slices.
 4. Use `Ctrl + Scroll` to zoom.

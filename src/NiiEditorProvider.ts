@@ -8,6 +8,9 @@ import { VolumeCache } from './VolumeCache';
 import { downsampleSlice } from './nifti/sliceExtractor';
 import { getNativeBindings } from './nativeBridge';
 import { parseNiiHeaderQuick } from './nifti/headerParser';
+import { findVolumeFormat, VOLUME_EXTENSIONS } from './formats/registry';
+import { removeTempVolumes } from './formats/header';
+import type { ParsedVolume, VolumeFormat } from './formats/types';
 import { isWanRemote, shouldUseSliceMode, SLICE_MODE_MIN_BYTES } from './remoteEnv';
 import { resolveAnalyzePair, isAnalyzeHeaderPath, type AnalyzePair } from './io/analyzePair';
 
@@ -100,6 +103,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private debugStatusBarItem: vscode.StatusBarItem | null = null;
   private nativeFallbackWarned = false;
   private perfChannel: vscode.OutputChannel | null = null;
+  /** Materialized raw volumes (npz/mgz/gzip nrrd/...) per webview. */
+  private parsedTempFiles = new Map<string, string[]>();
   // Remote-SSH fast-path fallback contexts, keyed by webviewId. If the
   // webview cannot fetch the port-forwarded proxy URL (forwarding blocked,
   // CSP, tunnel hiccup), it reports back and we fall back to the chunked
@@ -111,6 +116,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     validationToken: string;
     signal: AbortSignal;
     isGzip: boolean;
+  }>();
+  // Same idea for host-parsed formats: re-read the volume in the host and
+  // push it as cachedVolume when the forwarded proxy URL is unreachable.
+  private parsedRemoteFallbacks = new Map<string, {
+    webview: vscode.Webview;
+    uri: vscode.Uri;
+    format: VolumeFormat;
+    signal: AbortSignal;
   }>();
   // Debug mode: when on, perf reports are written to the OutputChannel AND
   // the panel is auto-revealed. Toggled by clicking the $(bug) status bar item.
@@ -276,6 +289,11 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     this.activeWebviews.clear();
     // Cancel all queued loads
     this.loadQueue.cancel('__all__');
+    // Drop materialized parser scratch volumes
+    for (const [, files] of this.parsedTempFiles) {
+      void removeTempVolumes(files);
+    }
+    this.parsedTempFiles.clear();
     // Close HTTP proxy server
     this.proxy?.stop();
     this.proxy = null;
@@ -312,6 +330,11 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     _token: vscode.CancellationToken
   ): Promise<void> {
     const uri = document.uri;
+    // Any format the host can decode (npy/npz/nrrd/mha/mrc/mgh/...) is
+    // normalized into a NIfTI-shaped header and then flows through the same
+    // cache / stats / LOD / renderer pipeline as .nii.
+    const parsedFormat = findVolumeFormat(uri.fsPath || uri.path);
+    const isParsed = !!parsedFormat;
     const pair = await resolveAnalyzePair(uri);
     const webview = webviewPanel.webview;
     const webviewId = String(this.webviewCounter++);
@@ -332,7 +355,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     let fileUrl: string;
     let entryId: string | null = null;
 
-    if (isRemote) {
+    if (isParsed) {
+      // Host-parsed formats are decoded in the extension host and pushed as
+      // whole-volume voxel data (or served via the proxy in Remote-SSH slice
+      // mode), so no worker fetch is involved.
+      fileUrl = isRemote ? uri.toString() : webview.asWebviewUri(uri).toString();
+    } else if (isRemote) {
       if (!this.proxy) {
         this.proxy = new LocalFileProxy(this.volumeCache);
         await this.proxy.start();
@@ -361,8 +389,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       abortController.abort();
       this.loadQueue.cancel(webviewId);
       this.remoteHttpFallbacks.delete(webviewId);
+      this.parsedRemoteFallbacks.delete(webviewId);
       this.volumeCache.setActive(uri.toString(), null);
       this.activeWebviews.delete(webviewId);
+      const temps = this.parsedTempFiles.get(webviewId);
+      if (temps) {
+        this.parsedTempFiles.delete(webviewId);
+        void removeTempVolumes(temps);
+      }
     });
 
     webview.onDidReceiveMessage(async (msg) => {
@@ -420,15 +454,24 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           // port-forwarded HTTP, then either on-demand slices (large files)
           // or a full fetch (small files). The webview skips the HTTP-preview
           // fallback timer while that message is in flight.
-          isRemoteSsh: !isRemote && isWanRemote(),
-          deferFullVolume: isRemote || shouldUseSliceMode(fileSize),
+          isRemoteSsh: !isParsed && !isRemote && isWanRemote(),
+          deferFullVolume: isParsed ? false : (isRemote || shouldUseSliceMode(fileSize)),
+          skipHttpFallback: isParsed,
+          hostParsed: isParsed,
           fileUrl,
-          directUrl: isRemote ? pair.dataUri.toString() : '',
+          directUrl: isRemote && !isParsed ? pair.dataUri.toString() : '',
           fileName: path.basename(uri.fsPath ?? uri.toString()),
           webviewId,
           fileSize,
           validationToken,
         });
+
+        if (parsedFormat) {
+          await this.loadParsedVolume(
+            webview, webviewId, uri, abortController.signal, parsedFormat, fileSize, validationToken
+          );
+          return;
+        }
 
         if (isAnalyzeHeaderPath(uri.fsPath || uri.path) && !pair.separateImg) {
           vscode.window.showWarningMessage('NiftiSpy: no matching .img next to this .hdr — voxel data was not found.');
@@ -440,6 +483,27 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.startLocalLoad(webview, webviewId, uri, abortController.signal, fileSize, validationToken, pair);
         }
       } else if (msg.type === 'remoteHttpFallback') {
+        // Host-parsed volume: the forwarded proxy URL is unreachable, so read
+        // the file in the host and push it through the normal cachedVolume path.
+        const parsedFb = this.parsedRemoteFallbacks.get(msg.webviewId);
+        if (parsedFb) {
+          this.logPerf(`[parsed] webview fetch failed (${String(msg.reason || 'unknown')}) — reading in host`);
+          try {
+            const { parsed, tempFiles } = await this.parseVolumeUri(parsedFb.uri, parsedFb.format, true);
+            if (tempFiles.length) this.trackParsedTemps(msg.webviewId, tempFiles);
+            if (parsed.rawData && !parsedFb.signal.aborted) {
+              this.publishParsedVolume(
+                parsedFb.webview, parsedFb.uri.toString(), parsed.header, parsed.rawData, parsedFb.signal
+              );
+            }
+          } catch (err: any) {
+            if (parsedFb.signal.aborted) return;
+            const message = err?.message || String(err);
+            parsedFb.webview.postMessage({ type: 'loadError', message });
+            vscode.window.showErrorMessage(`NiftiSpy: cannot open ${path.basename(parsedFb.uri.fsPath || parsedFb.uri.path)} — ${message}`);
+          }
+          return;
+        }
         // The webview could not fetch the port-forwarded proxy URL
         // (forwarding blocked / CSP / tunnel hiccup). Resume the legacy
         // chunked postMessage transfer from the stashed context.
@@ -453,7 +517,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       } else if (msg.type === 'selectImage') {
         const files = await vscode.window.showOpenDialog({
           canSelectMany: false,
-          filters: { 'NIfTI Files': ['nii', 'nii.gz', 'hdr', 'img'] },
+          filters: {
+            'Volumes': ['nii', 'nii.gz', 'hdr', 'img', ...VOLUME_EXTENSIONS.map(ext => ext.slice(1))],
+          },
           title: 'Select Image File',
         });
         if (files && files.length > 0) {
@@ -463,6 +529,22 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const imgFileName = path.basename(imgUri.fsPath ?? imgUri.toString());
           const imgIsGzip = (imgPair.dataUri.fsPath || imgUri.fsPath)?.endsWith('.gz') ?? false;
           const imgWebviewId = msg.webviewId || webviewId;
+          const imgFormat = findVolumeFormat(imgUri.fsPath || imgUri.path);
+
+          if (imgFormat) {
+            webview.postMessage({
+              type: 'newImage',
+              fileUrl: imgIsRemote ? imgUri.toString() : webview.asWebviewUri(imgUri).toString(),
+              fileName: imgFileName,
+              isGzip: false,
+              isRemote: imgIsRemote,
+              hostParsed: true,
+            });
+            await this.loadParsedVolume(
+              webview, imgWebviewId, imgUri, new AbortController().signal, imgFormat, 0, ''
+            );
+            return;
+          }
 
           if (imgIsRemote) {
             if (!this.proxy) {
@@ -2029,6 +2111,324 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         }
       },
     });
+  }
+
+  /**
+   * Host-parsed formats (npy/npz/nrrd/mha/mrc/mgh/...): the parser normalizes
+   * the volume into a NIfTI-shaped header, then the data flows through the
+   * exact same cache / stats / LOD / cachedVolume pipeline as local NIfTI.
+   * Remote hosts stay on the streaming path so only slices cross the tunnel.
+   */
+  private async loadParsedVolume(
+    webview: vscode.Webview,
+    webviewId: string,
+    uri: vscode.Uri,
+    signal: AbortSignal,
+    format: VolumeFormat,
+    fileSize: number,
+    validationToken: string
+  ): Promise<void> {
+    const uriKey = uri.toString();
+    const isRemote = uri.scheme !== 'file';
+
+    if (fileSize <= 0) {
+      try {
+        fileSize = isRemote
+          ? Number((await vscode.workspace.fs.stat(uri)).size)
+          : (await fs.promises.stat(uri.fsPath)).size;
+      } catch {
+        // size is only used to pick a transport strategy
+      }
+    }
+
+    const cached = this.volumeCache.get(uriKey);
+    const wantsSlices = isRemote && isWanRemote() && shouldUseSliceMode(fileSize);
+    if (cached && !wantsSlices) {
+      this.volumeCache.setActive(uriKey, webviewId);
+      webview.postMessage({
+        type: 'cachedVolume',
+        header: cached.header,
+        globalMin: cached.min,
+        globalMax: cached.max,
+        slope: cached.slope,
+        inter: cached.inter,
+        sliceIdx: {
+          axial: Math.floor(cached.header.nz / 2),
+          coronal: Math.floor(cached.header.ny / 2),
+          sagittal: Math.floor(cached.header.nx / 2),
+        },
+        voxelData: cached.voxelData.buffer,
+        voxOffset: cached.voxelData.byteOffset,
+        voxelLength: cached.voxelData.byteLength,
+        datatype: cached.header.datatype,
+      });
+      return;
+    }
+
+    this.volumeCache.setActive(uriKey, webviewId);
+
+    if (isRemote) {
+      this.parsedRemoteFallbacks.set(webviewId, { webview, uri, format, signal });
+      const dispatched = await this.startParsedRemoteLoad(
+        webview, webviewId, uri, format, fileSize, validationToken, signal
+      );
+      if (dispatched) return;
+      this.parsedRemoteFallbacks.delete(webviewId);
+    }
+
+    try {
+      const { parsed, tempFiles } = await this.parseVolumeUri(uri, format, true);
+      if (tempFiles.length) this.trackParsedTemps(webviewId, tempFiles);
+      if (signal.aborted) return;
+      if (!parsed.rawData) throw new Error('parser produced no voxel data');
+      this.publishParsedVolume(webview, uriKey, parsed.header, parsed.rawData, signal);
+    } catch (err: any) {
+      if (signal.aborted) return;
+      const message = err?.message || String(err);
+      webview.postMessage({ type: 'loadError', message });
+      vscode.window.showErrorMessage(
+        `NiftiSpy: cannot open ${path.basename(uri.fsPath || uri.path)} — ${message}`
+      );
+    }
+  }
+
+  /**
+   * Remote path: keep voxel bytes on the remote disk and let the webview read
+   * slices (WAN) or fetch the file once (fast link). Container formats
+   * (npz/mgz/gzip nrrd) are materialized once so a slice request never
+   * re-inflates the whole stream.
+   */
+  private async startParsedRemoteLoad(
+    webview: vscode.Webview,
+    webviewId: string,
+    uri: vscode.Uri,
+    format: VolumeFormat,
+    fileSize: number,
+    validationToken: string,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    try {
+      const { parsed, tempFiles } = await this.parseVolumeUri(uri, format, false);
+      if (tempFiles.length) this.trackParsedTemps(webviewId, tempFiles);
+      if (signal.aborted) return true;
+
+      if (!parsed.dataPath) {
+        // ASCII NRRD has no random-access layout; publish from memory.
+        if (parsed.rawData) {
+          this.publishParsedVolume(webview, uri.toString(), parsed.header, parsed.rawData, signal);
+          return true;
+        }
+        return false;
+      }
+
+      if (!this.proxy) {
+        this.proxy = new LocalFileProxy(this.volumeCache);
+        await this.proxy.start();
+        this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
+      }
+
+      const dataUri = vscode.Uri.file(parsed.dataPath);
+      const proxyUrl = this.proxy.registerFile(dataUri, undefined, parsed.header);
+      const entryId = proxyUrl.split('/').pop()!;
+      // Port-forward the proxy so the local webview can reach the remote disk.
+      const external = await vscode.env.asExternalUri(vscode.Uri.parse(proxyUrl));
+
+      let dataSize = fileSize;
+      try {
+        dataSize = (await fs.promises.stat(parsed.dataPath)).size;
+      } catch {
+        // keep the header-file size
+      }
+
+      const fileName = path.basename(uri.fsPath || uri.path);
+      const sliceMode = isWanRemote() && shouldUseSliceMode(dataSize);
+
+      if (sliceMode) {
+        let preview: Awaited<ReturnType<LocalFileProxy['extractPreviewForWebview']>> = null;
+        try {
+          preview = await this.proxy.extractPreviewForWebview(entryId, signal);
+        } catch (err) {
+          this.logPerf(`[remote-ssh-slice] parsed preview failed (${String(err)}) — dispatching header only`);
+        }
+        if (signal.aborted) return true;
+        const header = preview?.header || parsed.header;
+        return webview.postMessage({
+          type: 'remoteSliceMode',
+          sourceIdentity: `${os.hostname()}|${uri.toString()}`,
+          url: external.toString(),
+          fileName,
+          fileSize: dataSize,
+          validationToken,
+          isGzip: false,
+          hostParsed: true,
+          deferFullVolume: true,
+          header,
+          globalMin: preview?.globalMin ?? 0,
+          globalMax: preview?.globalMax ?? 1,
+          slope: header.scl_slope || 1,
+          inter: header.scl_inter || 0,
+          sliceIdx: preview?.sliceIdx ?? {
+            axial: 0,
+            coronal: Math.floor(header.ny / 2),
+            sagittal: Math.floor(header.nx / 2),
+          },
+          axialSlice: preview?.slices.axial,
+          coronalSlice: preview?.slices.coronal,
+          sagittalSlice: preview?.slices.sagittal,
+          partialPreview: true,
+          perfExtTiming: { isRemoteSSH: true, path: 'remote-parsed-slice' },
+        });
+      }
+
+      return webview.postMessage({
+        type: 'remoteSshHttp',
+        sourceIdentity: `${os.hostname()}|${uri.toString()}`,
+        url: external.toString(),
+        fileName,
+        fileSize: dataSize,
+        validationToken,
+        isGzip: false,
+        hostParsed: true,
+        header: parsed.header,
+        perfExtTiming: { isRemoteSSH: isWanRemote(), path: 'remote-parsed-http' },
+      });
+    } catch (err) {
+      this.logPerf(`[parsed] remote dispatch failed (${String(err)}) — reading in host`);
+      return false;
+    }
+  }
+
+  /**
+   * Parsers read from disk; virtual file systems (vscode-vfs) are materialized
+   * once so the same path-based parsers can run.
+   */
+  private async parseVolumeUri(
+    uri: vscode.Uri,
+    format: VolumeFormat,
+    memory: boolean
+  ): Promise<{ parsed: ParsedVolume; tempFiles: string[] }> {
+    const fsPath = uri.fsPath;
+    // file:// and vscode-remote:// paths both exist on the extension host.
+    if (fsPath && (uri.scheme === 'file' || uri.scheme.startsWith('vscode-remote'))) {
+      try {
+        return { parsed: await format.parse(fsPath, { memory }), tempFiles: [] };
+      } catch (err: any) {
+        if (err?.code !== 'ENOENT') throw err;
+      }
+    }
+    const bytes = new Uint8Array(await vscode.workspace.fs.readFile(uri));
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'niftispy-'));
+    const file = path.join(dir, path.basename(fsPath || uri.path));
+    try {
+      await fs.promises.writeFile(file, bytes);
+      const parsed = await format.parse(file, { memory: true });
+      return { parsed, tempFiles: [file, ...(parsed.tempFiles || [])] };
+    } catch (err) {
+      await removeTempVolumes([file]);
+      throw err;
+    }
+  }
+
+  private trackParsedTemps(webviewId: string, files: string[]): void {
+    const existing = this.parsedTempFiles.get(webviewId);
+    if (existing) existing.push(...files);
+    else this.parsedTempFiles.set(webviewId, [...files]);
+  }
+
+  private publishParsedVolume(
+    webview: vscode.Webview,
+    uriKey: string,
+    header: any,
+    rawData: Uint8Array,
+    signal: AbortSignal
+  ): void {
+    // Only the first 3D volume is rendered (4D time series reuse the same
+    // viewer buffer convention as the NIfTI local path).
+    const totalVoxels = header.nx * header.ny * header.nz;
+    const voxelBytes = totalVoxels * header.bytesPerVoxel;
+    const slope = header.scl_slope || 1;
+    const inter = header.scl_inter || 0;
+
+    // Text headers (NRRD/MetaImage) can end on an unaligned byte. The
+    // webview creates typed-array views at voxOffset, which requires natural
+    // alignment, so compact once when needed.
+    if ((rawData.byteOffset + header.voxOffset) % Math.max(1, header.bytesPerVoxel) !== 0) {
+      const aligned = new Uint8Array(voxelBytes);
+      aligned.set(rawData.subarray(header.voxOffset, header.voxOffset + voxelBytes));
+      rawData = aligned;
+      header.voxOffset = 0;
+    }
+
+    let payload = rawData;
+    let min: number;
+    let max: number;
+
+    if (header.datatype === 64) {
+      // Same Float64 → Float32 downcast as the NIfTI loader: halves the
+      // postMessage payload with no visible quality loss.
+      const src = new Float64Array(rawData.buffer, rawData.byteOffset + header.voxOffset, totalVoxels);
+      const dst = new Float32Array(totalVoxels);
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (let i = 0; i < totalVoxels; i++) {
+        const v = src[i];
+        dst[i] = v;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      if (lo === hi) hi = lo + 1;
+      if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+      min = lo;
+      max = hi;
+      header.datatype = 16;
+      header.bitpix = 32;
+      header.bytesPerVoxel = 4;
+      header.voxOffset = 0;
+      header.volumeBytes = totalVoxels * 4;
+      payload = new Uint8Array(dst.buffer);
+    } else {
+      const stats = this.computeVoxelStats(rawData, header);
+      min = stats.min;
+      max = stats.max;
+    }
+
+    // `bytesPerVoxel` may have changed in the Float64 downcast above.
+    const outBytes = totalVoxels * header.bytesPerVoxel;
+    const voxelOnly = payload.subarray(header.voxOffset, header.voxOffset + outBytes);
+
+    this.volumeCache.set(uriKey, {
+      header,
+      voxelData: voxelOnly,
+      min,
+      max,
+      slope,
+      inter,
+    });
+    this.updateCacheStatusBar();
+
+    webview.postMessage({
+      type: 'cachedVolume',
+      header,
+      voxelData: voxelOnly.buffer,
+      voxOffset: voxelOnly.byteOffset,
+      voxelLength: outBytes,
+      datatype: header.datatype,
+      globalMin: min,
+      globalMax: max,
+      slope,
+      inter,
+      sliceIdx: {
+        axial: Math.floor(header.nz / 2),
+        coronal: Math.floor(header.ny / 2),
+        sagittal: Math.floor(header.nx / 2),
+      },
+    });
+
+    // LOD levels are derived in the background from the same voxel buffer
+    // (no native mmap LOD path here because the source is not a NIfTI file).
+    setTimeout(() => {
+      if (!signal.aborted) this.generateAndSendLOD(webview, header, voxelOnly, signal);
+    }, 500);
   }
 
   private isWebviewActive(webviewId: string): boolean {

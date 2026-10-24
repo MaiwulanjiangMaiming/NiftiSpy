@@ -25,6 +25,15 @@
     "neuroimaging",
     "brain",
     "mri",
+    "numpy",
+    "npy",
+    "npz",
+    "nrrd",
+    "mrc",
+    "mgh",
+    "dicom",
+    "dicom viewer",
+    "medical image viewer",
     "viewer"
   ],
   "homepage": "https://github.com/MaiwulanjiangMaiming/NiftiSpy",
@@ -50,6 +59,45 @@
           },
           {
             "filenamePattern": "*.hdr"
+          },
+          {
+            "filenamePattern": "*.npy"
+          },
+          {
+            "filenamePattern": "*.npz"
+          },
+          {
+            "filenamePattern": "*.nrrd"
+          },
+          {
+            "filenamePattern": "*.nhdr"
+          },
+          {
+            "filenamePattern": "*.mha"
+          },
+          {
+            "filenamePattern": "*.mhd"
+          },
+          {
+            "filenamePattern": "*.mrc"
+          },
+          {
+            "filenamePattern": "*.mrcs"
+          },
+          {
+            "filenamePattern": "*.mgz"
+          },
+          {
+            "filenamePattern": "*.mgh"
+          },
+          {
+            "filenamePattern": "*.dcm"
+          },
+          {
+            "filenamePattern": "*.dicom"
+          },
+          {
+            "filenamePattern": "*.ima"
           }
         ],
         "priority": "default"
@@ -63,6 +111,16 @@
           }
         ],
         "priority": "default"
+      },
+      {
+        "viewType": "niftispy.raw",
+        "displayName": "NiftiSpy (raw + header)",
+        "selector": [
+          {
+            "filenamePattern": "*.raw"
+          }
+        ],
+        "priority": "option"
       }
     ],
     "languages": [
@@ -75,6 +133,43 @@
           ".nii",
           ".nii.gz",
           ".hdr"
+        ],
+        "icon": {
+          "light": "./File-Icons-clean.png",
+          "dark": "./File-Icons-clean.png"
+        }
+      },
+      {
+        "id": "numpy-volume",
+        "aliases": [
+          "NumPy Array"
+        ],
+        "extensions": [
+          ".npy",
+          ".npz"
+        ],
+        "icon": {
+          "light": "./File-Icons-clean.png",
+          "dark": "./File-Icons-clean.png"
+        }
+      },
+      {
+        "id": "volume",
+        "aliases": [
+          "Volume"
+        ],
+        "extensions": [
+          ".nrrd",
+          ".nhdr",
+          ".mha",
+          ".mhd",
+          ".mrc",
+          ".mrcs",
+          ".mgz",
+          ".mgh",
+          ".dcm",
+          ".dicom",
+          ".ima"
         ],
         "icon": {
           "light": "./File-Icons-clean.png",

@@ -42,6 +42,12 @@ interface FileEntry {
   dataCache?: Uint8Array;
   lastAccess?: number;
   headerCache?: any;
+  /**
+   * Header supplied by a host-side format parser (npy/npz/nrrd/...).
+   * The proxy never tries to parse these files as NIfTI; it reuses this
+   * header for /header, /slice, /preview and /lod.
+   */
+  hostHeader?: any;
   previewBinaryCache?: Buffer;
   sliceCache?: Map<string, { data: Buffer; timestamp: number }>;
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
@@ -175,7 +181,7 @@ export class LocalFileProxy {
     this.server = null;
   }
 
-  registerFile(uri: vscode.Uri, dataUri?: vscode.Uri): string {
+  registerFile(uri: vscode.Uri, dataUri?: vscode.Uri, hostHeader?: any): string {
     const id = String(this.idCounter++);
     const data = dataUri || uri;
     let sourceStamp: string | undefined;
@@ -186,6 +192,8 @@ export class LocalFileProxy {
       dataUri: data,
       separateImg: data.toString() !== uri.toString(),
       id,
+      headerCache: hostHeader,
+      hostHeader,
       sliceCache: new Map(),
       lodCache: new Map(),
     });
@@ -258,7 +266,9 @@ export class LocalFileProxy {
     const st = await fs.promises.stat(entry.dataUri.fsPath);
     const stamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
     if (entry.sourceStamp && entry.sourceStamp !== stamp) {
-      entry.dataCache = undefined; entry.headerCache = undefined; entry.previewBinaryCache = undefined;
+      entry.dataCache = undefined;
+      entry.headerCache = entry.hostHeader;
+      entry.previewBinaryCache = undefined;
       entry.gzipScan = undefined; entry.gzipIndex = undefined; entry.unpackPath = undefined; entry.size = st.size;
       entry.sliceCache?.clear(); entry.lodCache?.clear();
     }
@@ -277,6 +287,7 @@ export class LocalFileProxy {
   }
 
   private parseEntryHeader(entry: FileEntry, bytes: Uint8Array): any | null {
+    if (entry.hostHeader) return entry.hostHeader;
     return parseNiiHeaderQuick(bytes, { separateImg: !!entry.separateImg });
   }
 

@@ -5,6 +5,103 @@ import { NiiEditorProvider } from './NiiEditorProvider';
 import { VolumeCache } from './VolumeCache';
 import { ZarrVolumeProvider } from './nifti/volumeProvider';
 
+const HEADER_PREFIX_BYTES = 64 * 1024;
+
+/** Read only the leading text of a .nhdr/.mhd (they are header-only files). */
+async function readHeaderText(uri: vscode.Uri): Promise<string | undefined> {
+  const fsPath = uri.fsPath;
+  if (fsPath && (uri.scheme === 'file' || uri.scheme.startsWith('vscode-remote'))) {
+    try {
+      const handle = await fs.promises.open(fsPath, 'r');
+      try {
+        const buf = Buffer.alloc(HEADER_PREFIX_BYTES);
+        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+        return buf.toString('latin1', 0, bytesRead);
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      // Fall through to the workspace file system.
+    }
+  }
+  try {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    return Buffer.from(bytes.subarray(0, HEADER_PREFIX_BYTES)).toString('latin1');
+  } catch {
+    return undefined;
+  }
+}
+
+function referenceBasename(value: string): string {
+  return value.trim().replace(/^"|"$/g, '').replace(/\\/g, '/').split('/').pop()!.toLowerCase();
+}
+
+function headerReferencesRaw(text: string, rawName: string): boolean {
+  const target = rawName.toLowerCase();
+  const nrrd = /^\s*data\s+file\s*:\s*(.+)$/im.exec(text);
+  if (nrrd && referenceBasename(nrrd[1]) === target) return true;
+  const meta = /^\s*ElementDataFile\s*=\s*(.+)$/im.exec(text);
+  if (meta && meta[1].trim().toUpperCase() !== 'LOCAL' && referenceBasename(meta[1]) === target) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * A `.raw` payload is meaningless without a header. Find a sibling `.nhdr`
+ * or `.mhd` whose `data file` / `ElementDataFile` points at it.
+ */
+async function findRawHeader(uri: vscode.Uri): Promise<vscode.Uri | undefined> {
+  const rawName = path.basename(uri.fsPath || uri.path);
+  if (!/\.raw$/i.test(rawName)) return undefined;
+
+  const dir = uri.with({ path: path.posix.dirname(uri.path) });
+  let entries: [string, vscode.FileType][];
+  try {
+    entries = await vscode.workspace.fs.readDirectory(dir);
+  } catch {
+    return undefined;
+  }
+
+  const candidates = entries
+    .filter(([name, type]) => type === vscode.FileType.File && /\.(nhdr|mhd)$/i.test(name))
+    .map(([name]) => vscode.Uri.joinPath(dir, name));
+  if (!candidates.length) return undefined;
+
+  const rawStem = rawName.toLowerCase().replace(/\.raw$/, '');
+  candidates.sort((a, b) => {
+    const aStem = path.basename(a.path).toLowerCase().replace(/\.(nhdr|mhd)$/, '');
+    const bStem = path.basename(b.path).toLowerCase().replace(/\.(nhdr|mhd)$/, '');
+    return Number(bStem === rawStem) - Number(aStem === rawStem);
+  });
+
+  for (const candidate of candidates) {
+    const text = await readHeaderText(candidate);
+    if (text && headerReferencesRaw(text, rawName)) return candidate;
+  }
+  return undefined;
+}
+
+function rawEditorHtml(title: string, message: string): string {
+  const safeTitle = title.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+  const safeMessage = message.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+  return /* html */`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<style>
+body{background:#1a1a2e;color:#eaeaea;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.card{max-width:620px;padding:32px;text-align:center}
+h1{color:#e94560;font-size:22px;margin:0 0 12px}
+p{line-height:1.6;color:#c8c8d0;font-size:13px;margin:8px 0}
+code{color:#00d9ff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+</style>
+</head>
+<body><div class="card"><h1>${safeTitle}</h1><p>${safeMessage}</p></div></body>
+</html>`;
+}
+
 function isZarrDirectory(uri: vscode.Uri): boolean {
   const fsPath = uri.fsPath;
   if (!fsPath) return false;
@@ -132,6 +229,53 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
 </div>
 </body>
 </html>`;
+        },
+      },
+      {
+        webviewOptions: { retainContextWhenHidden: true },
+        supportsMultipleEditorsPerDocument: false,
+      }
+    )
+  );
+
+  // Register the .raw helper. A raw payload cannot describe itself, so this
+  // editor resolves a sibling .nhdr/.mhd and redirects to the normal viewer.
+  context.subscriptions.push(
+    vscode.window.registerCustomEditorProvider(
+      'niftispy.raw',
+      {
+        async openCustomDocument(uri: vscode.Uri): Promise<vscode.CustomDocument> {
+          return { uri, dispose: () => {} };
+        },
+        async resolveCustomEditor(
+          document: vscode.CustomDocument,
+          webviewPanel: vscode.WebviewPanel,
+        ): Promise<void> {
+          const webview = webviewPanel.webview;
+          webview.options = { enableScripts: false };
+          const rawName = path.basename(document.uri.fsPath || document.uri.path);
+          const header = await findRawHeader(document.uri);
+
+          if (!header) {
+            webview.html = rawEditorHtml(
+              'Raw volume payload',
+              `${rawName} has no companion .nhdr or .mhd header, so its dimensions and data type are unknown. ` +
+              'Create a header next to it, or open the existing header file instead.',
+            );
+            return;
+          }
+
+          const headerName = path.basename(header.fsPath || header.path);
+          webview.html = rawEditorHtml(
+            'Opening volume',
+            `Using header ${headerName} for ${rawName}…`,
+          );
+          try {
+            await vscode.commands.executeCommand('vscode.openWith', header, 'niftispy.nifti');
+            webviewPanel.dispose();
+          } catch (err: any) {
+            webview.html = rawEditorHtml('Cannot open volume', `${headerName}: ${err?.message || err}`);
+          }
         },
       },
       {

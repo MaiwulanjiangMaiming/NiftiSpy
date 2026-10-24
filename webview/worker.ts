@@ -32,6 +32,10 @@ const headCache = new Map<string, { totalSize: number; acceptRanges: boolean }>(
 // Track which volume IDs have already received an early preview
 const earlyPreviewSent = new Set<number>();
 const earlyPreviewHeaders = new Map<number, NiiHeader>();  // cache header from early preview
+// Headers supplied by the extension host for formats that have no NIfTI
+// header in the stream (npy/npz/nrrd/mha/mrc/mgh). The downloaded bytes are
+// pure voxels, i.e. voxOffset 0 from the worker's point of view.
+const hostParsedHeaders = new Map<number, NiiHeader>();
 
 interface CachedSlice {
   data: Float32Array;
@@ -67,7 +71,7 @@ self.onmessage = async (e: MessageEvent) => {
     if (type === 'loadVolume') {
       const { estimatedBps = 0, estimatedRttMs = 0, priority = 'background' } = e.data;
       volumeFetchPriority = priority === 'user' ? 'user' : 'background';
-      await handleLoadVolume(id, url, isGzip, directUrl, estimatedBps, estimatedRttMs);
+      await handleLoadVolume(id, url, isGzip, directUrl, estimatedBps, estimatedRttMs, e.data.preParsedHeader || undefined);
     } else if (type === 'loadVolumeFromData') {
       await handleLoadVolumeFromData(id, e.data);
     } else if (type === 'cancelVolumeLoad') {
@@ -1102,10 +1106,19 @@ function tryEmitEarlyPreview(
   id: number,
   isGzip: boolean,
 ): boolean {
-  if (bufLen < 544) return false;
-  try {
-    const header = parseNiiHeader(buf.buffer as ArrayBuffer, isGzip);
-    if (!header) return false;
+  const hostHeader = hostParsedHeaders.get(id);
+  let header: NiiHeader | null;
+  if (hostHeader) {
+    // The host header carries the real voxOffset into this stream (0 for
+    // materialized containers, the .npy data offset for a streamed .npy).
+    const firstSliceBytes = hostHeader.voxOffset + hostHeader.nx * hostHeader.ny * hostHeader.bytesPerVoxel;
+    if (bufLen < firstSliceBytes) return false;
+    header = hostHeader;
+  } else {
+    if (bufLen < 544) return false;
+    header = parseNiiHeader(buf.buffer as ArrayBuffer, isGzip);
+  }
+  if (!header) return false;
 
     const { nx, ny, voxOffset, bytesPerVoxel, scl_slope, scl_inter, littleEndian, datatype } = header;
     const firstSliceNeeded = voxOffset + nx * ny * bytesPerVoxel;
@@ -1173,9 +1186,6 @@ function tryEmitEarlyPreview(
     earlyPreviewSent.add(id);
     earlyPreviewHeaders.set(id, header);  // cache for processRawVolume
     return true;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -1927,11 +1937,17 @@ async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: Abort
   }
 }
 
-async function handleLoadVolume(id: number, url: string, isGzip: boolean, directFetchUrl?: string, estimatedBps = 0, estimatedRttMs = 0) {
+async function handleLoadVolume(id: number, url: string, isGzip: boolean, directFetchUrl?: string, estimatedBps = 0, estimatedRttMs = 0, preParsedHeader?: NiiHeader) {
   cancelVolumeLoad(id);
   const controller = new AbortController();
   volumeControllers.set(id, controller);
   const signal = controller.signal;
+
+  // Host-parsed formats (npy/npz/nrrd/mha/mrc/mgh): the byte stream contains
+  // no NIfTI header, so header discovery and the proxy's NIfTI-only
+  // /preview-volume endpoint are both inapplicable. The host already sent the
+  // header; we only need the voxel bytes.
+  if (preParsedHeader) hostParsedHeaders.set(id, preParsedHeader);
 
   // For remote files, prefer the direct URL over the localhost proxy.
   // The proxy adds a full round-trip and double-hops every byte through
@@ -1962,7 +1978,7 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
     // The preview goes through the localhost proxy (subsampling
     // server-side) while the full download goes direct to the remote
     // origin — different connections, fully overlapped.
-    const firePreview = (measuredBps: number) => {
+    const firePreview = preParsedHeader ? undefined : (measuredBps: number) => {
       tryFetchPreviewVolume(url, id, signal, measuredBps, isGzip).catch((err: any) => {
         // AbortError is expected when the load is cancelled — swallow it to
         // avoid an unhandled rejection (this promise is intentionally not awaited).
@@ -2036,12 +2052,13 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
     }
 
     // Pass pre-parsed header from early preview to avoid redundant parseNiiHeader call
-    const preParsed = earlyPreviewHeaders.get(id);
+    const preParsed = preParsedHeader || earlyPreviewHeaders.get(id);
     earlyPreviewHeaders.delete(id);
     await processRawVolume(rawData, id, signal, isGzip, preParsed);
   } finally {
     volumeControllers.delete(id);
     earlyPreviewHeaders.delete(id);
+    hostParsedHeaders.delete(id);
   }
 }
 

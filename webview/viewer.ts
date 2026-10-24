@@ -27,6 +27,11 @@ interface VolumeImage {
   lastAccess: number;
   loadPromise?: Promise<void>;
   selected?: boolean;   // user-checked for compare mode (exactly two allowed)
+  /**
+   * NIfTI-shaped header produced by a host-side parser (npy/npz/nrrd/mha/
+   * mrc/mgh). The worker skips NIfTI magic parsing and uses this directly.
+   */
+  preParsedHeader?: NiiHeader;
   // ITK-SNAP-style stored registration: affine mapping world -> this volume's
   // OWN voxel grid (row-major 4x4). The volume data itself is never resampled;
   // compare rendering samples the original data through this transform.
@@ -2256,7 +2261,7 @@ function displayLoadedImage(img: VolumeImage): void {
   setupInteraction();
 }
 
-async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void, directFetchUrl?: string): Promise<any> {
+async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void, directFetchUrl?: string, preParsedHeader?: NiiHeader): Promise<any> {
   const worker = new Worker(await ensureWorkerBlobUrl());
   const requestId = nextStreamRequestId++;
   return new Promise((resolve, reject) => {
@@ -2313,6 +2318,7 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
       url,
       isGzip: gz,
       directUrl: directFetchUrl || '',
+      preParsedHeader: preParsedHeader || null,
       estimatedBps: bandwidthEstimator?.estimatedBps ?? 0,
       estimatedRttMs: bandwidthEstimator?.estimatedRttMs ?? 0,
       priority: volumeLoadReasons.get(loadKey) === 'user' ? 'user' : 'background',
@@ -2457,7 +2463,8 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const result = await loadVolumeViaWorker(loadKey, img.url, (img.name && img.name.endsWith('.gz')) || img.url.endsWith('.gz'), (msg) => {
+        const gz = !img.preParsedHeader && ((img.name && img.name.endsWith('.gz')) || img.url.endsWith('.gz'));
+        const result = await loadVolumeViaWorker(loadKey, img.url, gz, (msg) => {
           if (msg.type === 'preview' && !isLowResPreview && images[activeImageIdx] === img && !img.data) {
             showPartialPreviewFromMessage(msg, { fetchMissingSlices: false });
           }
@@ -2497,7 +2504,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
           if (images[activeImageIdx] === img && msg.type === 'progress') {
             updateProgress(0.5 + msg.value * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
           }
-        }, img.directUrl);
+        }, img.directUrl, img.preParsedHeader);
         img.header = result.header;
         img.data = result.voxelData;
         img.min = result.globalMin;
@@ -5666,6 +5673,15 @@ window.addEventListener('message', async (e) => {
     return;
   }
 
+  if (msg.type === 'loadError') {
+    // Host-parsed formats (e.g. .npy) report parse/read failures directly;
+    // there is no HTTP fallback that could recover them.
+    if (directPreviewTimer) { window.clearTimeout(directPreviewTimer); directPreviewTimer = null; }
+    loading.style.display = 'flex';
+    updateProgress(0, 'Error: ' + (msg.message || 'Failed to load file'));
+    return;
+  }
+
   if (msg.type === 'remoteSshHttp') {
     // Remote-SSH small-file path: the extension host registered the file in
     // the localhost HTTP proxy and port-forwarded it via asExternalUri. The
@@ -5677,9 +5693,13 @@ window.addEventListener('message', async (e) => {
     fileUrl = msg.url;
     directUrl = ''; // force the Worker to fetch the proxy URL
     fileName = msg.fileName || fileName;
-    isGzip = !!msg.isGzip;
+    isGzip = false;
     isRemoteSource = true;
     deferFullVolume = false;
+
+    // Host-parsed formats (npy/npz/nrrd/mha/mrc/mgh) ship their NIfTI-shaped
+    // header here; the Worker must not try to parse the bytes as NIfTI.
+    if (msg.hostParsed) msg.preParsedHeader = msg.header;
 
     if (msg.validationToken && fileName) {
       broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0, identity: `${msg.sourceIdentity || msg.url || fileUrl}|${msg.validationToken || ''}` });
@@ -5705,6 +5725,7 @@ window.addEventListener('message', async (e) => {
         colormap: colormap,
         state: 'loading',
         lastAccess: Date.now(),
+        preParsedHeader: msg.preParsedHeader || undefined,
       });
       activeImageIdx = 0;
     } else {
@@ -5712,6 +5733,7 @@ window.addEventListener('message', async (e) => {
       images[idx].url = fileUrl;
       images[idx].directUrl = '';
       images[idx].name = fileName;
+      images[idx].preParsedHeader = msg.preParsedHeader || undefined;
       activeImageIdx = idx;
     }
     publishPerfMonitor();
@@ -5745,10 +5767,13 @@ window.addEventListener('message', async (e) => {
     fileUrl = msg.url;
     directUrl = '';
     fileName = msg.fileName || fileName;
-    isGzip = !!msg.isGzip;
+    isGzip = false;
     isRemoteSource = true;
     deferFullVolume = true;
     if (msg.fileSize) currentFileSize = msg.fileSize;
+    // Slice mode also supports host-parsed formats: slices come from the
+    // remote /slice endpoint and the header is already NIfTI-shaped.
+    if (msg.hostParsed) msg.preParsedHeader = msg.header;
 
     if (msg.validationToken && fileName) {
       broadcastToSliceWorkers({ type: 'setFileHash', fileName, fileSize: msg.fileSize || 0, identity: `${msg.sourceIdentity || msg.url || fileUrl}|${msg.validationToken || ''}` });
@@ -5864,7 +5889,7 @@ window.addEventListener('message', async (e) => {
   injectPreconnectHint(targetUrl);
   void warmupConnection(targetUrl);
   fileName = msg.fileName;
-  isGzip = fileName.endsWith('.gz');
+  isGzip = !msg.hostParsed && fileName.endsWith('.gz');
   isRemoteSource = !!msg.isRemote;
   deferFullVolume = !!msg.deferFullVolume;
   currentFileSize = msg.fileSize || currentFileSize;
@@ -5919,6 +5944,11 @@ window.addEventListener('message', async (e) => {
     // fast path ('remoteSshHttp' follows) or, if forwarding failed, the
     // legacy chunked/cached postMessage path. Either message drives the
     // UI from here — no HTTP-preview fallback timer.
+    loadingText.textContent = 'Preparing volume stream...';
+    updateProgress(0.01, 'Preparing volume stream...');
+  } else if (msg.skipHttpFallback) {
+    // Host-parsed formats (e.g. .npy) deliver a cachedVolume directly. An
+    // HTTP preview fallback would re-download and misparse the file.
     loadingText.textContent = 'Preparing volume stream...';
     updateProgress(0.01, 'Preparing volume stream...');
   } else {
@@ -6088,6 +6118,7 @@ function showPartialPreviewFromMessage(msg: any, opts?: { fetchMissingSlices?: b
     img.state = 'preview';
     img.url = fileUrl;
     img.directUrl = directUrl;
+    if (msg.preParsedHeader) img.preParsedHeader = msg.preParsedHeader;
     img.preview = {
       axial,
       coronal: currentSlices.coronal?.data || coronal,
@@ -7012,6 +7043,7 @@ function setPrimaryImageFromDirectPreview(msg: any, axial: Float32Array, coronal
     preview: { axial, coronal, sagittal },
     state: 'preview',
     lastAccess: Date.now(),
+    preParsedHeader: msg.preParsedHeader || undefined,
   });
   activeImageIdx = 0;
   publishPerfMonitor();
@@ -7472,7 +7504,7 @@ async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: b
   injectPreconnectHint(targetUrl);
   void warmupConnection(targetUrl);
   fileName = name;
-  isGzip = name.endsWith('.gz');
+  isGzip = !!_gz;
   isRemoteSource = !!_remote;
   fullVolumeLoaded = false;
 
