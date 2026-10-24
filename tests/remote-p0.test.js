@@ -51,6 +51,41 @@ test('all local axes preserve endian/scaling/4D values and sample on the server'
   }
 });
 
+test('typed slice path matches DataView for float32 volumes', async t => {
+  const p = await productionRuntime();
+  const nx = 9, ny = 11, nz = 13;
+  const raw = Buffer.alloc(352 + nx * ny * nz * 4);
+  raw.writeInt32LE(348, 0);
+  raw.writeInt16LE(3, 40);
+  [nx, ny, nz].forEach((v, i) => raw.writeInt16LE(v, 42 + i * 2));
+  raw.writeInt16LE(16, 70);
+  raw.writeInt16LE(32, 72);
+  [1, 1, 1, 1].forEach((v, i) => raw.writeFloatLE(v, 76 + i * 4));
+  raw.writeFloatLE(352, 108);
+  raw.writeFloatLE(2, 112);
+  raw.writeFloatLE(10, 116);
+  raw.write('n+1\0', 344);
+  for (let z = 0; z < nz; z++) for (let y = 0; y < ny; y++) for (let x = 0; x < nx; x++) {
+    raw.writeFloatLE(x + y * 0.25 + z * 0.5, 352 + 4 * ((z * ny + y) * nx + x));
+  }
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'niftispy-float32-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'float32.nii');
+  fs.writeFileSync(file, raw);
+  const header = p.parseNiiHeaderQuick(raw);
+
+  for (const axis of ['axial', 'coronal', 'sagittal']) for (const factor of [1, 4]) {
+    const actual = await p.extractLocalSlice(file, header, axis, 5, 0, factor);
+    const expected = p.sampleSlice(
+      p.extractSingleSlice(raw, header, axis, 5),
+      axis === 'sagittal' ? header.ny : header.nx,
+      axis === 'axial' ? header.ny : header.nz,
+      factor,
+    );
+    assert.deepEqual(actual, expected, `${axis} f${factor}`);
+  }
+});
+
 test('seekable cache is atomic, single-flight, and invalidated by same-size source rewrites', async t => {
   const p = await productionRuntime(), f = setup(t);
   let decoded = 0;

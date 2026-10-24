@@ -53,6 +53,24 @@ export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any):
   return slice;
 }
 
+/** Little-endian typed view over the scratch buffer, or null for DataView. */
+function leTypedView(scratch: Buffer, bytes: number, header: any): any | null {
+  if (!header.littleEndian) return null;
+  const bpv = Math.max(1, header.bitpix / 8);
+  if (scratch.byteOffset % bpv !== 0) return null;
+  switch (header.datatype) {
+    case 2: return scratch;
+    case 256: return new Int8Array(scratch.buffer, scratch.byteOffset, bytes);
+    case 4: return new Int16Array(scratch.buffer, scratch.byteOffset, bytes / 2);
+    case 512: return new Uint16Array(scratch.buffer, scratch.byteOffset, bytes / 2);
+    case 8: return new Int32Array(scratch.buffer, scratch.byteOffset, bytes / 4);
+    case 768: return new Uint32Array(scratch.buffer, scratch.byteOffset, bytes / 4);
+    case 16: return new Float32Array(scratch.buffer, scratch.byteOffset, bytes / 4);
+    case 64: return new Float64Array(scratch.buffer, scratch.byteOffset, bytes / 8);
+    default: return null;
+  }
+}
+
 /** A single file handle and an 8 MiB scratch budget, independent of volume depth. */
 export async function extractLocalSlice(
   fsPath: string, header: any, axis: string, idx: number, timeIdx = 0, factor = 1,
@@ -67,6 +85,8 @@ export async function extractLocalSlice(
   const w = Math.max(1, Math.floor(width / f)), h = Math.max(1, Math.floor(height / f));
   const out = new Float32Array(w * h);
   const bpv = Math.max(1, header.bitpix / 8), rowBytes = nx * bpv;
+  const slope = header.scl_slope || 1;
+  const inter = header.scl_inter || 0;
   const base = voxOffset + timepointByteOffset(header, timeIdx);
   const fd = await fs.promises.open(fsPath, 'r');
   const scratch = Buffer.allocUnsafe(Math.min(8 * 1024 * 1024, axis === 'sagittal' ? rowBytes * ny : rowBytes));
@@ -90,7 +110,13 @@ export async function extractLocalSlice(
           const count = Math.min(w - first, Math.max(1, Math.floor(scratch.length / (f * bpv))));
           const bytes = ((count - 1) * f + 1) * bpv;
           const view = await read(base + ((z * ny + y) * nx + first * f) * bpv, bytes);
-          for (let x = 0; x < count; x++) out[oy * w + first + x] = decodeVoxel(scratch, x * f * bpv, header, view);
+          const typed = leTypedView(scratch, bytes, header);
+          for (let x = 0; x < count; x++) {
+            const i = x * f;
+            out[oy * w + first + x] = typed
+              ? typed[i] * slope + inter
+              : decodeVoxel(scratch, i * bpv, header, view);
+          }
           first += count;
         }
       } else {
@@ -102,12 +128,20 @@ export async function extractLocalSlice(
             // Extremely wide data: pread the selected voxel instead of a row.
             for (let y = firstY; y < firstY + rows; y++) if (y % f === 0 && y / f < w) {
               const view = await read(base + ((oy * f * ny + y) * nx + idx) * bpv, bpv);
-              out[oy * w + y / f] = decodeVoxel(scratch, 0, header, view);
+              const typed = leTypedView(scratch, bpv, header);
+              out[oy * w + y / f] = typed
+                ? typed[0] * slope + inter
+                : decodeVoxel(scratch, 0, header, view);
             }
           } else {
-            const view = await read(base + (oy * f * ny + firstY) * rowBytes, rows * rowBytes);
+            const bytes = rows * rowBytes;
+            const view = await read(base + (oy * f * ny + firstY) * rowBytes, bytes);
+            const typed = leTypedView(scratch, bytes, header);
             for (let y = firstY; y < firstY + rows; y++) if (y % f === 0 && y / f < w) {
-              out[oy * w + y / f] = decodeVoxel(scratch, ((y - firstY) * nx + idx) * bpv, header, view);
+              const i = (y - firstY) * nx + idx;
+              out[oy * w + y / f] = typed
+                ? typed[i] * slope + inter
+                : decodeVoxel(scratch, i * bpv, header, view);
             }
           }
         }
