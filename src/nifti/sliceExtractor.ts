@@ -1,5 +1,4 @@
 import * as fs from 'fs';
-import { readLocalFilePartial } from '../io/fileReader';
 import { timepointByteOffset } from './headerParser';
 
 export function decodeVoxel(bytes: Uint8Array, offset: number, header: any, view?: DataView): number {

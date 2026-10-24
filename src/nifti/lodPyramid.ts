@@ -1,4 +1,4 @@
-import { VolumeProvider, VolumeInfo, ChunkKey } from './volumeProvider';
+import { VolumeProvider } from './volumeProvider';
 
 export type LODLevel = 0 | 1 | 2;
 

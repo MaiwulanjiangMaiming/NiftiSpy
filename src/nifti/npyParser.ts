@@ -105,7 +105,6 @@ export function npyHeaderFromLayout(layout: NpyLayout, voxOffset: number): any {
   const datatype = layout.datatype === 0
     ? (layout.kind === 'f' && layout.bytes === 2 ? 16 : 64)
     : layout.datatype;
-  const bytes = layout.datatype === 0 ? (datatype === 16 ? 4 : 8) : layout.bytes;
   return makeNiftiHeader({
     nx, ny, nz, nt, datatype, voxOffset,
     descrip: `NumPy ${layout.descr} (${layout.shape.join('×')})${layout.fortran ? ' Fortran' : ''}`,

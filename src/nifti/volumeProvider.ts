@@ -176,7 +176,6 @@ export abstract class VolumeProvider {
 
   async extractSlice(axis: 'axial' | 'coronal' | 'sagittal', sliceIndex: number): Promise<Float32Array> {
     if (!this.info) return new Float32Array(0);
-    const { nx, ny, nz, scl_slope, scl_inter } = this.info;
     const chunkKeys = this.getChunksForSlice(axis, sliceIndex, 0);
 
     // Load all needed chunks
@@ -545,7 +544,6 @@ export class ZarrVolumeProvider extends VolumeProvider {
           const lx = x - xc * cxSize;
 
           // Actual Zarr chunk dimensions
-          const actualCz = Math.min(czSize, nz - zc * czSize);
           const actualCy = Math.min(cySize, ny - yc * cySize);
           const actualCx = Math.min(cxSize, nx - xc * cxSize);
 
@@ -606,7 +604,6 @@ export class ZarrVolumeProvider extends VolumeProvider {
 
     if (this.isHttp) {
       try {
-        const { readHttpPartial } = await import('../io/fileReader');
         // For metadata, we just need the whole file
         const data = await this.readHttpFile(fullPath);
         return new TextDecoder().decode(data);
@@ -695,8 +692,7 @@ export class ZarrVolumeProvider extends VolumeProvider {
 
       // Try native blosc decompression via fflate or fallback
       // Since we don't have a blosc library, we'll try a simple approach:
-      // Blosc can use lz4, snappy, zlib internally
-      const codecByte = data[2]; // flags byte contains codec info
+      // Blosc can use lz4, snappy, zlib internally.
       // For now, we'll use a basic approach: try to decompress with zlib
       // if the blosc chunk uses zlib internally
       try {
@@ -725,10 +721,8 @@ export class ZarrVolumeProvider extends VolumeProvider {
 
     if (id === 'lz4') {
       // LZ4 block format: we need an LZ4 decompressor
-      // Use fflate which is already a dependency, but it doesn't support LZ4
-      // Fall back to a basic implementation
+      // fflate does not support LZ4; try zlib-compatible decompression.
       try {
-        const fflate = await import('fflate');
         // fflate doesn't support LZ4, so we'll try zlib-compatible decompression
         const zlib = await import('zlib');
         return new Promise((resolve, reject) => {
