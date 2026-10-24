@@ -2000,10 +2000,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       const skipCachedVolume = isRemote && cachedBytes >= SLICE_MODE_MIN_BYTES;
       if (!skipCachedVolume) {
         this.volumeCache.setActive(uriKey, webviewId);
-        const voxelBuffer = cached.voxelData.buffer.slice(
-          cached.voxelData.byteOffset,
-          cached.voxelData.byteOffset + cached.voxelData.byteLength
-        );
         webview.postMessage({
           type: 'cachedVolume',
           header: cached.header,
@@ -2016,7 +2012,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             coronal: Math.floor(cached.header.ny / 2),
             sagittal: Math.floor(cached.header.nx / 2),
           },
-          voxelData: voxelBuffer,
+          // Pass the backing buffer + offsets instead of copying the volume.
+          voxelData: cached.voxelData.buffer,
+          voxOffset: cached.header.voxOffset,
+          voxelLength: cached.voxelData.byteLength,
           datatype: cached.header.datatype,
         });
         return;
@@ -2116,10 +2115,13 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           if (!rawData || !header || signal.aborted) return;
 
           const voxOffset = header.voxOffset;
-          const n = header.nx * header.ny * header.nz;
+          const n = header.nx * header.ny * header.nz * Math.max(1, header.nt || 1);
           const elemSize = header.bytesPerVoxel;
           const voxelOnly = rawData.slice(voxOffset, voxOffset + n * elemSize);
           const { min, max } = this.computeVoxelStats(rawData, header);
+          // The compacted copy starts at byte 0; keep the cached header and
+          // the published payload consistent for later cache hits.
+          header.voxOffset = 0;
 
           this.volumeCache.set(uriKey, {
             header,
@@ -2130,12 +2132,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           });
           this.updateCacheStatusBar();
 
-          const voxelBuffer = voxelOnly.buffer.slice(voxelOnly.byteOffset, voxelOnly.byteOffset + voxelOnly.byteLength);
-
           webview.postMessage({
             type: 'cachedVolume',
             header,
-            voxelData: voxelBuffer,
+            voxelData: voxelOnly.buffer,
+            voxOffset: 0,
+            voxelLength: voxelOnly.byteLength,
             datatype: header.datatype,
             globalMin: min,
             globalMax: max,
