@@ -64,14 +64,14 @@ async function findRawHeader(uri: vscode.Uri): Promise<vscode.Uri | undefined> {
   }
 
   const candidates = entries
-    .filter(([name, type]) => type === vscode.FileType.File && /\.(nhdr|mhd)$/i.test(name))
+    .filter(([name, type]) => type === vscode.FileType.File && /\.(nhdr|mhd|nrrd|mha)$/i.test(name))
     .map(([name]) => vscode.Uri.joinPath(dir, name));
   if (!candidates.length) return undefined;
 
   const rawStem = rawName.toLowerCase().replace(/\.raw$/, '');
   candidates.sort((a, b) => {
-    const aStem = path.basename(a.path).toLowerCase().replace(/\.(nhdr|mhd)$/, '');
-    const bStem = path.basename(b.path).toLowerCase().replace(/\.(nhdr|mhd)$/, '');
+    const aStem = path.basename(a.path).toLowerCase().replace(/\.(nhdr|mhd|nrrd|mha)$/, '');
+    const bStem = path.basename(b.path).toLowerCase().replace(/\.(nhdr|mhd|nrrd|mha)$/, '');
     return Number(bStem === rawStem) - Number(aStem === rawStem);
   });
 
@@ -260,7 +260,7 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
           if (!header) {
             webview.html = rawEditorHtml(
               'Raw volume payload',
-              `${rawName} has no companion .nhdr or .mhd header, so its dimensions and data type are unknown. ` +
+              `${rawName} has no companion .nhdr, .mhd, .nrrd or .mha header that references it, so its dimensions and data type are unknown. ` +
               'Create a header next to it, or open the existing header file instead.',
             );
             return;
