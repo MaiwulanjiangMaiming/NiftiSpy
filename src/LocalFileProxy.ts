@@ -79,6 +79,10 @@ interface PrioritizedRequest {
   execute: () => Promise<void>;
 }
 
+/** Per-entry slice cache bounds (server-side L2 behind the client cache). */
+const MAX_SLICE_CACHE_ENTRIES = 64;
+const MAX_SLICE_CACHE_BYTES = 64 * 1024 * 1024;
+
 const REQUEST_PRIORITY = {
   header: 100,
   preview: 90,
@@ -1657,6 +1661,20 @@ export class LocalFileProxy {
     return headers;
   }
 
+  private trimSliceCache(entry: FileEntry): void {
+    const cache = entry.sliceCache;
+    if (!cache) return;
+    let bytes = 0;
+    for (const value of cache.values()) bytes += value.data.length;
+    while (cache.size > MAX_SLICE_CACHE_ENTRIES || bytes > MAX_SLICE_CACHE_BYTES) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      const value = cache.get(oldest);
+      cache.delete(oldest);
+      if (value) bytes -= value.data.length;
+    }
+  }
+
   /** Raw slices only for little-endian 8/16-bit data; others stay Float32. */
   private rawSliceMeta(header: any): RawSliceMeta | null {
     if (!header || !header.littleEndian) return null;
@@ -1693,6 +1711,7 @@ export class LocalFileProxy {
         if (!sampled && factor > 1) slice = sampleSlice(slice, axis === 'sagittal' ? h.ny : h.nx, axis === 'axial' ? h.ny : h.nz, factor);
         const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
         entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
+        this.trimSliceCache(entry);
         compressResponse(buf, req, res, 'application/octet-stream', this.sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk' : 'source'));
       };
 
@@ -1701,6 +1720,7 @@ export class LocalFileProxy {
         const h = entry.headerCache;
         const buf = Buffer.from(slice.data.buffer, slice.data.byteOffset, slice.data.byteLength);
         entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now(), raw });
+        this.trimSliceCache(entry);
         compressResponse(buf, req, res, 'application/octet-stream',
           this.sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk-raw' : 'source-raw', raw));
       };
