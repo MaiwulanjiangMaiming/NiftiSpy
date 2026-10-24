@@ -162,6 +162,19 @@ test('SSH forwarded localhost slices expose dimensions, compress losslessly, and
   assert.equal(p.shouldCompress({ headers: { 'accept-encoding': 'gzip;q=0', host: 'localhost' } }), false);
 });
 
+test('proxy slice cache stays bounded during long scrolling', async t => {
+  const p = await productionRuntime(), f = setup(t);
+  const proxy = new p.LocalFileProxy(); await proxy.start(); t.after(() => proxy.stop());
+  const url = proxy.registerFile({ scheme: 'file', fsPath: f.file, toString: () => `file://${f.file}` });
+  for (let i = 0; i < 100; i++) {
+    const response = await fetch(url.replace('/file/', '/slice/') + `/axial/${i % 32}?factor=1`);
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+  }
+  const entry = proxy.getEntry(url.split('/').pop());
+  assert.ok(entry.sliceCache.size <= 64, `slice cache has ${entry.sliceCache.size} entries`);
+});
+
 test('proxy routes require the session capability token and restrict CORS', async t => {
   const p = await productionRuntime(), f = setup(t);
   const proxy = new p.LocalFileProxy(); await proxy.start(); t.after(() => proxy.stop());
@@ -273,6 +286,10 @@ test('one cancelled consumer does not abort another consumer of the shared disk 
   const p = await productionRuntime(), f = setup(t, fixture({ nx: 64, ny: 64, nz: 64 }));
   const ac = new AbortController();
   const first = p.unpackGzipToCache(f.gz, { directory: f.cache, signal: ac.signal, onChunk: () => ac.abort() });
+  // Let the first caller win the job-creation race so its onChunk is wired
+  // into the shared build; otherwise the second caller can create the build
+  // without the abort hook and the first promise fulfills.
+  await new Promise(resolve => setImmediate(resolve));
   const second = p.unpackGzipToCache(f.gz, { directory: f.cache });
   const [cancelled, completed] = await Promise.allSettled([first, second]);
   assert.equal(cancelled.status, 'rejected'); assert.equal(cancelled.reason.name, 'AbortError');
