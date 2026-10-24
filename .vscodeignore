@@ -67,3 +67,6 @@ native-wasm/src/**
 File-Icons.png
 tests/**
 benchmarks/**
+*.vsix
+fbp_t1.npy
+package-lock.json

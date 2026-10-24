@@ -121,7 +121,7 @@ Benchmark on a 342MB compressed / 465MB decompressed MRI volume (Apple Silicon, 
 | libdeflate single-core (v2.1.4) | ~830 ms | ~560 MB/s | 1.4× |
 | **rusty-rapidgzip multi-core (v2.2.0)** | **~300 ms** | **~1550 MB/s** | **3.8×** |
 
-The binary is keyed by platform and architecture (`niftispy_native.darwin-arm64.node`, `niftispy_native.linux-x64-gnu.node`, `niftispy_native.win32-x64-msvc.node`) and selected automatically at runtime. Falls back to the legacy wasm-pack build when a platform binary is absent. Byte-for-byte verified against the zlib reference.
+The binary is keyed by platform and architecture (`niftispy_native.darwin-arm64.node`, `niftispy_native.linux-x64-gnu.node`, `niftispy_native.win32-x64-msvc.node`) and selected automatically at runtime. Platforms without a bundled binary use the JavaScript path. Byte-for-byte verified against the zlib reference.
 
 ## Usage
 
