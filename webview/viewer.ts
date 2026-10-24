@@ -1,5 +1,7 @@
 import { NiiHeader, DATATYPE_NAMES, parseNiiHeader } from './nii-parser';
 import { errorMessage, isAbortError } from '../src/errors';
+import type { Axis, TypedArray, VolumeImage } from './viewer/types';
+import { RegistrationController } from './viewer/registration';
 import { WebGPURenderer } from './webgpuRenderer';
 import { WebGLRenderer } from './viewer/webglRenderer';
 import { COLORMAPS } from './viewer/colormaps';
@@ -27,38 +29,6 @@ interface VsCodeApi {
 declare function acquireVsCodeApi(): VsCodeApi;
 const vscode = acquireVsCodeApi();
 
-interface VolumeImage {
-  header: NiiHeader;
-  data: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | null;
-  min: number;
-  max: number;
-  name: string;
-  url: string;
-  directUrl: string;  // Original remote URL for direct fetch (bypasses proxy)
-  slope: number;
-  inter: number;
-  colormap: string;
-  preview?: {
-    axial: Float32Array;
-    coronal: Float32Array;
-    sagittal: Float32Array;
-  };
-  state: 'preview' | 'loading' | 'ready' | 'error';
-  lastAccess: number;
-  loadPromise?: Promise<void>;
-  selected?: boolean;   // user-checked for compare mode (exactly two allowed)
-  /**
-   * NIfTI-shaped header produced by a host-side parser (npy/npz/nrrd/mha/
-   * mrc/mgh). The worker skips NIfTI magic parsing and uses this directly.
-   */
-  preParsedHeader?: NiiHeader;
-  // ITK-SNAP-style stored registration: affine mapping world -> this volume's
-  // OWN voxel grid (row-major 4x4). The volume data itself is never resampled;
-  // compare rendering samples the original data through this transform.
-  align?: { m: number[]; ref: string };
-}
-
-type Axis = 'axial' | 'coronal' | 'sagittal';
 
 interface SliceFrame {
   data: Float32Array;
@@ -84,7 +54,6 @@ interface PerformanceProfile {
 }
 
 type RenderBackend = 'webgpu' | 'webgl3d' | 'webgl2d' | 'canvas2d';
-type TypedArray = Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
 
 interface NiftiWindowGlobals {
   WORKER_URL?: string;
@@ -188,53 +157,6 @@ interface LodDataMessage {
   sagittalW?: number;
   sagittalH?: number;
 }
-
-interface RegProgressMessage { phase?: string; pct?: number; }
-
-interface RegResultMessage {
-  alignM?: number;
-  cost?: number;
-  costMode?: string;
-  durationMs?: number;
-  nx: number; ny: number; nz: number;
-  dx: number; dy: number; dz: number;
-  orientation?: NiiHeader['orientation'];
-  srow_x: number[];
-  srow_y: number[];
-  srow_z: number[];
-  tplData: ArrayBuffer;
-  tplMax: number;
-  tplMin: number;
-  tplName: string;
-}
-
-interface RegLaunchOptions {
-  mode: string;
-  name?: string;
-  tplName?: string;
-  bytes?: number;
-  moving?: {
-    data: ArrayBuffer;
-    datatype: number;
-    littleEndian: boolean;
-    slope: number;
-    inter: number;
-    dims: number[];
-    srow_x: number[];
-    srow_y: number[];
-    srow_z: number[];
-  };
-  template?: Uint8Array;
-  templateVolume?: {
-    data: ArrayBuffer;
-    dims: number[];
-    srow_x: number[];
-    srow_y: number[];
-    srow_z: number[];
-  };
-}
-
-interface RegInitMessage extends RegLaunchOptions { type: string; }
 
 const DEBUG = typeof window !== 'undefined' && typeof URLSearchParams !== 'undefined' && new URLSearchParams(window.location.search).has('debug');
 
@@ -4081,280 +4003,29 @@ let chunkedGeneration = 0;
 // volume data is never resampled or modified).
 // ─────────────────────────────────────────────────────────────────────────
 
-let regWorker: Worker | null = null;
-let regBusy = false;
-// Which flow produced the running registration: 'register' aligns the active
-// image to an MNI/custom template; 'align' aligns one compared image onto the
-// other (chosen reference). Indices captured at launch survive user switching.
-let regFlow: 'register' | 'align' = 'register';
-let regSourceIdx = -1;   // image the transform will be attached to (moving)
-let regRefIdx = -1;      // reference image index (align flow only)
-
-async function ensureRegWorkerUrl(): Promise<string> {
-  if (win.__NII_REG_WORKER_BLOB_URL__) return win.__NII_REG_WORKER_BLOB_URL__!;
-  const resp = await fetch(win.REG_WORKER_URL!);
-  if (!resp.ok) throw new Error(`Reg worker fetch failed: ${resp.status}`);
-  const src = await resp.text();
-  const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-  win.__NII_REG_WORKER_BLOB_URL__ = url;
-  return url;
-}
-
-function setRegButtonsEnabled(enabled: boolean): void {
-  for (const id of ['btn-reg-mni', 'btn-reg-custom', 'btn-align'] as const) {
-    const b = document.getElementById(id) as HTMLButtonElement | null;
-    if (b) b.disabled = !enabled;
-  }
-}
-
-/** kind 'idle' resets the box to neutral text; 'busy' shows the progress track. */
-function showRegStatus(kind: 'busy' | 'ok' | 'fail' | 'idle', text: string, pct?: number): void {
-  const box = document.getElementById('reg-status');
-  const txt = document.getElementById('reg-status-text');
-  const fill = document.getElementById('reg-fill');
-  if (!box || !txt || !fill) return;
-  box.classList.remove('reg-hidden', 'busy', 'ok', 'fail');
-  txt.textContent = text;
-  if (kind === 'busy') {
-    box.classList.add('busy');
-    fill.style.width = `${Math.max(0, Math.min(100, Math.round((pct ?? 0) * 100)))}%`;
-  } else if (kind !== 'idle') {
-    box.classList.add(kind);
-    fill.style.width = kind === 'ok' ? '100%' : '0%';
-  }
-  setRegButtonsEnabled(kind !== 'busy');
-  const cancelBtn = document.getElementById('btn-reg-cancel') as HTMLButtonElement | null;
-  if (cancelBtn) cancelBtn.style.display = kind === 'busy' ? 'inline-block' : 'none';
-}
-
-function terminateRegWorker(): void {
-  if (regWorker) { regWorker.terminate(); regWorker = null; }
-  regBusy = false;
-}
-
-function startRegistration(mode: 'mni' | 'custom'): void {
-  if (regBusy) return;
-  void (async () => {
-    const ok = await ensureFullVolumeForTool();
-    if (!ok) {
-      showRegStatus('fail', 'Could not load the full volume — registration needs all voxels.');
-      return;
-    }
-    if (!header || !volumeData || !fullVolumeLoaded) {
-      showRegStatus('fail', 'Load the full volume first — registration needs all voxels.');
-      return;
-    }
-    regBusy = true;
-    regFlow = 'register';
-    regSourceIdx = activeImageIdx;
-    regRefIdx = -1;
-    showRegStatus('busy',
-      mode === 'mni' ? 'Resolving MNI template…' : 'Pick a template volume…', 0);
-    vscode.postMessage({ type: 'getTemplate', mode });
-  })();
-}
-
-async function cancelRegistration(): Promise<void> {
-  if (!regBusy) return;
-  terminateRegWorker();
-  showRegStatus('idle', 'Registration cancelled.');
-}
-
-function handleRegProgress(d: RegProgressMessage): void {
-  if (!regBusy) return;
-  showRegStatus('busy', d.phase ? `${d.phase}… ${Math.round((d.pct ?? 0) * 100)}%` : 'Registering…', d.pct);
-}
-
-function handleRegFailure(message: string, cancelled: boolean): void {
-  terminateRegWorker();
-  if (cancelled) showRegStatus('idle', 'Registration cancelled.');
-  else showRegStatus('fail', `Registration failed: ${message}`);
-  console.error('[NiftiSpy] Registration:', message);
-}
-
-async function launchRegWorker(m: RegLaunchOptions): Promise<void> {
-  try {
-    showRegStatus('busy', `Registering to ${m.name}…`, 0);
-    const srcImg = images[regSourceIdx];
-    if (!srcImg?.data) throw new Error('Source volume missing');
-    const h = srcImg.header;
-    const src = srcImg.data;
-    // Platform-ordered float copy of the leading sub-volume (4D inputs
-    // contribute their first timepoint). Shipping decoded values instead of
-    // raw bytes keeps endianness handling identical to what is on screen;
-    // slope/inter are forwarded so the optimizer sees the shown intensities.
-    const vox3d = h.nx * h.ny * h.nz;
-    const floats = new Float32Array(vox3d);
-    const lim = Math.min(vox3d, src.length);
-    for (let i = 0; i < lim; i++) floats[i] = src[i];
-
-    const old = regWorker;
-    regWorker = new Worker(await ensureRegWorkerUrl());
-    old?.terminate();
-
-    const w = regWorker;
-    w.onmessage = (ev: MessageEvent) => {
-      const d = ev.data;
-      if (d?.type === 'regProgress') handleRegProgress(d);
-      else if (d?.type === 'regResult') finishRegistration(d);
-      else if (d?.type === 'regError') handleRegFailure(d.message || 'Registration failed', false);
-    };
-    w.onerror = () => handleRegFailure('Registration worker crashed', false);
-
-    const msg: RegInitMessage = {
-      type: 'initReg',
-      mode: m.mode,
-      tplName: m.name,
-      moving: {
-        data: floats.buffer,
-        datatype: 16,
-        littleEndian: true,
-        slope: srcImg.slope || 1,
-        inter: srcImg.inter || 0,
-        dims: [h.nx, h.ny, h.nz],
-        srow_x: h.srow_x,
-        srow_y: h.srow_y,
-        srow_z: h.srow_z,
-      },
-      template: new Uint8Array(m.bytes ?? 0),
-    };
-    // Compare-mode Align flow: the reference is another loaded image, shipped
-    // as a pre-decoded volume instead of NIfTI bytes.
-    if (regFlow === 'align') {
-      const refImg = images[regRefIdx];
-      if (!refImg?.data) throw new Error('Reference volume missing');
-      const rh = refImg.header;
-      const rn = rh.nx * rh.ny * rh.nz;
-      const rFloats = new Float32Array(rn);
-      const rlim = Math.min(rn, refImg.data.length);
-      for (let i = 0; i < rlim; i++) rFloats[i] = refImg.data![i];
-      msg.templateVolume = {
-        data: rFloats.buffer,
-        dims: [rh.nx, rh.ny, rh.nz],
-        srow_x: rh.srow_x, srow_y: rh.srow_y, srow_z: rh.srow_z,
-      };
-      showRegStatus('busy', `Aligning ${srcImg.name} → ${refImg.name}…`, 0);
-    }
-    w.postMessage(msg);
-  } catch (err) {
-    handleRegFailure(errorMessage(err), false);
-  }
-}
-
-/**
- * Compare-mode Align: register `refIdx`'s counterpart (the other compared
- * image) onto `refIdx` as reference. Stores only the transform on the moving
- * image — both volumes keep their native data untouched.
- */
-async function startAlign(refIdx: number): Promise<void> {
-  if (regBusy) { showToast('A registration is already running.'); return; }
-  const img0 = cmpImg(0);
-  const img1 = cmpImg(1);
-  if (!img0 || !img1) { showToast('Enter compare mode with two images first.'); return; }
-  const ref = images[refIdx];
-  if (!ref || (images.indexOf(ref) !== compareIdxA && images.indexOf(ref) !== compareIdxB)) {
-    showToast('Pick one of the two compared images as reference.');
-    return;
-  }
-  const movIdx = images.indexOf(ref) === compareIdxA ? compareIdxB : compareIdxA;
-  const mov = images[movIdx];
-  if (!ref || !mov || ref === mov) { showToast('Pick one of the two compared images as reference.'); return; }
-  try {
-    await ensureImageData(compareIdxA, 'active', 'user');
-    await ensureImageData(compareIdxB, 'active', 'user');
-  } catch {
-    showToast('Both images must be fully loaded before aligning.');
-    return;
-  }
-  regBusy = true;
-  regFlow = 'align';
-  regSourceIdx = movIdx;
-  regRefIdx = images.indexOf(ref);
-  showRegStatus('busy', `Aligning ${mov.name} → ${ref.name}…`, 0);
-  // Reuse the custom-template pipeline; launchRegWorker attaches the
-  // reference volume payload for the align flow.
-  void launchRegWorker({ mode: 'custom', name: ref.name });
-}
-
-function finishRegistration(d: RegResultMessage): void {
-  try {
-    terminateRegWorker();
-    const srcImg = images[regSourceIdx];
-    if (!srcImg?.header) throw new Error('Source image missing');
-    if (!Array.isArray(d.alignM) || d.alignM.length !== 16) throw new Error('Invalid transform returned');
-
-    // ITK-SNAP style: attach the transform, keep the original volume data
-    // and header completely untouched.
-    srcImg.align = { m: d.alignM.map((v: number) => +v), ref: String(d.tplName) };
+const registration = new RegistrationController({
+  getImages: () => images,
+  getActiveIndex: () => activeImageIdx,
+  getHeader: () => header,
+  getVolumeData: () => volumeData,
+  isFullVolumeLoaded: () => fullVolumeLoaded,
+  ensureFullVolume: () => ensureFullVolumeForTool(),
+  ensureImage: (index, priority, reason) => ensureImageData(index, priority, reason),
+  getComparedImage: which => cmpImg(which),
+  getCompareIndices: () => ({ a: compareIdxA, b: compareIdxB }),
+  setCompareIndices: (a, b) => { compareIdxA = a; compareIdxB = b; },
+  enterCompareOverlayUI: () => enterCompareOverlayUI(),
+  clearCompareCaches: () => {
     compareSliceCanvasCache.clear();
     overlayResampleCache.clear();
+  },
+  showToast,
+  postMessage: message => vscode.postMessage(message),
+  getRegWorkerUrl: () => win.REG_WORKER_URL,
+  getCachedRegWorkerUrl: () => win.__NII_REG_WORKER_BLOB_URL__,
+  setCachedRegWorkerUrl: url => { win.__NII_REG_WORKER_BLOB_URL__ = url; },
+});
 
-    const secs = ((d.durationMs || 0) / 1000).toFixed(1);
-    const cm = typeof d.cost === 'number' ? ` · cost ${d.cost.toFixed(3)} (${d.costMode})` : '';
-
-    if (regFlow === 'align') {
-      // Enter/refresh overlay compare: reference is the base (img0), moving
-      // image (with the new transform) is the overlay (img1).
-      const refIdx = regRefIdx;
-      const movIdx = regSourceIdx;
-      compareIdxA = refIdx;
-      compareIdxB = movIdx;
-      enterCompareOverlayUI();
-      showRegStatus('ok', `Aligned in ${secs}s${cm} · transform stored, original data untouched`);
-    } else {
-      // Template-space registration: add the template volume next to the
-      // source image, then show the aligned overlay (template as base).
-      const hdrTpl: NiiHeader = JSON.parse(JSON.stringify(srcImg.header));
-      hdrTpl.ndim = 3; hdrTpl.nt = 1; hdrTpl.nu = 1;
-      hdrTpl.nx = d.nx; hdrTpl.ny = d.ny; hdrTpl.nz = d.nz;
-      hdrTpl.dx = d.dx; hdrTpl.dy = d.dy; hdrTpl.dz = d.dz;
-      hdrTpl.datatype = 16; hdrTpl.bitpix = 32; hdrTpl.bytesPerVoxel = 4;
-      hdrTpl.scl_slope = 1; hdrTpl.scl_inter = 0;
-      hdrTpl.isGzip = false;
-      hdrTpl.totalVoxels3D = d.nx * d.ny * d.nz;
-      hdrTpl.sliceSizeXY = d.nx * d.ny;
-      hdrTpl.volumeBytes = d.nx * d.ny * d.nz * 4;
-      hdrTpl.srow_x = [...d.srow_x];
-      hdrTpl.srow_y = [...d.srow_y];
-      hdrTpl.srow_z = [...d.srow_z];
-      if (d.orientation) hdrTpl.orientation = d.orientation;
-
-      const tplTag = String(d.tplName).replace(/\.nii(\.gz)?$/i, '');
-      let tplIdx = images.findIndex(im => im.name === tplTag);
-      if (tplIdx < 0) {
-        images.push({
-          header: hdrTpl,
-          data: new Float32Array(d.tplData),
-          min: d.tplMin,
-          max: d.tplMax,
-          name: tplTag,
-          url: '',
-          directUrl: '',
-          slope: 1,
-          inter: 0,
-          colormap: srcImg.colormap,
-          state: 'ready',
-          lastAccess: Date.now(),
-        });
-        tplIdx = images.length - 1;
-      }
-      const srcIdx = images.indexOf(srcImg);
-      images[srcIdx].selected = true;
-      images[tplIdx].selected = true;
-      compareIdxA = tplIdx;        // template as base
-      compareIdxB = srcIdx;        // aligned source as overlay
-      enterCompareOverlayUI();
-      showRegStatus('ok', `Aligned to ${tplTag} in ${secs}s${cm} · original preserved, overlay shown`);
-    }
-  } catch (err) {
-    handleRegFailure(errorMessage(err), false);
-  }
-}
-
-/**
- * Enter overlay-compare UI using the current compareIdxA/B pair. Shared by
- * the Compare button, template registration, and the Align flow.
- */
 function enterCompareOverlayUI(): void {
   compareMode = true;
   compareLayout = 'overlay';
@@ -4412,14 +4083,13 @@ window.addEventListener('message', async (e) => {
   // Registration flow, step 2: template bytes arrived from the host, hand
   // them to the registration worker along with the current volume.
   if (msg.type === 'templateData') {
-    if (!regBusy) return;
-    void launchRegWorker(msg);
+    registration.handleTemplateData(msg);
     return;
   }
 
   if (msg.type === 'regStatus') {
     // Host-side failure / cancellation before any worker was started.
-    handleRegFailure(String(msg.message || ''), !!msg.cancelled);
+    registration.handleHostFailure(String(msg.message || ''), !!msg.cancelled);
     return;
   }
 
@@ -6437,7 +6107,7 @@ function setupInteraction() {
       it.title = `Align ${img.name === a.name ? b.name : a.name} onto ${img.name}`;
       it.addEventListener('mouseenter', () => { it.style.background = '#3a3a3a'; });
       it.addEventListener('mouseleave', () => { it.style.background = 'transparent'; });
-      it.addEventListener('click', () => { menu.remove(); void startAlign(idx); });
+      it.addEventListener('click', () => { menu.remove(); void registration.startAlign(idx); });
       menu.appendChild(it);
     };
     mkEntry(a, compareIdxA);
@@ -6472,13 +6142,13 @@ function setupInteraction() {
 
   // Registration buttons — trigger the affine registration pipeline
   const btnRegMni = document.getElementById('btn-reg-mni') as HTMLButtonElement | null;
-  btnRegMni?.addEventListener('click', () => startRegistration('mni'));
+  btnRegMni?.addEventListener('click', () => registration.startRegistration('mni'));
 
   const btnRegCustom = document.getElementById('btn-reg-custom') as HTMLButtonElement | null;
-  btnRegCustom?.addEventListener('click', () => startRegistration('custom'));
+  btnRegCustom?.addEventListener('click', () => registration.startRegistration('custom'));
 
   const btnRegCancel = document.getElementById('btn-reg-cancel') as HTMLButtonElement | null;
-  btnRegCancel?.addEventListener('click', () => void cancelRegistration());
+  btnRegCancel?.addEventListener('click', () => void registration.cancel());
 
   const btnAddImg = document.getElementById('btn-add-img') as HTMLButtonElement;
   btnAddImg?.addEventListener('click', () => {

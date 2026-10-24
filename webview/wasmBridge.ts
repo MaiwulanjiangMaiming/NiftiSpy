@@ -142,6 +142,3 @@ export function getWasmBindings(): WasmBindings | null {
 /**
  * Check if WASM SIMD is available and initialized.
  */
-export function isWasmSimdReady(): boolean {
-  return wasmInstance?.hasSimd() ?? false;
-}

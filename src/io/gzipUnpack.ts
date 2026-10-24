@@ -21,8 +21,6 @@ const inflight = new Map<string, CacheBuild>();
 let reservationQueue: Promise<unknown> = Promise.resolve();
 const reservations = new Map<string, number>();
 
-export function getUnpackCachePath(gzPath: string): string { return gzPath + '.niftispy-unpack.nii'; }
-
 /** gzip ISIZE is only a hint: sizes above 4 GiB wrap around. */
 export async function readGzipISize(gzPath: string): Promise<number> {
   const fd = await fs.promises.open(gzPath, 'r');

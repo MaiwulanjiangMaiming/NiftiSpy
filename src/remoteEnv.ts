@@ -30,11 +30,6 @@ export function isWanRemote(remoteName?: string | null): boolean {
   return classifyRemote(name) === 'sshWan';
 }
 
-export function isLocalFastRemote(remoteName?: string | null): boolean {
-  const name = remoteName === undefined ? vscode.env.remoteName : remoteName;
-  return classifyRemote(name) === 'localFast';
-}
-
 export function shouldUseSliceMode(fileSize: number, remoteName?: string | null): boolean {
   if (!isWanRemote(remoteName)) return false;
   // Unknown size: be conservative and avoid a huge structured-clone / scp.

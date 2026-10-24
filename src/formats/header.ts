@@ -276,18 +276,6 @@ export function typedToU8(data: ArrayBufferView): Uint8Array {
 }
 
 /** Minimal sform from direction cosines + spacing + origin. */
-export function sformFromMdc(
-  mdc: number[][],
-  spacing: [number, number, number],
-  origin: [number, number, number],
-): number[][] {
-  return [
-    [mdc[0][0] * spacing[0], mdc[0][1] * spacing[1], mdc[0][2] * spacing[2], origin[0]],
-    [mdc[1][0] * spacing[0], mdc[1][1] * spacing[1], mdc[1][2] * spacing[2], origin[1]],
-    [mdc[2][0] * spacing[0], mdc[2][1] * spacing[1], mdc[2][2] * spacing[2], origin[2]],
-  ];
-}
-
 /**
  * sform from per-axis world directions (columns) in RAS.
  * `directions[j]` is the direction of voxel axis `j`.

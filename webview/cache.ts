@@ -1,7 +1,6 @@
 const DB_NAME = 'niftispy-cache';
 const DB_VERSION = 2;
 const STORE_NAME = 'chunks';
-const META_STORE = 'meta';
 const MAX_CACHE_SIZE = 1.5 * 1024 * 1024 * 1024; // 1.5 GB
 
 let dbInstance: IDBDatabase | null = null;
@@ -16,9 +15,6 @@ function openDB(): Promise<IDBDatabase> {
         const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
         store.createIndex('timestamp', 'timestamp', { unique: false });
         store.createIndex('size', 'size', { unique: false });
-      }
-      if (!db.objectStoreNames.contains(META_STORE)) {
-        db.createObjectStore(META_STORE, { keyPath: 'key' });
       }
     };
     req.onsuccess = () => {
@@ -102,17 +98,6 @@ export async function evictIfNeeded(): Promise<void> {
   };
 }
 
-export async function clearCache(): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    const store = tx.objectStore(STORE_NAME);
-    store.clear();
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-
 export function makeCacheKey(url: string, axis: string, index: number): string {
   return `${url}::${axis}::${index}`;
 }
@@ -129,7 +114,7 @@ export interface CacheStats {
   l3Entries: number;
 }
 
-let stats: CacheStats = {
+const stats: CacheStats = {
   l1Hits: 0, l1Misses: 0,
   l2Hits: 0, l2Misses: 0,
   l3Hits: 0, l3Misses: 0,
@@ -157,64 +142,3 @@ export function recordL4Fetch(): void {
   stats.l4Fetches++;
 }
 
-export function getCacheStats(): CacheStats {
-  return { ...stats };
-}
-
-export function resetCacheStats(): void {
-  stats = {
-    l1Hits: 0, l1Misses: 0,
-    l2Hits: 0, l2Misses: 0,
-    l3Hits: 0, l3Misses: 0,
-    l4Fetches: 0,
-    l3Size: 0, l3Entries: 0,
-  };
-}
-
-export async function getCacheSize(): Promise<{ totalSize: number; entryCount: number }> {
-  const db = await openDB();
-  return new Promise((resolve) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const store = tx.objectStore(STORE_NAME);
-    let totalSize = 0;
-    let entryCount = 0;
-    const cursorReq = store.openCursor();
-    cursorReq.onsuccess = () => {
-      const cursor = cursorReq.result;
-      if (cursor) {
-        totalSize += cursor.value.size || 0;
-        entryCount++;
-        cursor.continue();
-      } else {
-        stats.l3Size = totalSize;
-        stats.l3Entries = entryCount;
-        resolve({ totalSize, entryCount });
-      }
-    };
-    cursorReq.onerror = () => resolve({ totalSize: 0, entryCount: 0 });
-  });
-}
-
-export async function getCacheMeta(key: string): Promise<string | null> {
-  const db = await openDB();
-  return new Promise((resolve) => {
-    const tx = db.transaction(META_STORE, 'readonly');
-    const store = tx.objectStore(META_STORE);
-    const req = store.get(key);
-    req.onsuccess = () => {
-      resolve(req.result?.value ?? null);
-    };
-    req.onerror = () => resolve(null);
-  });
-}
-
-export async function setCacheMeta(key: string, value: string): Promise<void> {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(META_STORE, 'readwrite');
-    const store = tx.objectStore(META_STORE);
-    store.put({ key, value });
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}

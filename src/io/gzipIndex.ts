@@ -423,10 +423,6 @@ export async function saveCachedIndex(fsPath: string, index: GzipIndex): Promise
   }
 }
 
-export function buildGzipIndex(fsPath: string, signal?: AbortSignal): Promise<GzipIndexEntry[]> {
-  return GzipIndex.buildIndex(fsPath, signal).then(idx => idx.entries);
-}
-
 export function extractRangeFromGzipIndex(
   fsPath: string,
   index: GzipIndexEntry[],

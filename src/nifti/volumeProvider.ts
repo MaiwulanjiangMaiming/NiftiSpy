@@ -314,90 +314,6 @@ export abstract class VolumeProvider {
 }
 
 // ---------------------------------------------------------------------------
-// NiftiVolumeProvider – wraps existing NIfTI loading
-// ---------------------------------------------------------------------------
-
-export class NiftiVolumeProvider extends VolumeProvider {
-  private fsPath: string;
-  private rawData: Uint8Array | null = null;
-
-  constructor(fsPath: string) {
-    super();
-    this.fsPath = fsPath;
-  }
-
-  async getInfo(): Promise<VolumeInfo> {
-    if (this.info) return this.info;
-    const { parseNiiHeaderQuick } = await import('../nifti/headerParser');
-    const { readLocalFilePartial } = await import('../io/fileReader');
-    const headerBytes = await readLocalFilePartial(this.fsPath, 0, 543);
-    const header = parseNiiHeaderQuick(headerBytes);
-    if (!header) throw new Error('Failed to parse NIfTI header');
-    this.info = {
-      nx: header.nx, ny: header.ny, nz: header.nz,
-      bytesPerVoxel: header.bytesPerVoxel,
-      voxOffset: header.voxOffset,
-      datatype: header.datatype,
-      littleEndian: header.littleEndian,
-      scl_slope: header.scl_slope || 1,
-      scl_inter: header.scl_inter || 0,
-    };
-    return this.info;
-  }
-
-  async loadChunk(key: ChunkKey): Promise<Float32Array | null> {
-    if (!this.info) await this.getInfo();
-    if (!this.rawData) {
-      const fs = await import('fs');
-      const data = fs.readFileSync(this.fsPath);
-      this.rawData = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    }
-    const { nx, ny, nz, voxOffset, bytesPerVoxel, datatype, littleEndian } = this.info!;
-    const factor = Math.pow(2, key.lod);
-    const bpv = Math.max(1, bytesPerVoxel);
-
-    const startX = key.cx * CHUNK_SIZE * factor;
-    const startY = key.cy * CHUNK_SIZE * factor;
-    const startZ = key.cz * CHUNK_SIZE * factor;
-    const endX = Math.min(startX + CHUNK_SIZE * factor, nx);
-    const endY = Math.min(startY + CHUNK_SIZE * factor, ny);
-    const endZ = Math.min(startZ + CHUNK_SIZE * factor, nz);
-
-    const outW = Math.ceil((endX - startX) / factor);
-    const outH = Math.ceil((endY - startY) / factor);
-    const outD = Math.ceil((endZ - startZ) / factor);
-    const result = new Float32Array(outW * outH * outD);
-
-    const le = littleEndian;
-    let outIdx = 0;
-    for (let z = startZ; z < endZ; z += factor) {
-      for (let y = startY; y < endY; y += factor) {
-        for (let x = startX; x < endX; x += factor) {
-          const offset = voxOffset + (z * ny * nx + y * nx + x) * bpv;
-          if (offset + bpv > this.rawData!.length) { result[outIdx++] = 0; continue; }
-          const view = new DataView(this.rawData!.buffer, this.rawData!.byteOffset + offset, bpv);
-          let val: number;
-          switch (datatype) {
-            case 2: val = this.rawData![offset]; break;
-            case 4: val = view.getInt16(0, le); break;
-            case 8: val = view.getInt32(0, le); break;
-            case 16: val = view.getFloat32(0, le); break;
-            case 64: val = view.getFloat64(0, le); break;
-            case 256: val = (this.rawData![offset] << 24) >> 24; break;
-            case 512: val = view.getUint16(0, le); break;
-            case 768: val = view.getUint32(0, le); break;
-            default: val = 0;
-          }
-          result[outIdx++] = val;
-        }
-      }
-    }
-
-    return result;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // ZarrVolumeProvider – read-only Zarr v2 support
 // ---------------------------------------------------------------------------
 
@@ -797,12 +713,3 @@ export class ZarrVolumeProvider extends VolumeProvider {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Backward-compatible alias
-// ---------------------------------------------------------------------------
-
-export class LocalVolumeProvider extends NiftiVolumeProvider {
-  constructor(fsPath: string) {
-    super(fsPath);
-  }
-}
