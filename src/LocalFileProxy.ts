@@ -126,6 +126,10 @@ export class LocalFileProxy {
           // would reject every webview request with a protocol error.
           const createdServer = http.createServer(this.handleRequest.bind(this) as any);
           this.stats.protocol = 'http/1.1';
+          // Slice fetches pause while the user reads a plane. Keep the
+          // forwarded socket alive instead of paying a new connection setup.
+          createdServer.keepAliveTimeout = 30_000;
+          createdServer.headersTimeout = 31_000;
 
           createdServer.on('error', (err: any) => {
             if (err.code === 'EADDRINUSE' && tryPort !== 0) {
