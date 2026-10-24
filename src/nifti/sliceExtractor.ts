@@ -117,6 +117,89 @@ export async function extractLocalSlice(
   } finally { await fd.close(); }
 }
 
+export interface RawLocalSlice {
+  data: Uint8Array;
+  width: number;
+  height: number;
+}
+
+/**
+ * Same traversal as extractLocalSlice but returns the native little-endian
+ * voxel bytes (8/16-bit only). This halves the slice payload for the common
+ * int16 MRI/CT case; the client applies scl_slope / scl_inter.
+ */
+export async function extractLocalSliceRaw(
+  fsPath: string, header: any, axis: string, idx: number, timeIdx = 0, factor = 1,
+  signal?: AbortSignal,
+): Promise<RawLocalSlice | null> {
+  const { nx, ny, nz, voxOffset } = header;
+  const limit = axis === 'axial' ? nz : axis === 'coronal' ? ny : nx;
+  if (!Number.isInteger(idx) || idx < 0 || idx >= limit) return null;
+  const bpv = Math.max(1, header.bitpix / 8);
+  if (bpv > 2 || !header.littleEndian) return null;
+
+  const f = Math.max(1, Math.min(32, Math.floor(factor) || 1));
+  const width = axis === 'sagittal' ? ny : nx;
+  const height = axis === 'axial' ? ny : nz;
+  const w = Math.max(1, Math.floor(width / f)), h = Math.max(1, Math.floor(height / f));
+  const out = new Uint8Array(w * h * bpv);
+  const rowBytes = nx * bpv;
+  const base = voxOffset + timepointByteOffset(header, timeIdx);
+  const fd = await fs.promises.open(fsPath, 'r');
+  const scratch = Buffer.allocUnsafe(Math.min(8 * 1024 * 1024, axis === 'sagittal' ? rowBytes * ny : rowBytes));
+
+  const read = async (position: number, bytes: number) => {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    let done = 0;
+    while (done < bytes) {
+      const r = await fd.read(scratch, done, bytes - done, position + done);
+      if (!r.bytesRead) throw new Error('Truncated NIfTI voxel data');
+      done += r.bytesRead;
+    }
+  };
+  const copyVoxel = (src: number, dstIndex: number) => {
+    const dst = dstIndex * bpv;
+    for (let b = 0; b < bpv; b++) out[dst + b] = scratch[src + b];
+  };
+
+  try {
+    for (let oy = 0; oy < h; oy++) {
+      if (axis !== 'sagittal') {
+        const z = axis === 'axial' ? idx : oy * f;
+        const y = axis === 'axial' ? oy * f : idx;
+        for (let first = 0; first < w;) {
+          const count = Math.min(w - first, Math.max(1, Math.floor(scratch.length / (f * bpv))));
+          const bytes = ((count - 1) * f + 1) * bpv;
+          await read(base + ((z * ny + y) * nx + first * f) * bpv, bytes);
+          if (f === 1) {
+            out.set(scratch.subarray(0, count * bpv), (oy * w + first) * bpv);
+          } else {
+            for (let x = 0; x < count; x++) copyVoxel(x * f * bpv, oy * w + first + x);
+          }
+          first += count;
+        }
+      } else {
+        const rowsPerSlab = Math.max(1, Math.floor(scratch.length / rowBytes));
+        for (let firstY = 0; firstY < ny; firstY += rowsPerSlab) {
+          const rows = Math.min(rowsPerSlab, ny - firstY);
+          if (rowBytes > scratch.length) {
+            for (let y = firstY; y < firstY + rows; y++) if (y % f === 0 && y / f < w) {
+              await read(base + ((oy * f * ny + y) * nx + idx) * bpv, bpv);
+              copyVoxel(0, oy * w + y / f);
+            }
+          } else {
+            await read(base + (oy * f * ny + firstY) * rowBytes, rows * rowBytes);
+            for (let y = firstY; y < firstY + rows; y++) if (y % f === 0 && y / f < w) {
+              copyVoxel(((y - firstY) * nx + idx) * bpv, oy * w + y / f);
+            }
+          }
+        }
+      }
+    }
+    return { data: out, width: w, height: h };
+  } finally { await fd.close(); }
+}
+
 export async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
   return extractLocalSlice(fsPath, header, 'coronal', idx, timeIdx);
 }

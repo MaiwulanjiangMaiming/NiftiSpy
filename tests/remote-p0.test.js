@@ -139,10 +139,21 @@ test('SSH forwarded localhost slices expose dimensions, compress losslessly, and
     assert.equal(response.headers.get('X-Width'), String(64 / factor)); assert.equal(response.headers.get('X-Height'), String(64 / factor));
     assert.match(response.headers.get('Access-Control-Expose-Headers'), /X-Width/);
     assert.match(response.headers.get('Server-Timing'), /slice;dur=/);
-    assert.equal(response.headers.get('Content-Encoding'), 'gzip');
+    assert.equal(response.headers.get('X-NiftiSpy-Slice-Format'), 'raw');
+    assert.equal(response.headers.get('X-NiftiSpy-Dtype'), '4');
     const bytes = await response.arrayBuffer();
-    assert.deepEqual(new Float32Array(bytes), p.sampleSlice(p.extractSingleSlice(f.raw, header, axis, 32, 1), 64, 64, factor));
-    assert.ok(Number(response.headers.get('Content-Length')) < bytes.byteLength);
+    assert.equal(bytes.byteLength, (64 / factor) * (64 / factor) * 2);
+    if (bytes.byteLength >= 1024) assert.equal(response.headers.get('Content-Encoding'), 'gzip');
+    const actual = p.decodeRawSlice(
+      bytes,
+      Number(response.headers.get('X-NiftiSpy-Dtype')),
+      Number(response.headers.get('X-NiftiSpy-Slope')),
+      Number(response.headers.get('X-NiftiSpy-Inter')),
+      64 / factor,
+      64 / factor,
+    );
+    assert.deepEqual(actual, p.sampleSlice(p.extractSingleSlice(f.raw, header, axis, 32, 1), 64, 64, factor));
+    assert.ok(Number(response.headers.get('Content-Length')) <= bytes.byteLength);
   }
   assert.ok(proxy.getEntry(url.split('/').pop()).unpackPath);
   const entry = proxy.getEntry(url.split('/').pop());
@@ -175,6 +186,14 @@ test('proxy routes require the session capability token and restrict CORS', asyn
   assert.equal(webview.headers.get('Access-Control-Allow-Origin'), 'vscode-webview://test');
   assert.match(webview.headers.get('Vary'), /Origin/);
   await webview.arrayBuffer();
+});
+
+test('decodeRawSlice applies native dtype and slope/inter', async () => {
+  const p = await productionRuntime();
+  const bytes = new Int16Array([1, -2, 3]).buffer;
+  assert.deepEqual([...p.decodeRawSlice(bytes, 4, 2, 10, 3, 1)], [12, 6, 16]);
+  assert.deepEqual([...p.decodeRawSlice(new Uint8Array([1, 255]).buffer, 2, 1, 0, 2, 1)], [1, 255]);
+  assert.equal(p.decodeRawSlice(bytes, 16, 1, 0, 3, 1), null);
 });
 
 test('persistent slice frames retain exact dimensions and reject mixed factors/truncation', async () => {

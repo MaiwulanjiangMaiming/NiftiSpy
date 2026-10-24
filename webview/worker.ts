@@ -1,4 +1,4 @@
-import { encodeSliceFrame, decodeSliceFrame } from './sliceFrame';
+import { encodeSliceFrame, decodeSliceFrame, decodeRawSlice } from './sliceFrame';
 import { gunzip } from 'fflate';
 import { parseNiiHeader, type NiiHeader } from './nii-parser';
 import { getCachedChunk, setCachedChunk, makeCacheKey, recordCacheHit, recordCacheMiss, recordL4Fetch } from './cache';
@@ -481,9 +481,23 @@ async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: n
     const width = Number(resp.headers.get('X-Width') || 0);
     const height = Number(resp.headers.get('X-Height') || 0);
     const buffer = await resp.arrayBuffer();
-    if (!width || !height || buffer.byteLength !== width * height * 4) throw new Error('Invalid slice dimensions or payload');
     const decodeAt = performance.now();
-    const data = new Float32Array(buffer);
+    let data: Float32Array;
+    if (resp.headers.get('X-NiftiSpy-Slice-Format') === 'raw') {
+      const decoded = decodeRawSlice(
+        buffer,
+        Number(resp.headers.get('X-NiftiSpy-Dtype') || 0),
+        Number(resp.headers.get('X-NiftiSpy-Slope') || 1),
+        Number(resp.headers.get('X-NiftiSpy-Inter') || 0),
+        width,
+        height,
+      );
+      if (!decoded) throw new Error('Invalid raw slice dimensions or payload');
+      data = decoded;
+    } else {
+      if (!width || !height || buffer.byteLength !== width * height * 4) throw new Error('Invalid slice dimensions or payload');
+      data = new Float32Array(buffer);
+    }
     const persisted = encodeSliceFrame(data, width, height, factor);
     const slice: CachedSlice = {
       data,

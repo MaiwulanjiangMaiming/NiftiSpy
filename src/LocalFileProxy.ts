@@ -14,6 +14,7 @@ import {
   extractPreviewSlices,
   downsampleSlice,
   extractLocalSlice,
+  extractLocalSliceRaw,
   sampleSlice,
 } from './nifti/sliceExtractor';
 import { computeSliceMinMax, encodePreviewBinary } from './nifti/previewEncoder';
@@ -50,13 +51,19 @@ interface FileEntry {
    */
   hostHeader?: any;
   previewBinaryCache?: Buffer;
-  sliceCache?: Map<string, { data: Buffer; timestamp: number }>;
+  sliceCache?: Map<string, { data: Buffer; timestamp: number; raw?: RawSliceMeta }>;
   lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
   pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
   gzipIndex?: GzipIndex;
   gzipScan?: GzipScanSession;
   unpackPath?: string;
   sourceStamp?: string;
+}
+
+interface RawSliceMeta {
+  dtype: number;
+  slope: number;
+  inter: number;
 }
 
 interface ConnectionStats {
@@ -364,7 +371,7 @@ export class LocalFileProxy {
     if (allowedOrigin) res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
     if (origin) res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding, X-NiftiSpy-Priority');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source, X-Width, X-Height, X-Factor, Server-Timing');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source, X-Width, X-Height, X-Factor, X-NiftiSpy-Slice-Format, X-NiftiSpy-Dtype, X-NiftiSpy-Slope, X-NiftiSpy-Inter, Server-Timing');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
   }
@@ -1623,12 +1630,38 @@ export class LocalFileProxy {
     return { header, factor, volume, outNx, outNy, outNz, min, max: max > min ? max : min + 1 };
   }
 
-  private sliceHeaders(header: any, axis: string, factor: number, startedAt: number, cache: string): Record<string, string> {
-    return {
+  private sliceHeaders(
+    header: any,
+    axis: string,
+    factor: number,
+    startedAt: number,
+    cache: string,
+    raw?: RawSliceMeta,
+  ): Record<string, string> {
+    const headers: Record<string, string> = {
       'X-Width': String(Math.max(1, Math.floor((axis === 'sagittal' ? header.ny : header.nx) / factor))),
       'X-Height': String(Math.max(1, Math.floor((axis === 'axial' ? header.ny : header.nz) / factor))),
       'X-Factor': String(factor),
       'Server-Timing': `slice;dur=${(performance.now() - startedAt).toFixed(2)};desc="${cache}"`,
+    };
+    if (raw) {
+      headers['X-NiftiSpy-Slice-Format'] = 'raw';
+      headers['X-NiftiSpy-Dtype'] = String(raw.dtype);
+      headers['X-NiftiSpy-Slope'] = String(raw.slope);
+      headers['X-NiftiSpy-Inter'] = String(raw.inter);
+    }
+    return headers;
+  }
+
+  /** Raw slices only for little-endian 8/16-bit data; others stay Float32. */
+  private rawSliceMeta(header: any): RawSliceMeta | null {
+    if (!header || !header.littleEndian) return null;
+    const dtype = header.datatype;
+    if (dtype !== 2 && dtype !== 256 && dtype !== 4 && dtype !== 512) return null;
+    return {
+      dtype,
+      slope: header.scl_slope || 1,
+      inter: header.scl_inter || 0,
     };
   }
 
@@ -1641,7 +1674,8 @@ export class LocalFileProxy {
       const cached = entry.sliceCache?.get(cacheKey);
       if (cached) {
         const h = entry.headerCache;
-        compressResponse(cached.data, req, res, 'application/octet-stream', this.sliceHeaders(h, axis, factor, startedAt, 'memory'));
+        compressResponse(cached.data, req, res, 'application/octet-stream',
+          this.sliceHeaders(h, axis, factor, startedAt, 'memory', cached.raw));
         return;
       }
 
@@ -1658,6 +1692,15 @@ export class LocalFileProxy {
         compressResponse(buf, req, res, 'application/octet-stream', this.sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk' : 'source'));
       };
 
+      const replyRaw = (slice: { data: Uint8Array; width: number; height: number }, raw: RawSliceMeta) => {
+        if (ac.signal.aborted) return;
+        const h = entry.headerCache;
+        const buf = Buffer.from(slice.data.buffer, slice.data.byteOffset, slice.data.byteLength);
+        entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now(), raw });
+        compressResponse(buf, req, res, 'application/octet-stream',
+          this.sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk-raw' : 'source-raw', raw));
+      };
+
       if (dataFs && !isGzip) {
         if (!entry.headerCache) {
           const headerReadPath = entry.unpackPath || headerFs || dataFs;
@@ -1671,6 +1714,13 @@ export class LocalFileProxy {
           entry.headerCache = header;
         }
         const header = entry.headerCache;
+        const rawMeta = this.rawSliceMeta(header);
+        if (rawMeta) {
+          const raw = await extractLocalSliceRaw(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
+          if (!raw) { res.writeHead(404); res.end('Slice not found'); return; }
+          replyRaw(raw, rawMeta);
+          return;
+        }
         const slice = await extractLocalSlice(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
         if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
         reply(slice, true);
