@@ -176,6 +176,10 @@ let currentFileSize = 0;
 // WebviewId assigned by the extension host (used to route fallback
 // requests such as 'remoteHttpFallback' back to the right webview).
 let currentWebviewId = '';
+// Unique id for the load currently being dispatched. A webview can own
+// several images (Add Image / compare), so fallback messages must carry the
+// loadId instead of relying on webviewId alone.
+let currentLoadId = '';
 let fullVolumeLoaded = false;
 let interactionInitialized = false;
 // Low-res preview state (Stage 1: strided sub-sampling)
@@ -5652,6 +5656,7 @@ window.addEventListener('message', async (e) => {
   const msg = e.data;
 
   if (msg.type === 'newImage') {
+    currentLoadId = msg.loadId || currentLoadId;
     const target = msg.directUrl || msg.fileUrl;
     injectPreconnectHint(target);
     void warmupConnection(target);
@@ -5693,6 +5698,7 @@ window.addEventListener('message', async (e) => {
     fileUrl = msg.url;
     directUrl = ''; // force the Worker to fetch the proxy URL
     fileName = msg.fileName || fileName;
+    currentLoadId = msg.loadId || currentLoadId;
     isGzip = false;
     isRemoteSource = true;
     deferFullVolume = false;
@@ -5747,6 +5753,7 @@ window.addEventListener('message', async (e) => {
       vscode.postMessage({
         type: 'remoteHttpFallback',
         webviewId: currentWebviewId,
+        loadId: msg.loadId || currentLoadId,
         reason: (err as Error)?.message || String(err),
       });
       loadingText.textContent = 'Retrying with chunked transfer...';
@@ -5758,6 +5765,7 @@ window.addEventListener('message', async (e) => {
   if (msg.type === 'remoteSliceMode') {
     remotePreviewStartedAt = Date.now();
     remotePreviewToken = msg.validationToken || '';
+    currentLoadId = msg.loadId || currentLoadId;
     // Large Remote-SSH files: preview pixels come from the remote disk;
     // scrolling uses /slice. The compressed object is not pulled across
     // the tunnel.
@@ -5796,6 +5804,7 @@ window.addEventListener('message', async (e) => {
           vscode.postMessage({
             type: 'remoteHttpFallback',
             webviewId: currentWebviewId,
+            loadId: msg.loadId || currentLoadId,
             reason: 'slice-mode preview unavailable',
           });
           return;
@@ -5814,6 +5823,7 @@ window.addEventListener('message', async (e) => {
         vscode.postMessage({
           type: 'remoteHttpFallback',
           webviewId: currentWebviewId,
+          loadId: msg.loadId || currentLoadId,
           reason: (err as Error)?.message || String(err),
         });
       });
@@ -5885,6 +5895,7 @@ window.addEventListener('message', async (e) => {
   fileUrl = msg.fileUrl;
   directUrl = msg.directUrl || '';
   currentWebviewId = msg.webviewId || '';
+  currentLoadId = msg.loadId || '';
   const targetUrl = directUrl || fileUrl;
   injectPreconnectHint(targetUrl);
   void warmupConnection(targetUrl);

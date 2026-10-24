@@ -106,10 +106,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private perfChannel: vscode.OutputChannel | null = null;
   /** Materialized raw volumes (npz/mgz/gzip nrrd/...) per webview. */
   private parsedTempFiles = new Map<string, string[]>();
-  // Remote-SSH fast-path fallback contexts, keyed by webviewId. If the
-  // webview cannot fetch the port-forwarded proxy URL (forwarding blocked,
-  // CSP, tunnel hiccup), it reports back and we fall back to the chunked
-  // postMessage transfer from this stashed context.
+  // Remote-SSH fast-path fallback contexts, keyed by per-dispatch loadId.
+  // If the webview cannot fetch the port-forwarded proxy URL (forwarding
+  // blocked, CSP, tunnel hiccup), it reports back and we fall back to the
+  // chunked postMessage transfer from this stashed context.
   private remoteHttpFallbacks = new Map<string, {
     webview: vscode.Webview;
     fsPath: string;
@@ -126,6 +126,15 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     format: VolumeFormat;
     signal: AbortSignal;
   }>();
+  private loadIdCounter = 0;
+
+  /**
+   * Unique per dispatched load. A webview can own several volumes (Add Image /
+   * compare), so fallback contexts must never be keyed by webviewId alone.
+   */
+  private newLoadId(): string {
+    return `${Date.now().toString(36)}-${this.loadIdCounter++}`;
+  }
   // Debug mode: when on, perf reports are written to the OutputChannel AND
   // the panel is auto-revealed. Toggled by clicking the $(bug) status bar item.
   // Persists across sessions via workspaceState. Initial value also honors
@@ -389,8 +398,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     webviewPanel.onDidDispose(() => {
       abortController.abort();
       this.loadQueue.cancel(webviewId);
-      this.remoteHttpFallbacks.delete(webviewId);
-      this.parsedRemoteFallbacks.delete(webviewId);
+      for (const [key, fb] of this.remoteHttpFallbacks) {
+        if (fb.webview === webview) this.remoteHttpFallbacks.delete(key);
+      }
+      for (const [key, fb] of this.parsedRemoteFallbacks) {
+        if (fb.webview === webview) this.parsedRemoteFallbacks.delete(key);
+      }
       this.volumeCache.setActive(uri.toString(), null);
       this.activeWebviews.delete(webviewId);
       const temps = this.parsedTempFiles.get(webviewId);
@@ -402,6 +415,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
     webview.onDidReceiveMessage(async (msg) => {
       if (msg.type === 'ready') {
+        // A ready event starts a fresh dispatch (including webview reloads),
+        // so it needs its own fallback identity.
+        const loadId = this.newLoadId();
         const config = vscode.workspace.getConfiguration('niftispy');
 
         // Update native acceleration status bar
@@ -463,13 +479,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           directUrl: isRemote && !isParsed ? pair.dataUri.toString() : '',
           fileName: path.basename(uri.fsPath ?? uri.toString()),
           webviewId,
+          loadId,
           fileSize,
           validationToken,
         });
 
         if (parsedFormat) {
           await this.loadParsedVolume(
-            webview, webviewId, uri, abortController.signal, parsedFormat, fileSize, validationToken
+            webview, webviewId, loadId, uri, abortController.signal, parsedFormat, fileSize, validationToken
           );
           return;
         }
@@ -479,15 +496,18 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         }
 
         if (isRemote && entryId) {
-          this.startPreviewLoad(entryId, webview, webviewId, uri, abortController.signal);
+          this.startPreviewLoad(entryId, webview, webviewId, loadId, uri, abortController.signal);
         } else if (!isRemote) {
-          this.startLocalLoad(webview, webviewId, uri, abortController.signal, fileSize, validationToken, pair);
+          this.startLocalLoad(webview, webviewId, loadId, uri, abortController.signal, fileSize, validationToken, pair);
         }
       } else if (msg.type === 'remoteHttpFallback') {
         // Host-parsed volume: the forwarded proxy URL is unreachable, so read
         // the file in the host and push it through the normal cachedVolume path.
-        const parsedFb = this.parsedRemoteFallbacks.get(msg.webviewId);
+        // The loadId keeps concurrent images in one webview independent.
+        const fallbackId = String(msg.loadId || msg.webviewId || '');
+        const parsedFb = this.parsedRemoteFallbacks.get(fallbackId);
         if (parsedFb) {
+          this.parsedRemoteFallbacks.delete(fallbackId);
           this.logPerf(`[parsed] webview fetch failed (${String(msg.reason || 'unknown')}) — reading in host`);
           try {
             const { parsed, tempFiles } = await this.parseVolumeUri(parsedFb.uri, parsedFb.format, true);
@@ -508,8 +528,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         // The webview could not fetch the port-forwarded proxy URL
         // (forwarding blocked / CSP / tunnel hiccup). Resume the legacy
         // chunked postMessage transfer from the stashed context.
-        const fb = this.remoteHttpFallbacks.get(msg.webviewId);
-        this.remoteHttpFallbacks.delete(msg.webviewId);
+        const fb = this.remoteHttpFallbacks.get(fallbackId);
+        this.remoteHttpFallbacks.delete(fallbackId);
         if (!fb || fb.signal.aborted) return;
         this.logPerf(`[remote-ssh-http] webview fetch failed (${String(msg.reason || 'unknown')}), falling back to chunked transfer`);
         await this.remoteSshChunkedLoad(fb.webview, fb.fsPath, fb.fileSize, fb.validationToken, fb.signal, fb.isGzip);
@@ -531,8 +551,26 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           const imgIsGzip = (imgPair.dataUri.fsPath || imgUri.fsPath)?.endsWith('.gz') ?? false;
           const imgWebviewId = msg.webviewId || webviewId;
           const imgFormat = findVolumeFormat(imgUri.fsPath || imgUri.path);
+          const imgLoadId = this.newLoadId();
 
           if (imgFormat) {
+            // Add Image must carry the same size/token as a fresh open, or the
+            // slice-mode decision and IndexedDB cache key are both lost.
+            let imgFileSize = 0;
+            let imgValidationToken = '';
+            try {
+              if (imgIsRemote) {
+                const st = await vscode.workspace.fs.stat(imgUri);
+                imgFileSize = Number(st.size);
+                imgValidationToken = `${st.mtime}:${st.size}`;
+              } else if (imgUri.fsPath) {
+                const st = await fs.promises.stat(imgUri.fsPath);
+                imgFileSize = st.size;
+                imgValidationToken = `${st.mtimeMs}:${st.ctimeMs}:${st.size}:${st.ino}`;
+              }
+            } catch {
+              // size/token are optional; parsing still works
+            }
             webview.postMessage({
               type: 'newImage',
               fileUrl: imgIsRemote ? imgUri.toString() : webview.asWebviewUri(imgUri).toString(),
@@ -540,9 +578,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               isGzip: false,
               isRemote: imgIsRemote,
               hostParsed: true,
+              webviewId: imgWebviewId,
+              loadId: imgLoadId,
             });
             await this.loadParsedVolume(
-              webview, imgWebviewId, imgUri, new AbortController().signal, imgFormat, 0, ''
+              webview, imgWebviewId, imgLoadId, imgUri, new AbortController().signal,
+              imgFormat, imgFileSize, imgValidationToken
             );
             return;
           }
@@ -562,8 +603,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               fileName: imgFileName,
               isGzip: imgIsGzip,
               isRemote: true,
+              webviewId: imgWebviewId,
+              loadId: imgLoadId,
             });
-            this.startPreviewLoad(entryId, webview, imgWebviewId, imgUri, new AbortController().signal);
+            this.startPreviewLoad(entryId, webview, imgWebviewId, imgLoadId, imgUri, new AbortController().signal);
           } else {
             // Local file: direct webview URI + postMessage (same as initial open).
             const imgUrl = webview.asWebviewUri(imgPair.dataUri).toString();
@@ -585,8 +628,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               fileName: imgFileName,
               isGzip: imgIsGzip,
               isRemote: false,
+              webviewId: imgWebviewId,
+              loadId: imgLoadId,
             });
-            this.startLocalLoad(webview, imgWebviewId, imgUri, new AbortController().signal, imgFileSize, imgValidationToken, imgPair);
+            this.startLocalLoad(webview, imgWebviewId, imgLoadId, imgUri, new AbortController().signal, imgFileSize, imgValidationToken, imgPair);
           }
         }
       } else if (msg.type === 'exportSlice') {
@@ -743,6 +788,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private async startLocalLoad(
     webview: vscode.Webview,
     webviewId: string,
+    loadId: string,
     uri: vscode.Uri,
     signal: AbortSignal,
     fileSize: number = 0,
@@ -819,7 +865,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           // below if port forwarding is unavailable.
           if (isRemoteSSH) {
             const dispatched = await this.tryRemoteSshHttpLoad(
-              webview, webviewId, uri, fsPath, fileSize, validationToken, signal
+              webview, webviewId, loadId, uri, fsPath, fileSize, validationToken, signal
             );
             if (dispatched) return;
             // asExternalUri failed → legacy postMessage paths below.
@@ -1508,6 +1554,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private async tryRemoteSshHttpLoad(
     webview: vscode.Webview,
     webviewId: string,
+    loadId: string,
     uri: vscode.Uri,
     fsPath: string,
     fileSize: number,
@@ -1531,7 +1578,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       const sliceMode = shouldUseSliceMode(fileSize);
       const isGzip = fsPath.endsWith('.gz');
 
-      this.remoteHttpFallbacks.set(webviewId, {
+      this.remoteHttpFallbacks.set(loadId, {
         webview, fsPath, fileSize, validationToken, signal,
         isGzip,
       });
@@ -1557,7 +1604,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.logPerf(`[remote-ssh-slice] preview extract failed (${String(err)}) — still dispatching slice URL`);
         }
         if (signal.aborted) {
-          this.remoteHttpFallbacks.delete(webviewId);
+          this.remoteHttpFallbacks.delete(loadId);
           return true;
         }
 
@@ -1566,6 +1613,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           sourceIdentity: `${os.hostname()}|${uri.toString()}`,
           url: external.toString(),
           fileName: path.basename(fsPath),
+          webviewId,
+          loadId,
           fileSize,
           validationToken,
           isGzip,
@@ -1586,7 +1635,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           },
         });
         if (!ok) {
-          this.remoteHttpFallbacks.delete(webviewId);
+          this.remoteHttpFallbacks.delete(loadId);
           return false;
         }
         if (isGzip) {
@@ -1611,6 +1660,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         sourceIdentity: `${os.hostname()}|${uri.toString()}`,
         url: external.toString(),
         fileName: path.basename(fsPath),
+        webviewId,
+        loadId,
         fileSize,
         validationToken,
         isGzip,
@@ -1620,13 +1671,13 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         },
       });
       if (!ok) {
-        this.remoteHttpFallbacks.delete(webviewId);
+        this.remoteHttpFallbacks.delete(loadId);
         return false;
       }
       this.logPerf(`[remote-ssh-http] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`);
       return true;
     } catch (err) {
-      this.remoteHttpFallbacks.delete(webviewId);
+      this.remoteHttpFallbacks.delete(loadId);
       this.logPerf(`[remote-ssh-http] unavailable (${String(err)}) — falling back to postMessage transfer`);
       return false;
     }
@@ -1943,6 +1994,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     entryId: string,
     webview: vscode.Webview,
     webviewId: string,
+    loadId: string,
     uri: vscode.Uri,
     signal: AbortSignal
   ): void {
@@ -2123,6 +2175,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private async loadParsedVolume(
     webview: vscode.Webview,
     webviewId: string,
+    loadId: string,
     uri: vscode.Uri,
     signal: AbortSignal,
     format: VolumeFormat,
@@ -2169,12 +2222,12 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     this.volumeCache.setActive(uriKey, webviewId);
 
     if (isRemote) {
-      this.parsedRemoteFallbacks.set(webviewId, { webview, uri, format, signal });
+      this.parsedRemoteFallbacks.set(loadId, { webview, uri, format, signal });
       const dispatched = await this.startParsedRemoteLoad(
-        webview, webviewId, uri, format, fileSize, validationToken, signal
+        webview, webviewId, loadId, uri, format, fileSize, validationToken, signal
       );
       if (dispatched) return;
-      this.parsedRemoteFallbacks.delete(webviewId);
+      this.parsedRemoteFallbacks.delete(loadId);
     }
 
     try {
@@ -2202,6 +2255,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private async startParsedRemoteLoad(
     webview: vscode.Webview,
     webviewId: string,
+    loadId: string,
     uri: vscode.Uri,
     format: VolumeFormat,
     fileSize: number,
@@ -2258,6 +2312,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           sourceIdentity: `${os.hostname()}|${uri.toString()}`,
           url: external.toString(),
           fileName,
+          webviewId,
+          loadId,
           fileSize: dataSize,
           validationToken,
           isGzip: false,
@@ -2286,6 +2342,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         sourceIdentity: `${os.hostname()}|${uri.toString()}`,
         url: external.toString(),
         fileName,
+        webviewId,
+        loadId,
         fileSize: dataSize,
         validationToken,
         isGzip: false,
