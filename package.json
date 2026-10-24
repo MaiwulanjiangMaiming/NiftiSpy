@@ -104,7 +104,7 @@
       },
       {
         "viewType": "niftispy.zarr",
-        "displayName": "NiftiSpy (Zarr)",
+        "displayName": "NiftiSpy (Zarr metadata)",
         "selector": [
           {
             "filenamePattern": "*.zarr"

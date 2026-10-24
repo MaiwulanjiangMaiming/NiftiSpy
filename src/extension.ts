@@ -182,50 +182,47 @@ export async function activate(context: vscode.ExtensionContext) {
           const webview = webviewPanel.webview;
           const zarrPath = uri.fsPath || uri.toString();
 
-          webview.options = {
-            enableScripts: true,
-            localResourceRoots: [
-              vscode.Uri.joinPath(context.extensionUri, 'dist'),
-              vscode.Uri.joinPath(uri, '.'),
-            ],
-          };
+          webview.options = { enableScripts: false };
 
-          // Try to load Zarr metadata and show info
+          // Zarr is a metadata preview only: the viewer does not render
+          // chunked Zarr volumes yet, so be explicit instead of implying it.
           let zarrInfo: string;
           try {
             const zarrProvider = new ZarrVolumeProvider(zarrPath);
             const info = await zarrProvider.getInfo();
             const dims = zarrProvider.getDimensions();
+            const chunk = zarrProvider.getChunkSize();
+            const voxel = zarrProvider.getVoxelSize();
             const totalChunks = zarrProvider.getTotalChunksCount();
-            zarrInfo = `Zarr v2 Volume: ${dims.nx}×${dims.ny}×${dims.nz}, ${totalChunks} chunks, dtype=${info.datatype}`;
+            zarrInfo = `Zarr v2 dataset: ${dims.nx}×${dims.ny}×${dims.nz} · chunk ${chunk.cx}×${chunk.cy}×${chunk.cz} · ${totalChunks} chunks · dtype ${info.datatype} · spacing ${voxel.dx}×${voxel.dy}×${voxel.dz}`;
           } catch (err: any) {
-            zarrInfo = `Error loading Zarr: ${err?.message || err}`;
+            zarrInfo = `Error loading Zarr metadata: ${err?.message || err}`;
           }
 
-          const viewerUri = webview.asWebviewUri(
-            vscode.Uri.joinPath(context.extensionUri, 'dist', 'viewer.js')
-          );
+          const version = context.extension.packageJSON.version;
 
           webview.html = /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NiftiSpy – Zarr</title>
+<title>NiftiSpy – Zarr metadata</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#1a1a2e;color:#eaeaea;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;overflow:hidden}
-.container{text-align:center;max-width:600px;padding:40px}
+.container{text-align:center;max-width:640px;padding:40px}
 h1{color:#e94560;margin-bottom:16px;font-size:24px}
 .info{background:#16213e;border:1px solid #2a3f5f;border-radius:8px;padding:20px;margin-top:16px;font-family:monospace;font-size:13px;line-height:1.6;color:#00d9ff;word-break:break-all}
+.note{margin-top:16px;font-size:12px;line-height:1.6;color:#c8c8d0}
 .version{margin-top:20px;font-size:11px;color:#a0a0a0}
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>Zarr Volume</h1>
+  <h1>Zarr Metadata</h1>
   <div class="info">${zarrInfo}</div>
-  <div class="version">NiftiSpy v1.10.0</div>
+  <div class="note">Volume rendering for Zarr is not wired into the viewer yet. Convert the array to <code>.npy</code> or <code>.nii.gz</code> to visualize it.</div>
+  <div class="version">NiftiSpy v${version}</div>
 </div>
 </body>
 </html>`;

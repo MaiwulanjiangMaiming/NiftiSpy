@@ -27,7 +27,7 @@ Open NIfTI, NumPy, NRRD, MetaImage, MRC, DICOM and FreeSurfer volumes directly i
 - IndexedDB disk cache for remote file slices
 - Progressive LOD loading for .nii.gz files
 - GZIP random-access index for on-demand slice extraction
-- Zarr v2 format support
+- Zarr v2 metadata inspector (read-only; volume rendering not wired yet)
 - Optional Rust native acceleration (mmap, fast decompress)
 - Window/level, zoom, pan, crosshair, orientation labels, and compare mode
 
@@ -42,7 +42,7 @@ Open NIfTI, NumPy, NRRD, MetaImage, MRC, DICOM and FreeSurfer volumes directly i
 - `.mrc`, `.mrcs` (MRC / MRC2014, modes 0/1/2/6)
 - `.mgh`, `.mgz` (FreeSurfer, big-endian and gzip)
 - `.dcm`, `.dicom`, `.ima` (uncompressed single-file DICOM, single- or multi-frame)
-- `.zarr` (Zarr v2 format)
+- `.zarr` (Zarr v2 metadata inspector; voxel rendering not yet enabled)
 
 ## NumPy Support
 
@@ -68,14 +68,13 @@ Every non-NIfTI format is parsed in the extension host into the same NIfTI-shape
 - **Remote-SSH**: uncompressed little-endian files are sliced straight from the remote disk; big-endian files are byte-swapped once
 - **Limitations**: compressed transfer syntaxes (JPEG, JPEG-LS, JPEG 2000, RLE, deflated) and DICOM series folders are not supported; export an uncompressed copy or a NIfTI volume for those
 
-## Zarr Support
+## Zarr Metadata Preview
 
-NiftiSpy supports reading Zarr v2 directories for volumetric image data.
+Double-clicking a `.zarr` directory opens a read-only metadata inspector. It validates `.zarray` and reports dimensions, chunk grid, dtype and compressor.
 
-- **Supported formats**: Zarr v2 directories (`.zarr`)
-- **Supported compressors**: zlib/gzip, blosc, lz4
+- **Supported metadata**: Zarr v2 directories (`.zarr`); zlib/gzip, blosc and lz4 chunk metadata
 - **How to open**: Double-click a `.zarr` directory in the VS Code file explorer
-- **Limitations**: Read-only — no write support for Zarr volumes
+- **Limitations**: volume rendering for Zarr is not wired into the viewer yet; convert the array to `.npy` / `.nii.gz` to visualize it. No write support.
 
 ## Install
 
