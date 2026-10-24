@@ -1,8 +1,7 @@
-import { encodeSliceFrame, decodeSliceFrame, decodeRawSlice } from './sliceFrame';
 import { gunzip } from 'fflate';
 import { parseNiiHeader, type NiiHeader } from './nii-parser';
-import { getCachedChunk, setCachedChunk, makeCacheKey, recordCacheHit, recordCacheMiss, recordL4Fetch } from './cache';
-import { SliceCacheDB, deriveFileHash, makeSliceCacheKey, getSliceCacheDB } from './SliceCacheDB';
+import { SliceCacheDB, deriveFileHash, getSliceCacheDB } from './SliceCacheDB';
+import { SliceService } from './worker/slices';
 import { initWasmBindings, getWasmBindings, type WasmBindings } from './wasmBridge';
 
 // Initialize WASM SIMD module (async, non-blocking)
@@ -25,9 +24,7 @@ const MAX_SLICE_CACHE = 96;
 const LOCALHOST_CHUNK_SIZE = 128 * 1024 * 1024;  // 128MB for loopback (no network latency)
 const LOCALHOST_MAX_CONCURRENT = 16;
 const REMOTE_MAX_CONCURRENT = 16;
-type SliceAxis = 'axial' | 'coronal' | 'sagittal';
 const volumeControllers = new Map<number, AbortController>();
-const pendingSliceFetches = new Map<string, Promise<CachedSlice>>();
 const headCache = new Map<string, { totalSize: number; acceptRanges: boolean }>();
 // Track which volume IDs have already received an early preview
 const earlyPreviewSent = new Set<number>();
@@ -37,14 +34,6 @@ const earlyPreviewHeaders = new Map<number, NiiHeader>();  // cache header from 
 // pure voxels, i.e. voxOffset 0 from the worker's point of view.
 const hostParsedHeaders = new Map<number, NiiHeader>();
 
-interface CachedSlice {
-  data: Float32Array;
-  width: number;
-  height: number;
-  timestamp: number;
-}
-
-const sliceCache = new Map<string, CachedSlice>();
 
 // SliceCacheDB — persistent IndexedDB disk cache
 const sliceCacheDB = getSliceCacheDB();
@@ -65,6 +54,17 @@ function setFileHashForCache(fileName: string, fileSize: number, identity = ''):
 
 let sharedVolume: { buffer: SharedArrayBuffer; nx: number; ny: number; nz: number; slope: number; inter: number; datatype: number } | null = null;
 
+const sliceService = new SliceService({
+  fetchWithRetry,
+  abortError,
+  ensureSliceCacheDB,
+  getSharedVolume: () => sharedVolume,
+  getFileHash: () => currentFileHash,
+  postMessage: (message, transfer) => transfer ? self.postMessage(message, transfer) : self.postMessage(message),
+  maxRetries: MAX_RETRIES,
+  maxSliceCache: MAX_SLICE_CACHE,
+});
+
 self.onmessage = async (e: MessageEvent) => {
   const { id, type, url, isGzip, directUrl } = e.data;
   try {
@@ -77,7 +77,7 @@ self.onmessage = async (e: MessageEvent) => {
     } else if (type === 'cancelVolumeLoad') {
       cancelVolumeLoad(id);
     } else if (type === 'fetchSlice') {
-      await handleFetchSlice(e.data);
+      await sliceService.handleFetchSlice(e.data);
     } else if (type === 'sharedVolume') {
       sharedVolume = {
         buffer: e.data.buffer as SharedArrayBuffer,
@@ -170,23 +170,6 @@ function cancelVolumeLoad(id: number): void {
   const controller = volumeControllers.get(id);
   controller?.abort();
   volumeControllers.delete(id);
-}
-
-const VOLUME_BUFFER_HEADER_BYTES = 8;
-
-function createVolumeView(buffer: SharedArrayBuffer, datatype: number, length: number): Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array {
-  const byteOffset = VOLUME_BUFFER_HEADER_BYTES;
-  switch (datatype) {
-    case 2: return new Uint8Array(buffer, byteOffset, length);
-    case 4: return new Int16Array(buffer, byteOffset, length);
-    case 8: return new Int32Array(buffer, byteOffset, length);
-    case 16: return new Float32Array(buffer, byteOffset, length);
-    case 64: return new Float64Array(buffer, byteOffset, length);
-    case 256: return new Int8Array(buffer, byteOffset, length);
-    case 512: return new Uint16Array(buffer, byteOffset, length);
-    case 768: return new Uint32Array(buffer, byteOffset, length);
-    default: return new Float32Array(buffer, byteOffset, length);
-  }
 }
 
 async function fetchWithRetry(url: string, options?: RequestInit, retries: number = MAX_RETRIES, signal?: AbortSignal): Promise<Response> {
@@ -389,37 +372,6 @@ async function fetchRangeBytesWithRetry(
   throw lastErr || new Error('Range fetch failed after retries');
 }
 
-function getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0, identity = currentFileHash): string {
-  return `${identity}|${url}|${axis}|${index}|${factor}|t${timeIdx}`;
-}
-
-function getCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): CachedSlice | null {
-  const key = getSliceCacheKey(url, axis, index, factor, timeIdx);
-  const cached = sliceCache.get(key);
-  if (!cached) return null;
-  sliceCache.delete(key);
-  sliceCache.set(key, { ...cached, timestamp: Date.now() });
-  return cached;
-}
-
-function setCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, slice: CachedSlice, timeIdx = 0, identity = currentFileHash): void {
-  const key = getSliceCacheKey(url, axis, index, factor, timeIdx, identity);
-  sliceCache.delete(key);
-  sliceCache.set(key, slice);
-  while (sliceCache.size > MAX_SLICE_CACHE) {
-    const firstKey = sliceCache.keys().next().value;
-    if (!firstKey) break;
-    sliceCache.delete(firstKey);
-  }
-}
-
-function buildSliceUrl(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0): string {
-  const sliceUrl = new URL(url.replace('/file/', '/slice/') + `/${axis}/${index}`);
-  if (factor > 1) sliceUrl.searchParams.set('factor', String(factor));
-  if (timeIdx > 0) sliceUrl.searchParams.set('t', String(timeIdx));
-  return sliceUrl.toString();
-}
-
 function getPreferredChunkSize(url: string): number {
   if (url.includes('127.0.0.1')) return LOCALHOST_CHUNK_SIZE;
   return CHUNK_SIZE;
@@ -428,202 +380,6 @@ function getPreferredChunkSize(url: string): number {
 function getPreferredConcurrency(url: string): number {
   if (url.includes('127.0.0.1')) return LOCALHOST_MAX_CONCURRENT;
   return REMOTE_MAX_CONCURRENT;
-}
-
-async function fetchSlice(url: string, axis: SliceAxis, index: number, factor: number, signal?: AbortSignal, timeIdx = 0): Promise<CachedSlice> {
-  const cached = getCachedSlice(url, axis, index, factor, timeIdx);
-  if (cached) return cached;
-  const cacheKey = getSliceCacheKey(url, axis, index, factor, timeIdx);
-  const pending = pendingSliceFetches.get(cacheKey);
-  if (pending) return pending;
-
-  const fileHash = currentFileHash;
-  const request = (async () => {
-    // Check new SliceCacheDB first (primary L3 disk cache)
-    if (fileHash) {
-      try {
-        const db = await ensureSliceCacheDB();
-        const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
-        const dbData = await db.get(dbKey);
-        const frame = dbData ? decodeSliceFrame(dbData, factor) : null;
-        if (frame) {
-          recordCacheHit('l3');
-          const slice: CachedSlice = { ...frame, timestamp: Date.now() };
-          setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
-          return slice;
-        }
-      } catch {
-        // SliceCacheDB not available; fall through
-      }
-    }
-
-    // Fall back to legacy IndexedDB cache
-    const idbKey = `v2|${fileHash}|${makeCacheKey(url, axis, index)}|t${timeIdx}|f${factor}`;
-    const idbData = await getCachedChunk(idbKey);
-    const legacyFrame = idbData ? decodeSliceFrame(idbData, factor) : null;
-    if (legacyFrame) {
-      recordCacheHit('l3');
-      const slice: CachedSlice = { ...legacyFrame, timestamp: Date.now() };
-      setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
-      return slice;
-    }
-    recordCacheMiss('l3');
-
-    const startedAt = performance.now();
-    recordL4Fetch();
-    if (signal?.aborted) throw abortError();
-    const resp = await fetchWithRetry(buildSliceUrl(url, axis, index, factor, timeIdx), undefined, MAX_RETRIES, signal);
-    if (!resp.ok) {
-      throw new Error(`Slice fetch failed: ${resp.status}`);
-    }
-
-    const headersAt = performance.now();
-    const width = Number(resp.headers.get('X-Width') || 0);
-    const height = Number(resp.headers.get('X-Height') || 0);
-    const buffer = await resp.arrayBuffer();
-    const decodeAt = performance.now();
-    let data: Float32Array;
-    if (resp.headers.get('X-NiftiSpy-Slice-Format') === 'raw') {
-      const decoded = decodeRawSlice(
-        buffer,
-        Number(resp.headers.get('X-NiftiSpy-Dtype') || 0),
-        Number(resp.headers.get('X-NiftiSpy-Slope') || 1),
-        Number(resp.headers.get('X-NiftiSpy-Inter') || 0),
-        width,
-        height,
-      );
-      if (!decoded) throw new Error('Invalid raw slice dimensions or payload');
-      data = decoded;
-    } else {
-      if (!width || !height || buffer.byteLength !== width * height * 4) throw new Error('Invalid slice dimensions or payload');
-      data = new Float32Array(buffer);
-    }
-    const persisted = encodeSliceFrame(data, width, height, factor);
-    const slice: CachedSlice = {
-      data,
-      width,
-      height,
-      timestamp: Date.now(),
-    };
-    setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
-
-    // Store in new SliceCacheDB (primary)
-    if (fileHash) {
-      try {
-        const db = await ensureSliceCacheDB();
-        const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
-        db.put(dbKey, persisted).catch(() => {});
-        db.evictLRU().catch(() => {});
-      } catch { /* An unavailable disk cache must not fail a successful slice fetch. */ }
-    }
-
-    // Also store in legacy cache for backward compatibility
-    setCachedChunk(idbKey, persisted).catch(() => {});
-
-    self.postMessage({
-      id: -1,
-      type: 'bandwidthSample',
-      bytes: Number(resp.headers.get('Content-Length')) || buffer.byteLength,
-      durationMs: Math.max(1, decodeAt - headersAt),
-      timing: { ttfbMs: headersAt - startedAt, transferMs: decodeAt - headersAt, decodeMs: performance.now() - decodeAt, server: resp.headers.get('Server-Timing') },
-    });
-    return slice;
-  })().finally(() => {
-    pendingSliceFetches.delete(cacheKey);
-  });
-  pendingSliceFetches.set(cacheKey, request);
-  return request;
-}
-
-async function handleFetchSlice(message: {
-  id: number;
-  url: string;
-  axis: SliceAxis;
-  index: number;
-  factor?: number;
-  prefetch?: number;
-  maxIndex?: number;
-  timeIdx?: number;
-  signal?: AbortSignal;
-}): Promise<void> {
-  const factor = Math.max(1, message.factor || 1);
-  const timeIdx = message.timeIdx || 0;
-
-  if (sharedVolume && factor === 1 && timeIdx === 0) {
-    const { buffer, nx, ny, nz, slope, inter, datatype } = sharedVolume;
-    const data = createVolumeView(buffer, datatype, nx * ny * nz);
-    const idx = message.index;
-    let sliceData: Float32Array;
-    let w: number, h: number;
-
-    if (message.axis === 'axial') {
-      w = nx; h = ny;
-      sliceData = new Float32Array(nx * ny);
-      const base = idx * ny * nx;
-      for (let i = 0; i < nx * ny; i++) {
-        sliceData[i] = data[base + i] * slope + inter;
-      }
-    } else if (message.axis === 'coronal') {
-      w = nx; h = nz;
-      sliceData = new Float32Array(nx * nz);
-      for (let z = 0; z < nz; z++) {
-        const base = z * ny * nx + idx * nx;
-        for (let x = 0; x < nx; x++) {
-          sliceData[z * nx + x] = data[base + x] * slope + inter;
-        }
-      }
-    } else {
-      w = ny; h = nz;
-      sliceData = new Float32Array(ny * nz);
-      for (let z = 0; z < nz; z++) {
-        const base = z * ny * nx;
-        for (let y = 0; y < ny; y++) {
-          sliceData[z * ny + y] = data[base + y * nx + idx] * slope + inter;
-        }
-      }
-    }
-
-    self.postMessage({
-      id: message.id,
-      type: 'slice',
-      axis: message.axis,
-      index: message.index,
-      factor,
-      width: w,
-      height: h,
-      data: sliceData,
-    }, [sliceData.buffer]);
-    return;
-  }
-
-  const slice = await fetchSlice(message.url, message.axis, message.index, factor, message.signal, timeIdx);
-  // Transfer the buffer directly instead of copying — the cache entry
-  // becomes invalid after transfer, so remove it from the cache.
-  const payload = slice.data;
-  const cacheKey = getSliceCacheKey(message.url, message.axis, message.index, factor, timeIdx);
-  sliceCache.delete(cacheKey);
-  self.postMessage({
-    id: message.id,
-    type: 'slice',
-    axis: message.axis,
-    index: message.index,
-    factor,
-    width: slice.width,
-    height: slice.height,
-    data: payload,
-  }, [payload.buffer]);
-
-  const prefetch = Math.max(0, message.prefetch || 0);
-  const maxIndex = Math.max(0, message.maxIndex || 0);
-  if (prefetch === 0) return;
-
-  for (let delta = 1; delta <= prefetch; delta++) {
-    for (const nextIndex of [message.index - delta, message.index + delta]) {
-      if (nextIndex < 0 || nextIndex > maxIndex) continue;
-      if (getCachedSlice(message.url, message.axis, nextIndex, factor, timeIdx)) continue;
-      void fetchSlice(message.url, message.axis, nextIndex, factor, message.signal, timeIdx).catch(() => {});
-    }
-  }
 }
 
 /**

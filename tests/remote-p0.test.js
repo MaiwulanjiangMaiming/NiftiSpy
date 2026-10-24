@@ -292,29 +292,38 @@ test('orthogonal reads keep one descriptor and bound scratch memory independentl
 });
 
 test('actual worker restores dimensioned frames and tolerates unavailable IndexedDB', async () => {
-  const p = await productionRuntime(), db = new Map(), ram = new Map();
-  let fetches = 0, dbUnavailable = false;
-  const context = sourceRuntime('webview/worker.ts', ['fetchSlice', 'buildSliceUrl', 'getSliceCacheKey', 'getCachedSlice', 'setCachedSlice'], {
-    currentFileHash: 'identity-one', sliceCache: ram, pendingSliceFetches: new Map(), MAX_SLICE_CACHE: 50, MAX_RETRIES: 1, URL,
-    makeSliceCacheKey: p.makeSliceCacheKey, encodeSliceFrame: p.encodeSliceFrame, decodeSliceFrame: p.decodeSliceFrame,
-    ensureSliceCacheDB: async () => { if (dbUnavailable) throw new Error('disabled'); return { get: async key => db.get(key), put: async (key, val) => db.set(key, val), evictLRU: async () => {} }; },
+  const p = await productionRuntime(), db = new Map();
+  let fetches = 0, dbUnavailable = false, identity = 'identity-one';
+  const context = sourceRuntime('webview/worker/slices.ts', ['SliceService'], {
+    URL,
+    makeSliceCacheKey: p.makeSliceCacheKey, encodeSliceFrame: p.encodeSliceFrame, decodeSliceFrame: p.decodeSliceFrame, decodeRawSlice: p.decodeRawSlice,
     getCachedChunk: async () => null, setCachedChunk: async () => {}, makeCacheKey: (...v) => v.join('|'),
-    recordCacheHit() {}, recordCacheMiss() {}, recordL4Fetch() {}, self: { postMessage() {} },
+    recordCacheHit() {}, recordCacheMiss() {}, recordL4Fetch() {},
+  });
+  const makeService = () => new context.SliceService({
     fetchWithRetry: async url => {
       fetches++;
       const factor = Number(new URL(url).searchParams.get('factor')) || 1, w = 8 / factor;
       return new Response(new Float32Array(w * w).fill(fetches).buffer, { headers: { 'X-Width': String(w), 'X-Height': String(w), 'Content-Length': String(w * w * 4) } });
     },
+    abortError: () => Object.assign(new Error('Aborted'), { name: 'AbortError' }),
+    ensureSliceCacheDB: async () => { if (dbUnavailable) throw new Error('disabled'); return { get: async key => db.get(key), put: async (key, val) => db.set(key, val), evictLRU: async () => {} }; },
+    getSharedVolume: () => null,
+    getFileHash: () => identity,
+    postMessage() {},
+    maxRetries: 1,
+    maxSliceCache: 50,
   });
   const url = 'http://localhost/file/1';
-  await context.fetchSlice(url, 'axial', 2, 4); ram.clear();
-  const restored = await context.fetchSlice(url, 'axial', 2, 4);
+  const first = makeService();
+  await first.fetchSlice(url, 'axial', 2, 4);
+  const restored = await makeService().fetchSlice(url, 'axial', 2, 4);
   assert.equal(fetches, 1); assert.equal(restored.width, 2); assert.equal(restored.height, 2); assert.equal(restored.data.length, 4);
-  const full = await context.fetchSlice(url, 'axial', 2, 1); assert.equal(fetches, 2); assert.equal(full.width, 8);
-  context.currentFileHash = 'identity-two';
-  await context.fetchSlice(url, 'axial', 2, 4); assert.equal(fetches, 3, 'memory and disk entries cannot cross file identities');
+  const full = await first.fetchSlice(url, 'axial', 2, 1); assert.equal(fetches, 2); assert.equal(full.width, 8);
+  identity = 'identity-two';
+  await first.fetchSlice(url, 'axial', 2, 4); assert.equal(fetches, 3, 'memory and disk entries cannot cross file identities');
   dbUnavailable = true;
-  assert.equal((await context.fetchSlice(url, 'axial', 3, 1)).width, 8);
+  assert.equal((await first.fetchSlice(url, 'axial', 3, 1)).width, 8);
 });
 
 test('one cancelled consumer does not abort another consumer of the shared disk build', async t => {

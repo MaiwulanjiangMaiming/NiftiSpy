@@ -21,6 +21,7 @@ function sourceRuntime(file, names, globals = {}) {
   const context = vm.createContext({
     console, performance, setTimeout, clearTimeout, AbortController,
     ArrayBuffer, DataView, Float32Array, Uint8Array, TextDecoder, TextEncoder,
+    exports: {},
     ...globals,
   });
   vm.runInContext(js, context, { filename: file });

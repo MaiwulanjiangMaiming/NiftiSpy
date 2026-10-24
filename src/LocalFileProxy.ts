@@ -1,70 +1,33 @@
 import * as http from 'http';
-import * as https from 'https';
 import * as fs from 'fs';
-import * as zlib from 'zlib';
 import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { VolumeCache } from './VolumeCache';
-import { parseNiiHeaderQuick, timepointByteOffset } from './nifti/headerParser';
+import { parseNiiHeaderQuick } from './nifti/headerParser';
 import {
   extractAxialSliceFromRange,
   extractCoronalSliceFromRange,
   extractSagittalSliceFromRange,
-  extractSingleSlice,
   extractPreviewSlices,
-  downsampleSlice,
-  extractLocalSlice,
-  extractLocalSliceRaw,
-  sampleSlice,
 } from './nifti/sliceExtractor';
 import { computeSliceMinMax, encodePreviewBinary } from './nifti/previewEncoder';
-import { readLocalFilePartial, readHttpPartial, readHttpPartialInto, getAgentForUrl } from './io/fileReader';
+import { readLocalFilePartial, readHttpPartial } from './io/fileReader';
 import {
   compressResponse,
   gunzipAsync,
   streamingGunzipPreview,
   streamingHttpGunzipPreview,
-  streamingGunzipPreviewVolume,
 } from './io/compression';
 import { GzipIndex } from './io/gzipIndex';
 import {
   GzipScanSession,
-  extractStridedVolumeFromIndex,
-  extractSliceFromGzipIndex,
   type GzipOrthoPreview,
 } from './io/gzipScan';
 import { isWanRemote } from './remoteEnv';
-
-interface FileEntry {
-  uri: vscode.Uri;
-  dataUri: vscode.Uri;
-  separateImg: boolean;
-  id: string;
-  size?: number;
-  dataCache?: Uint8Array;
-  lastAccess?: number;
-  headerCache?: any;
-  /**
-   * Header supplied by a host-side format parser (npy/npz/nrrd/...).
-   * The proxy never tries to parse these files as NIfTI; it reuses this
-   * header for /header, /slice, /preview and /lod.
-   */
-  hostHeader?: any;
-  previewBinaryCache?: Buffer;
-  sliceCache?: Map<string, { data: Buffer; timestamp: number; raw?: RawSliceMeta }>;
-  lodCache?: Map<number, { header: any; data: Float32Array; timestamp: number }>;
-  pendingLoad?: Promise<{ rawData: Uint8Array; header: any }>;
-  gzipIndex?: GzipIndex;
-  gzipScan?: GzipScanSession;
-  unpackPath?: string;
-  sourceStamp?: string;
-}
-
-interface RawSliceMeta {
-  dtype: number;
-  slope: number;
-  inter: number;
-}
+import type { FileEntry } from './proxy/types';
+import { handleFile, getHttpRemoteSize, downloadHttpFileInChunks, type HttpStreamContext } from './proxy/httpStream';
+import { handleSlice, handleLOD, type SliceHost } from './proxy/slice';
+import { handlePreviewVolume, type PreviewHost } from './proxy/preview';
 
 interface ConnectionStats {
   protocol: 'h2' | 'http/1.1';
@@ -78,10 +41,6 @@ interface PrioritizedRequest {
   preemptible?: boolean;
   execute: () => Promise<void>;
 }
-
-/** Per-entry slice cache bounds (server-side L2 behind the client cache). */
-const MAX_SLICE_CACHE_ENTRIES = 64;
-const MAX_SLICE_CACHE_BYTES = 64 * 1024 * 1024;
 
 const REQUEST_PRIORITY = {
   header: 100,
@@ -112,9 +71,28 @@ export class LocalFileProxy {
   private priorityQueue: PrioritizedRequest[] = [];
   private activeStreamCount = 0;
   private inflightFileStreams = new Set<{ destroy: () => void; background: boolean }>();
+  private readonly httpCtx: HttpStreamContext = {
+    inflightFileStreams: this.inflightFileStreams,
+    remoteSizeCache: new Map<string, number>(),
+  };
+  private readonly sliceHost: SliceHost;
+  private readonly previewHost: PreviewHost;
 
   constructor(volumeCache?: VolumeCache) {
     this.volumeCache = volumeCache || null;
+    this.sliceHost = {
+      headerPath: entry => this.headerPath(entry),
+      dataPath: entry => this.dataPath(entry),
+      parseEntryHeader: (entry, bytes) => this.parseEntryHeader(entry, bytes),
+      ensureGzipScan: (entry, onProgress) => this.ensureGzipScan(entry, onProgress),
+      loadFileData: (entry, signal) => this.loadFileData(entry, signal),
+    };
+    this.previewHost = {
+      ensureGzipScan: entry => this.ensureGzipScan(entry),
+      parseEntryHeader: (entry, bytes) => this.parseEntryHeader(entry, bytes),
+      loadFileData: (entry, signal) => this.loadFileData(entry, signal),
+      volumeCache: this.volumeCache,
+    };
   }
 
   async start(): Promise<void> {
@@ -207,7 +185,7 @@ export class LocalFileProxy {
     const id = String(this.idCounter++);
     const data = dataUri || uri;
     let sourceStamp: string | undefined;
-    try { const st = fs.statSync(data.fsPath); sourceStamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`; } catch {}
+    try { const st = fs.statSync(data.fsPath); sourceStamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`; } catch { /* virtual FS: no local stamp */ }
     this.files.set(id, {
       sourceStamp,
       uri,
@@ -495,399 +473,26 @@ export class LocalFileProxy {
         }
         if (previewVolumeMatch) {
           const factor = parseFactorFromPath(_req.url || '');
-          await this.handlePreviewVolume(entry, factor, _res, _req);
+          await handlePreviewVolume(entry, factor, _res, _req, this.previewHost);
           return;
         }
         if (sliceMatch) {
           const timeIdx = parseInt(query.get('t') || '0', 10) || 0;
-          await this.handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3], 10), _res, _req, timeIdx, Math.max(1, Math.min(32, Math.floor(Number(query.get('factor'))) || 1)));
+          await handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3], 10), _res, _req, this.sliceHost, timeIdx, Math.max(1, Math.min(32, Math.floor(Number(query.get('factor'))) || 1)));
           return;
         }
         if (lodMatch) {
-          await this.handleLOD(entry, parseInt(lodMatch[2]), _res, _req);
+          await handleLOD(entry, parseInt(lodMatch[2]), _res, _req, this.sliceHost);
           return;
         }
 
-        await this.handleFile(entry, _res, _req);
+        await handleFile(entry, _res, _req, this.httpCtx);
       } catch (err) {
         console.error('LocalFileProxy error:', err);
         _res.writeHead(500);
         _res.end(String(err));
       }
     }, { preemptible: backgroundFile });
-  }
-
-  private async handleFile(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const fileUri = entry.dataUri || entry.uri;
-    const isHttpRemote = fileUri.scheme === 'http' || fileUri.scheme === 'https';
-    const method = (req.method || 'GET').toUpperCase();
-    const rangeHeader = req.headers['range'];
-    const background = String(req.headers['x-niftispy-priority'] || '').toLowerCase() === 'background';
-
-    // ── Remote range request: forward directly, skip HEAD size lookup ──
-    // The remote's Content-Range response header carries the total size,
-    // so we cache it from the response and avoid a separate HEAD RTT.
-    // This is critical: the worker issues ~16 parallel range probes and
-    // a HEAD-per-request would add a full RTT to every single one.
-    if (isHttpRemote && method === 'GET' && rangeHeader) {
-      await this.streamHttpRangeToResponse(fileUri.toString(), rangeHeader, res, entry, req, background);
-      return;
-    }
-
-    // ── Remote full-file GET: stream directly without buffering ──
-    if (isHttpRemote && method === 'GET' && !rangeHeader) {
-      await this.streamHttpToResponse(fileUri.toString(), res, entry, req, background);
-      return;
-    }
-
-    // ── HEAD: answer with cached size or do one HEAD to the remote ──
-    if (method === 'HEAD') {
-      if (!entry.size) {
-        if (isHttpRemote) {
-          try { entry.size = await this.getHttpRemoteSize(fileUri.toString()); } catch { /* unknown */ }
-        }
-        if (!entry.size) {
-          const stat = await vscode.workspace.fs.stat(fileUri);
-          entry.size = Number(stat.size);
-        }
-      }
-      const headHeaders: Record<string, string | number> = {
-        'Content-Length': entry.size || 0,
-        'Accept-Ranges': 'bytes',
-        'Content-Type': 'application/octet-stream',
-      };
-      if (isHttpRemote) headHeaders['X-Remote-Source'] = 'true';
-      res.writeHead(200, headHeaders);
-      res.end();
-      return;
-    }
-
-    // ── Local file paths (fsPath or vscode-remote) need a size lookup ──
-    if (!entry.size) {
-      const stat = await vscode.workspace.fs.stat(fileUri);
-      entry.size = Number(stat.size);
-    }
-    const totalSize = entry.size!;
-
-    if (rangeHeader) {
-      const m = rangeHeader.match(/bytes=(\d+)-(\d*)/);
-      if (!m) {
-        res.writeHead(416, { 'Content-Range': `bytes */${totalSize}` });
-        res.end();
-        return;
-      }
-      const start = parseInt(m[1]);
-      const end = m[2] ? Math.min(parseInt(m[2]), totalSize - 1) : totalSize - 1;
-      const chunkSize = end - start + 1;
-
-      const fsPath = fileUri.fsPath;
-      if (fsPath) {
-        res.writeHead(206, {
-          'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-          'Content-Length': chunkSize,
-          'Accept-Ranges': 'bytes',
-          'Content-Type': 'application/octet-stream',
-        });
-        const stream = fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 });
-        await this.pipeLocalFile(req, res, stream, background);
-      } else {
-        entry.lastAccess = Date.now();
-        if (!entry.dataCache) {
-          entry.dataCache = await vscode.workspace.fs.readFile(fileUri);
-        }
-        const chunk = entry.dataCache.slice(start, end + 1);
-        res.writeHead(206, {
-          'Content-Range': `bytes ${start}-${end}/${totalSize}`,
-          'Content-Length': chunkSize,
-          'Accept-Ranges': 'bytes',
-          'Content-Type': 'application/octet-stream',
-        });
-        res.end(Buffer.from(chunk));
-      }
-    } else {
-      const fsPath = fileUri.fsPath;
-      // Never re-compress an already-compressed payload: gzip-of-gzip wastes
-      // server CPU (~2-5s per 100MB) with zero size benefit, and browsers
-      // cannot skip Accept-Encoding on fetch() (it is a forbidden header).
-      const isAlreadyCompressed = /\.gz$/i.test(fsPath || '') || /\.gz$/i.test(fileUri.path || '');
-      const shouldCompress = !isAlreadyCompressed && (req.headers['accept-encoding'] || '').includes('gzip');
-      if (fsPath && !shouldCompress) {
-        res.writeHead(200, {
-          'Content-Length': totalSize,
-          'Accept-Ranges': 'bytes',
-          'Content-Type': 'application/octet-stream',
-        });
-        const stream = fs.createReadStream(fsPath, { highWaterMark: 4 * 1024 * 1024 });
-        await this.pipeLocalFile(req, res, stream, background);
-      } else if (fsPath && shouldCompress) {
-        res.writeHead(200, {
-          'Content-Encoding': 'gzip',
-          'Accept-Ranges': 'bytes',
-          'Content-Type': 'application/octet-stream',
-        });
-        const stream = fs.createReadStream(fsPath);
-        const gzip = zlib.createGzip({ level: 1 });
-        stream.pipe(gzip);
-        await this.pipeLocalFile(req, res, gzip, background, stream);
-      } else {
-        entry.lastAccess = Date.now();
-        if (!entry.dataCache) {
-          entry.dataCache = await vscode.workspace.fs.readFile(fileUri);
-        }
-        compressResponse(Buffer.from(entry.dataCache), req, res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
-      }
-    }
-  }
-
-  private pipeLocalFile(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    stream: NodeJS.ReadableStream,
-    background: boolean,
-    extra?: { destroy: () => void },
-  ): Promise<void> {
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        this.inflightFileStreams.delete(handle);
-        resolve();
-      };
-      const destroy = () => {
-        try { extra?.destroy(); } catch { /* already closed */ }
-        try { (stream as any).destroy?.(); } catch { /* already closed */ }
-        if (!res.writableEnded) {
-          try { res.destroy(); } catch { /* already closed */ }
-        }
-        finish();
-      };
-      const handle = { destroy, background };
-      this.inflightFileStreams.add(handle);
-      req.on('close', destroy);
-      stream.on('error', finish);
-      res.on('finish', finish);
-      res.on('close', finish);
-      stream.pipe(res);
-    });
-  }
-
-  private trackHttpAbort(
-    clientReq: http.IncomingMessage | undefined,
-    remoteReq: { destroy: () => void },
-    background: boolean,
-  ): () => void {
-    const destroy = () => {
-      try { remoteReq.destroy(); } catch { /* already closed */ }
-    };
-    const handle = { destroy, background };
-    this.inflightFileStreams.add(handle);
-    clientReq?.on('close', destroy);
-    return () => this.inflightFileStreams.delete(handle);
-  }
-
-  private remoteSizeCache = new Map<string, number>();
-
-  private getHttpRemoteSize(url: string): Promise<number> {
-    const cached = this.remoteSizeCache.get(url);
-    if (cached !== undefined) return Promise.resolve(cached);
-
-    return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const options = {
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method: 'HEAD',
-        agent: getAgentForUrl(url),
-      };
-      const mod = parsed.protocol === 'https:' ? https : http;
-      const request = mod.request(options, (response: any) => {
-        const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-        if (contentLength > 0) {
-          this.remoteSizeCache.set(url, contentLength);
-          resolve(contentLength);
-        } else {
-          reject(new Error('Content-Length not available'));
-        }
-        response.resume(); // drain the response
-      });
-      request.on('error', reject);
-      request.setTimeout(5000, () => { request.destroy(); reject(new Error('HEAD request timeout')); });
-      request.end();
-    });
-  }
-
-  private streamHttpRangeToResponse(
-    url: string,
-    rangeHeader: string,
-    res: http.ServerResponse,
-    entry?: FileEntry,
-    clientReq?: http.IncomingMessage,
-    background = false,
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const options: any = {
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method: 'GET',
-        headers: { Range: rangeHeader },
-        agent: getAgentForUrl(url),
-      };
-      const mod = parsed.protocol === 'https:' ? https : http;
-      let untrack = () => {};
-      const request = mod.request(options, (response: any) => {
-        if (response.statusCode === 206 || response.statusCode === 200) {
-          const contentRange = response.headers['content-range'];
-          const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-
-          // Cache total size from Content-Range so subsequent requests
-          // (and the HEAD path) don't need another round-trip.
-          if (entry && contentRange) {
-            const m = contentRange.match(/\/(\d+)/);
-            if (m) entry.size = parseInt(m[1]);
-          } else if (entry && contentLength && response.statusCode === 200) {
-            entry.size = contentLength;
-          }
-
-          const headers: Record<string, string | number> = {
-            'Accept-Ranges': 'bytes',
-            'Content-Type': 'application/octet-stream',
-            'X-Remote-Source': 'true',
-          };
-          if (contentRange) {
-            headers['Content-Range'] = contentRange;
-          }
-          if (contentLength) {
-            headers['Content-Length'] = contentLength;
-          }
-          res.writeHead(response.statusCode, headers);
-          response.pipe(res, { end: true });
-          response.on('end', () => { untrack(); resolve(); });
-          response.on('error', (err: Error) => { untrack(); reject(err); });
-        } else {
-          untrack();
-          reject(new Error(`Remote responded with ${response.statusCode}`));
-          response.resume();
-        }
-      });
-      untrack = this.trackHttpAbort(clientReq, request, background);
-      request.on('error', (err) => { untrack(); reject(err); });
-      request.setTimeout(30000, () => { request.destroy(); untrack(); reject(new Error('Range request timeout')); });
-      request.end();
-    });
-  }
-
-  private streamHttpToResponse(
-    url: string,
-    res: http.ServerResponse,
-    entry?: FileEntry,
-    clientReq?: http.IncomingMessage,
-    background = false,
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const parsed = new URL(url);
-      const options = {
-        hostname: parsed.hostname,
-        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-        path: parsed.pathname + parsed.search,
-        method: 'GET',
-        agent: getAgentForUrl(url),
-      };
-      const mod = parsed.protocol === 'https:' ? https : http;
-      let untrack = () => {};
-      const request = mod.request(options, (response: any) => {
-        if (response.statusCode === 200) {
-          const contentLength = parseInt(response.headers['content-length'] || '0', 10);
-          if (entry && contentLength) entry.size = contentLength;
-          const headers: Record<string, string | number> = {
-            'Accept-Ranges': 'bytes',
-            'Content-Type': 'application/octet-stream',
-            'X-Remote-Source': 'true',
-          };
-          if (contentLength) {
-            headers['Content-Length'] = contentLength;
-          }
-          res.writeHead(200, headers);
-          response.pipe(res, { end: true });
-          response.on('end', () => { untrack(); resolve(); });
-          response.on('error', (err: Error) => { untrack(); reject(err); });
-        } else {
-          untrack();
-          reject(new Error(`Remote responded with ${response.statusCode}`));
-          response.resume();
-        }
-      });
-      untrack = this.trackHttpAbort(clientReq, request, background);
-      request.on('error', (err) => { untrack(); reject(err); });
-      request.setTimeout(60000, () => { request.destroy(); untrack(); reject(new Error('Full file request timeout')); });
-      request.end();
-    });
-  }
-
-  /**
-   * Download a remote HTTP file using parallel byte-range requests.
-   * This saturates high-bandwidth links and avoids the latency of many
-   * sequential small requests, which is critical for large uncompressed
-   * NIfTI volumes.
-   */
-  private async downloadHttpFileInChunks(url: string, totalSize: number, signal?: AbortSignal): Promise<Uint8Array> {
-    const CHUNK_SIZE = 32 * 1024 * 1024; // 32 MB — larger chunks = fewer requests, better throughput
-    const MAX_CONCURRENT = 32;            // match agent maxSockets for full utilization
-
-    if (totalSize <= CHUNK_SIZE) {
-      return readHttpPartial(url, 0, totalSize - 1, signal);
-    }
-
-    const ranges: { start: number; end: number }[] = [];
-    for (let start = 0; start < totalSize; start += CHUNK_SIZE) {
-      const end = Math.min(start + CHUNK_SIZE - 1, totalSize - 1);
-      ranges.push({ start, end });
-    }
-
-    // Pre-allocate the entire result buffer and write each chunk directly
-    // into it via readHttpPartialInto — avoids one intermediate Buffer
-    // allocation + memcpy per chunk (saves ~CHUNK_SIZE bytes of temp
-    // memory and a full-copy per request).
-    const result = Buffer.alloc(totalSize);
-    let running = 0;
-    let nextIdx = 0;
-    let poolError: Error | null = null;
-
-    return new Promise((resolve, reject) => {
-      const tryLaunch = (): void => {
-        while (running < MAX_CONCURRENT && nextIdx < ranges.length && !poolError) {
-          const idx = nextIdx++;
-          const { start, end } = ranges[idx];
-          running++;
-          readHttpPartialInto(url, start, end, result, start, signal)
-            .then(() => {
-              if (poolError) return;
-            })
-            .catch(err => {
-              if (!poolError) poolError = err;
-            })
-            .finally(() => {
-              running--;
-              if (poolError) {
-                reject(poolError);
-                return;
-              }
-              if (nextIdx >= ranges.length && running === 0) {
-                resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
-              } else {
-                tryLaunch();
-              }
-            });
-        }
-        if (ranges.length === 0) {
-          resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
-        }
-      };
-      tryLaunch();
-    });
   }
 
   private async handleHeader(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
@@ -1236,661 +841,6 @@ export class LocalFileProxy {
     }
   }
 
-  private sendPreviewVolumeBuffer(
-    loHeader: any,
-    volume: Float32Array,
-    factor: number,
-    outNx: number,
-    outNy: number,
-    outNz: number,
-    min: number,
-    max: number,
-    slope: number,
-    inter: number,
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-  ): void {
-    const headerJson = JSON.stringify(loHeader);
-    const headerBuf = Buffer.from(headerJson, 'utf8');
-    const voxelBuf = Buffer.from(volume.buffer, volume.byteOffset, volume.byteLength);
-    const buf = Buffer.alloc(4 + headerBuf.length + 4 * 8 + voxelBuf.length);
-    let offset = 0;
-    buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-    headerBuf.copy(buf, offset); offset += headerBuf.length;
-    buf.writeUInt32LE(factor, offset); offset += 4;
-    buf.writeUInt32LE(outNx, offset); offset += 4;
-    buf.writeUInt32LE(outNy, offset); offset += 4;
-    buf.writeUInt32LE(outNz, offset); offset += 4;
-    buf.writeFloatLE(min, offset); offset += 4;
-    buf.writeFloatLE(max, offset); offset += 4;
-    buf.writeFloatLE(slope, offset); offset += 4;
-    buf.writeFloatLE(inter, offset); offset += 4;
-    voxelBuf.copy(buf, offset);
-    compressResponse(buf, req, res, 'application/octet-stream');
-  }
-
-  /**
-   * Low-resolution subsampled volume endpoint for fast remote preview.
-   *
-   * Downloads only every `factor`-th axial slice from the source (1/factor of
-   * the data) and extracts every `factor`-th voxel in x and y from each
-   * fetched slice. The result is a complete (nx/factor × ny/factor ×
-   * nz/factor) Float32 volume that can be rendered immediately in all three
-   * orthogonal views, at 1/factor³ of the original voxel count.
-   *
-   * For a 256³ Float32 volume at factor=4: downloads 16 MB (64 source
-   * slices × 256 KB), produces a 64³ = 1 MB preview volume. On a 10 Mbps
-   * link with 100 ms RTT, the preview arrives in ~2 s instead of ~50 s
-   * for the full 64 MB.
-   *
-   * Stage 1: only uncompressed .nii (local fs + HTTP remote). Gzip falls
-   * back to 503 so the worker continues with the existing streaming path.
-   */
-  private async handlePreviewVolume(
-    entry: FileEntry,
-    factor: number,
-    res: http.ServerResponse,
-    req: http.IncomingMessage,
-  ): Promise<void> {
-    try {
-      const fsPath = entry.uri.fsPath;
-      const uriStr = entry.uri.toString();
-      const isGzip = fsPath ? fsPath.endsWith('.gz') : uriStr.endsWith('.gz');
-
-      // A larger factor reduces conversion and transport, not the gzip inflate span.
-      const f = isGzip ? Math.max(8, Math.min(32, Math.floor(factor) || 8)) : Math.max(2, Math.min(8, Math.floor(factor) || 4));
-
-      // Local gzip: reuse the in-flight inflate (index + coarse volume).
-      // HTTP gzip: sequential inflate until the last sampled z.
-      if (isGzip) {
-        const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
-        if (fsPath || isHttpRemote) {
-          const ac = new AbortController();
-          req.on('close', () => { if (!res.writableEnded) ac.abort(); });
-          try {
-            if (fsPath) {
-              const session = this.ensureGzipScan(entry);
-              const index = entry.gzipIndex || (session ? await session.done : null);
-              const lod = session?.lod;
-              if (lod && f >= lod.factor && f % lod.factor === 0) {
-                const coarse = this.coarsenLod(lod, f);
-                this.sendPreviewVolumeBuffer(
-                  coarse.header, coarse.volume, f, coarse.outNx, coarse.outNy, coarse.outNz,
-                  coarse.min, coarse.max, 1, 0,
-                  req, res,
-                );
-                return;
-              }
-              if (index) {
-                const indexed = await extractStridedVolumeFromIndex(fsPath, index, f, ac.signal);
-                this.sendPreviewVolumeBuffer(
-                  indexed.header, indexed.volume, f, indexed.outNx, indexed.outNy, indexed.outNz,
-                  indexed.min, indexed.max, indexed.header.scl_slope || 1, indexed.header.scl_inter || 0,
-                  req, res,
-                );
-                return;
-              }
-            }
-            const result = await streamingGunzipPreviewVolume(
-              fsPath ? { type: 'file', path: fsPath } : { type: 'http', url: uriStr },
-              f,
-              ac.signal,
-            );
-            // Build a low-res header (scaled spacings + adjusted sform)
-            const loHeader: any = { ...result.header };
-            loHeader.nx = result.outNx;
-            loHeader.ny = result.outNy;
-            loHeader.nz = result.outNz;
-            loHeader.dx = (result.header.dx || 1) * f;
-            loHeader.dy = (result.header.dy || 1) * f;
-            loHeader.dz = (result.header.dz || 1) * f;
-            loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
-            if (Array.isArray(result.header.sform)) {
-              const sform = result.header.sform.map((row: number[]) => [...row]);
-              for (const row of sform) { row[0] *= f; row[1] *= f; row[2] *= f; }
-              loHeader.sform = sform;
-            }
-            const slope = result.header.scl_slope || 1;
-            const inter = result.header.scl_inter || 0;
-
-            // Encode binary response (same layout as non-gzip path)
-            const headerJson = JSON.stringify(loHeader);
-            const headerBuf = Buffer.from(headerJson, 'utf8');
-            const voxelBuf = Buffer.from(result.volume.buffer, result.volume.byteOffset, result.volume.byteLength);
-            const totalLen = 4 + headerBuf.length + 4 * 8 + voxelBuf.length;
-            const buf = Buffer.alloc(totalLen);
-            let offset = 0;
-            buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-            headerBuf.copy(buf, offset); offset += headerBuf.length;
-            buf.writeUInt32LE(f, offset); offset += 4;
-            buf.writeUInt32LE(result.outNx, offset); offset += 4;
-            buf.writeUInt32LE(result.outNy, offset); offset += 4;
-            buf.writeUInt32LE(result.outNz, offset); offset += 4;
-            buf.writeFloatLE(result.min, offset); offset += 4;
-            buf.writeFloatLE(result.max, offset); offset += 4;
-            buf.writeFloatLE(slope, offset); offset += 4;
-            buf.writeFloatLE(inter, offset); offset += 4;
-            voxelBuf.copy(buf, offset);
-            compressResponse(buf, req, res, 'application/octet-stream');
-          } catch (err: any) {
-            if (err?.name === 'AbortError') return;
-            if (!res.headersSent) {
-              res.writeHead(500);
-              res.end(String(err?.message ?? err));
-            }
-          }
-          return;
-        }
-        // vscode-remote gzip: fall through to cached-data path below.
-        // loadFileData() will download + decompress the full file, then
-        // the standard subsampling code reads from entry.dataCache.
-      }
-
-      // ── Parse header (from cache or fetch first 544 bytes) ──
-      if (!entry.headerCache) {
-        let headerBytes: Uint8Array;
-        if (fsPath) {
-          headerBytes = await readLocalFilePartial(fsPath, 0, 543);
-        } else if (entry.uri.scheme === 'http' || entry.uri.scheme === 'https') {
-          headerBytes = await readHttpPartial(uriStr, 0, 543);
-        } else {
-          // Other remote (vscode-remote://): must load full data to parse header
-          const { header } = await this.loadFileData(entry);
-          entry.headerCache = header;
-          headerBytes = new Uint8Array(0);
-        }
-        if (!entry.headerCache) {
-          const header = this.parseEntryHeader(entry, headerBytes);
-          if (!header) {
-            res.writeHead(500);
-            res.end('Failed to parse NIfTI header');
-            return;
-          }
-          entry.headerCache = header;
-        }
-      }
-
-      const header = entry.headerCache;
-      const { nx, ny, nz, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = header;
-      const bpv = Math.max(1, bytesPerVoxel);
-      const slope = scl_slope || 1;
-      const inter = scl_inter || 0;
-      const le = littleEndian;
-
-      const outNx = Math.max(1, Math.floor(nx / f));
-      const outNy = Math.max(1, Math.floor(ny / f));
-      const outNz = Math.max(1, Math.floor(nz / f));
-      const outCount = outNx * outNy * outNz;
-      const output = new Float32Array(outCount);
-
-      // ── Decide source: local fs, HTTP remote, or cached data ──
-      const isLocal = !!fsPath;
-      const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
-
-      // For non-HTTP remote (vscode-remote://) without cached data, load full
-      // data once and then subsample from memory.
-      if (!isLocal && !isHttpRemote && !entry.dataCache) {
-        await this.loadFileData(entry);
-      }
-      const cachedData = (!isLocal && !isHttpRemote) ? entry.dataCache : null;
-
-      // If the full volume is already in the proxy-side VolumeCache (e.g. the
-      // user viewed this file before and it hasn't been evicted), subsample
-      // directly from the cached decoded voxel data.  This avoids 16 fresh
-      // HTTP Range requests and DataView decoding — pure memory copy, ~100x
-      // faster for a cached remote file.
-      let cachedVolume: { voxelData: any; min: number; max: number } | null = null;
-      if (isHttpRemote && this.volumeCache) {
-        const cv = this.volumeCache.get(uriStr);
-        if (cv) cachedVolume = { voxelData: cv.voxelData, min: cv.min, max: cv.max };
-      }
-
-      // ── Fetch each source z-slice and extract every f-th voxel ──
-      // Bounded concurrency: 16 parallel range requests. For a 256³ volume
-      // at factor=4, this is 64 slices → 4 batches → ~4 RTTs total.
-      const MAX_CONCURRENT = 16;
-      const sliceByteSize = nx * ny * bpv;
-
-      const fetchAndExtractSlice = async (outZ: number): Promise<void> => {
-        const srcZ = outZ * f;
-        const outSliceBase = outZ * outNy * outNx;
-
-        // ── Fast path: subsample from cached decoded volume data ──
-        // VolumeCache stores voxels as a typed array with slope/inter already
-        // applied, so we can index directly without DataView decoding.
-        if (cachedVolume) {
-          const vd = cachedVolume.voxelData;
-          for (let outY = 0; outY < outNy; outY++) {
-            const srcY = outY * f;
-            const srcRowBase = srcZ * ny * nx + srcY * nx;
-            const outRowBase = outSliceBase + outY * outNx;
-            for (let outX = 0; outX < outNx; outX++) {
-              output[outRowBase + outX] = vd[srcRowBase + outX * f];
-            }
-          }
-          return;
-        }
-
-        // ── Slow path: fetch raw bytes and decode via DataView ──
-        const sliceStart = voxOffset + srcZ * nx * ny * bpv;
-        const sliceEnd = sliceStart + sliceByteSize; // exclusive
-
-        let sliceBytes: Uint8Array;
-        if (cachedData) {
-          sliceBytes = cachedData.subarray(sliceStart, sliceEnd);
-        } else if (isLocal) {
-          sliceBytes = await readLocalFilePartial(fsPath!, sliceStart, sliceEnd - 1);
-        } else {
-          sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd - 1);
-        }
-
-        const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
-
-        for (let outY = 0; outY < outNy; outY++) {
-          const srcY = outY * f;
-          const rowBase = srcY * nx;
-          const outRowBase = outSliceBase + outY * outNx;
-          for (let outX = 0; outX < outNx; outX++) {
-            const srcX = outX * f;
-            const off = (rowBase + srcX) * bpv;
-            let val: number;
-            switch (datatype) {
-              case 2: val = sliceBytes[off]; break;
-              case 4: val = view.getInt16(off, le); break;
-              case 8: val = view.getInt32(off, le); break;
-              case 16: val = view.getFloat32(off, le); break;
-              case 64: val = view.getFloat64(off, le); break;
-              case 256: val = (sliceBytes[off] << 24) >> 24; break;
-              case 512: val = view.getUint16(off, le); break;
-              case 768: val = view.getUint32(off, le); break;
-              default: val = 0;
-            }
-            output[outRowBase + outX] = val * slope + inter;
-          }
-        }
-      };
-
-      // Bounded-concurrency pool
-      await new Promise<void>((resolve, reject) => {
-        let nextZ = 0;
-        let active = 0;
-        let settled = false;
-        const launch = (): void => {
-          while (active < MAX_CONCURRENT && nextZ < outNz && !settled) {
-            const z = nextZ++;
-            active++;
-            fetchAndExtractSlice(z)
-              .catch(err => { if (!settled) { settled = true; reject(err); } })
-              .finally(() => {
-                active--;
-                if (settled) return;
-                if (nextZ >= outNz && active === 0) {
-                  settled = true;
-                  resolve();
-                } else {
-                  launch();
-                }
-              });
-          }
-          if (nextZ >= outNz && active === 0 && !settled) {
-            settled = true;
-            resolve();
-          }
-        };
-        launch();
-      });
-
-      // ── Compute min/max from subsampled data ──
-      let min = Infinity, max = -Infinity;
-      for (let i = 0; i < outCount; i++) {
-        const v = output[i];
-        if (v < min) min = v;
-        if (v > max) max = v;
-      }
-      if (min === max) max = min + 1;
-
-      // ── Build a low-res header for the viewer ──
-      // Scale voxel sizes so the physical volume dimensions are preserved.
-      const loHeader: any = { ...header };
-      loHeader.nx = outNx;
-      loHeader.ny = outNy;
-      loHeader.nz = outNz;
-      loHeader.dx = (header.dx || 1) * f;
-      loHeader.dy = (header.dy || 1) * f;
-      loHeader.dz = (header.dz || 1) * f;
-      loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
-      // Preserve sform/qform codes but adjust the translation column so the
-      // center of the low-res volume maps to the same world coordinate as the
-      // center of the full volume. This keeps the orientation labels correct.
-      if (Array.isArray(header.sform)) {
-        const sform = header.sform.map((row: number[]) => [...row]);
-        // sform maps voxel → world. After subsampling, voxel (i,j,k) in the
-        // low-res volume corresponds to voxel (i*f, j*f, k*f) in the full
-        // volume. So world = sform * (i*f, j*f, k*f, 1)^T.
-        // The new sform is: [a*f, b*f, c*f, d] for each row [a, b, c, d].
-        for (const row of sform) {
-          row[0] *= f;
-          row[1] *= f;
-          row[2] *= f;
-        }
-        loHeader.sform = sform;
-      }
-
-      // ── Encode binary response ──
-      // Layout (little-endian):
-      //   [4]  header_json_length (uint32)
-      //   [N]  header_json (UTF-8)
-      //   [4]  factor (uint32)
-      //   [4]  out_nx (uint32)
-      //   [4]  out_ny (uint32)
-      //   [4]  out_nz (uint32)
-      //   [4]  global_min (float32)
-      //   [4]  global_max (float32)
-      //   [4]  slope (float32)
-      //   [4]  inter (float32)
-      //   [M]  voxel_data (Float32, out_nx*out_ny*out_nz * 4 bytes)
-      const headerJson = JSON.stringify(loHeader);
-      const headerBuf = Buffer.from(headerJson, 'utf8');
-      const voxelBuf = Buffer.from(output.buffer, output.byteOffset, output.byteLength);
-
-      const totalLen = 4 + headerBuf.length + 4 * 8 + voxelBuf.length;
-      const buf = Buffer.alloc(totalLen);
-      let offset = 0;
-
-      buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-      headerBuf.copy(buf, offset); offset += headerBuf.length;
-
-      buf.writeUInt32LE(f, offset); offset += 4;
-      buf.writeUInt32LE(outNx, offset); offset += 4;
-      buf.writeUInt32LE(outNy, offset); offset += 4;
-      buf.writeUInt32LE(outNz, offset); offset += 4;
-      buf.writeFloatLE(min, offset); offset += 4;
-      buf.writeFloatLE(max, offset); offset += 4;
-      buf.writeFloatLE(slope, offset); offset += 4;
-      buf.writeFloatLE(inter, offset); offset += 4;
-
-      voxelBuf.copy(buf, offset);
-
-      compressResponse(buf, req, res, 'application/octet-stream');
-    } catch (err: any) {
-      if (!res.headersSent) {
-        res.writeHead(500);
-        res.end(String(err?.message ?? err));
-      }
-    }
-  }
-
-  private coarsenLod(lod: NonNullable<GzipScanSession['lod']>, factor: number): NonNullable<GzipScanSession['lod']> {
-    if (factor === lod.factor) return lod;
-    const step = factor / lod.factor;
-    const outNx = Math.max(1, Math.floor(lod.outNx / step)), outNy = Math.max(1, Math.floor(lod.outNy / step)), outNz = Math.max(1, Math.floor(lod.outNz / step));
-    const volume = new Float32Array(outNx * outNy * outNz);
-    let min = Infinity, max = -Infinity;
-    for (let z = 0; z < outNz; z++) for (let y = 0; y < outNy; y++) for (let x = 0; x < outNx; x++) {
-      const v = lod.volume[((z * step) * lod.outNy + y * step) * lod.outNx + x * step];
-      volume[(z * outNy + y) * outNx + x] = v;
-      min = Math.min(min, v); max = Math.max(max, v);
-    }
-    const header: any = { ...lod.header, nx: outNx, ny: outNy, nz: outNz, dx: lod.header.dx * step, dy: lod.header.dy * step, dz: lod.header.dz * step };
-    header.pixDims = [header.dx, header.dy, header.dz];
-    for (const key of ['srow_x', 'srow_y', 'srow_z']) if (Array.isArray(lod.header[key])) header[key] = lod.header[key].map((v: number, i: number) => i < 3 ? v * step : v);
-    if (Array.isArray(lod.header.sform)) header.sform = lod.header.sform.map((row: number[]) => row.map((v, i) => i < 3 ? v * step : v));
-    return { header, factor, volume, outNx, outNy, outNz, min, max: max > min ? max : min + 1 };
-  }
-
-  private sliceHeaders(
-    header: any,
-    axis: string,
-    factor: number,
-    startedAt: number,
-    cache: string,
-    raw?: RawSliceMeta,
-  ): Record<string, string> {
-    const headers: Record<string, string> = {
-      'X-Width': String(Math.max(1, Math.floor((axis === 'sagittal' ? header.ny : header.nx) / factor))),
-      'X-Height': String(Math.max(1, Math.floor((axis === 'axial' ? header.ny : header.nz) / factor))),
-      'X-Factor': String(factor),
-      'Server-Timing': `slice;dur=${(performance.now() - startedAt).toFixed(2)};desc="${cache}"`,
-    };
-    if (raw) {
-      headers['X-NiftiSpy-Slice-Format'] = 'raw';
-      headers['X-NiftiSpy-Dtype'] = String(raw.dtype);
-      headers['X-NiftiSpy-Slope'] = String(raw.slope);
-      headers['X-NiftiSpy-Inter'] = String(raw.inter);
-    }
-    return headers;
-  }
-
-  private trimSliceCache(entry: FileEntry): void {
-    const cache = entry.sliceCache;
-    if (!cache) return;
-    let bytes = 0;
-    for (const value of cache.values()) bytes += value.data.length;
-    while (cache.size > MAX_SLICE_CACHE_ENTRIES || bytes > MAX_SLICE_CACHE_BYTES) {
-      const oldest = cache.keys().next().value;
-      if (oldest === undefined) break;
-      const value = cache.get(oldest);
-      cache.delete(oldest);
-      if (value) bytes -= value.data.length;
-    }
-  }
-
-  /** Raw slices only for little-endian 8/16-bit data; others stay Float32. */
-  private rawSliceMeta(header: any): RawSliceMeta | null {
-    if (!header || !header.littleEndian) return null;
-    const dtype = header.datatype;
-    if (dtype !== 2 && dtype !== 256 && dtype !== 4 && dtype !== 512) return null;
-    return {
-      dtype,
-      slope: header.scl_slope || 1,
-      inter: header.scl_inter || 0,
-    };
-  }
-
-  private async handleSlice(entry: FileEntry, axis: string, idx: number, res: http.ServerResponse, req: http.IncomingMessage, timeIdx = 0, factor = 1): Promise<void> {
-    const startedAt = performance.now();
-    const ac = new AbortController();
-    res.once('close', () => { if (!res.writableEnded) ac.abort(); });
-    try {
-      const cacheKey = `${entry.id}:${axis}:${idx}:${timeIdx}:${factor}`;
-      const cached = entry.sliceCache?.get(cacheKey);
-      if (cached) {
-        const h = entry.headerCache;
-        compressResponse(cached.data, req, res, 'application/octet-stream',
-          this.sliceHeaders(h, axis, factor, startedAt, 'memory', cached.raw));
-        return;
-      }
-
-      const headerFs = this.headerPath(entry);
-      const dataFs = entry.unpackPath || this.dataPath(entry);
-      const isGzip = !entry.unpackPath && (dataFs ? dataFs.endsWith('.gz') : (entry.dataUri || entry.uri).toString().endsWith('.gz'));
-
-      const reply = (slice: Float32Array, sampled = false) => {
-        if (ac.signal.aborted) return;
-        const h = entry.headerCache;
-        if (!sampled && factor > 1) slice = sampleSlice(slice, axis === 'sagittal' ? h.ny : h.nx, axis === 'axial' ? h.ny : h.nz, factor);
-        const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
-        entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
-        this.trimSliceCache(entry);
-        compressResponse(buf, req, res, 'application/octet-stream', this.sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk' : 'source'));
-      };
-
-      const replyRaw = (slice: { data: Uint8Array; width: number; height: number }, raw: RawSliceMeta) => {
-        if (ac.signal.aborted) return;
-        const h = entry.headerCache;
-        const buf = Buffer.from(slice.data.buffer, slice.data.byteOffset, slice.data.byteLength);
-        entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now(), raw });
-        this.trimSliceCache(entry);
-        compressResponse(buf, req, res, 'application/octet-stream',
-          this.sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk-raw' : 'source-raw', raw));
-      };
-
-      if (dataFs && !isGzip) {
-        if (!entry.headerCache) {
-          const headerReadPath = entry.unpackPath || headerFs || dataFs;
-          const headerBytes = await readLocalFilePartial(headerReadPath, 0, 543);
-          const header = this.parseEntryHeader(entry, headerBytes);
-          if (!header) {
-            res.writeHead(500);
-            res.end('Failed to parse header');
-            return;
-          }
-          entry.headerCache = header;
-        }
-        const header = entry.headerCache;
-        const rawMeta = this.rawSliceMeta(header);
-        if (rawMeta) {
-          const raw = await extractLocalSliceRaw(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
-          if (!raw) { res.writeHead(404); res.end('Slice not found'); return; }
-          replyRaw(raw, rawMeta);
-          return;
-        }
-        const slice = await extractLocalSlice(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
-        if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
-        reply(slice, true);
-        return;
-      }
-
-      if (dataFs && isGzip) {
-        const session = this.ensureGzipScan(entry);
-        if (!entry.gzipIndex && session) {
-          const built = await session.done;
-          if (built) entry.gzipIndex = built;
-          if (session.unpackPath) entry.unpackPath = session.unpackPath;
-        }
-      }
-
-      if (entry.unpackPath) {
-        return this.handleSlice(entry, axis, idx, res, req, timeIdx, factor);
-      }
-
-      if (dataFs && isGzip && entry.gzipIndex) {
-        if (!entry.headerCache) {
-          const headerBytes = await GzipIndex.readRange(dataFs, entry.gzipIndex, 0, 544);
-          const header = this.parseEntryHeader(entry, headerBytes);
-          if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
-          entry.headerCache = header;
-        }
-        try {
-          const slice = await extractSliceFromGzipIndex(dataFs, entry.gzipIndex, entry.headerCache, axis, idx, timeIdx, ac.signal);
-          if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
-          reply(slice);
-          return;
-        } catch {
-          // fall through to full decompression path
-        }
-      }
-
-      if (dataFs && isGzip && !entry.gzipIndex) {
-        this.ensureGzipScan(entry);
-      }
-
-      const fileUri = entry.dataUri || entry.uri;
-      const uriStr = fileUri.toString();
-      const isHttpRemote = fileUri.scheme === 'http' || fileUri.scheme === 'https';
-
-      if (isHttpRemote && !isGzip) {
-        if (!entry.headerCache) {
-          try {
-            const headerUri = entry.uri.toString();
-            const headerBytes = await readHttpPartial(headerUri, 0, 543);
-            const header = this.parseEntryHeader(entry, headerBytes);
-            if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
-            entry.headerCache = header;
-          } catch {
-            res.writeHead(500); res.end('Failed to fetch header via HTTP Range'); return;
-          }
-        }
-        const header = entry.headerCache;
-        const { nx, ny, voxOffset, bytesPerVoxel } = header;
-        const tOff = timepointByteOffset(header, timeIdx);
-
-        try {
-          if (axis === 'axial') {
-            const sliceStart = voxOffset + tOff + idx * nx * ny * bytesPerVoxel;
-            const sliceEnd = sliceStart + nx * ny * bytesPerVoxel - 1;
-            const sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd);
-            reply(extractAxialSliceFromRange(sliceBytes, header));
-            return;
-          }
-
-          // Coronal/sagittal slices access scattered voxels across many axial
-          // slices. Serving them with one tiny Range request per z-row causes
-          // massive round-trip overhead on remote files. Instead, fetch the
-          // full volume once using parallel chunked ranges and extract locally.
-          // Subsequent slice requests are then served from entry.dataCache.
-          const { rawData } = await this.loadFileData(entry);
-          const slice = extractSingleSlice(rawData, header, axis, idx, timeIdx);
-          if (!slice) {
-            res.writeHead(404); res.end('Slice not found'); return;
-          }
-          reply(slice);
-          return;
-        } catch {
-          res.writeHead(500); res.end('Failed to fetch slice via HTTP Range'); return;
-        }
-      }
-
-      const { rawData, header } = await this.loadFileData(entry);
-      if (!header) {
-        res.writeHead(500);
-        res.end('No header');
-        return;
-      }
-
-      const slice = extractSingleSlice(rawData, header, axis, idx, timeIdx);
-      if (!slice) {
-        res.writeHead(404);
-        res.end('Slice not found');
-        return;
-      }
-
-      reply(slice);
-    } catch (err: any) {
-      res.writeHead(500);
-      res.end(String(err?.message ?? err));
-    }
-  }
-
-  private async handleLOD(entry: FileEntry, level: number, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    try {
-      const cached = entry.lodCache?.get(level);
-      if (cached) {
-        const result = { header: cached.header, axial: Array.from(cached.data) };
-        compressResponse(Buffer.from(JSON.stringify(result)), req, res, 'application/json');
-        return;
-      }
-
-      const { rawData, header } = await this.loadFileData(entry);
-      if (!header) {
-        res.writeHead(500);
-        res.end('No header');
-        return;
-      }
-
-      const factor = Math.pow(2, level);
-      const { nx, ny, nz } = header;
-      const axMid = Math.floor(nz / 2);
-      const axialSlice = extractSingleSlice(rawData, header, 'axial', axMid);
-      if (!axialSlice) {
-        res.writeHead(500);
-        res.end('Failed to extract slice');
-        return;
-      }
-
-      const downsampled = downsampleSlice(axialSlice, nx, ny, factor);
-      const lodHeader = { ...header, nx: downsampled.w, ny: downsampled.h, nz: 1 };
-
-      entry.lodCache?.set(level, { header: lodHeader, data: downsampled.data, timestamp: Date.now() });
-
-      const result = { header: lodHeader, axial: Array.from(downsampled.data) };
-      compressResponse(Buffer.from(JSON.stringify(result)), req, res, 'application/json');
-    } catch (err: any) {
-      res.writeHead(500);
-      res.end(String(err?.message ?? err));
-    }
-  }
-
   public async loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: any }> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -1953,10 +903,10 @@ export class LocalFileProxy {
             if (isHttpRemote) {
               let compressedSize = entry.size;
               if (!compressedSize) {
-                compressedSize = await this.getHttpRemoteSize(fileUri.toString());
+                compressedSize = await getHttpRemoteSize(fileUri.toString(), this.httpCtx);
                 entry.size = compressedSize;
               }
-              compressed = await this.downloadHttpFileInChunks(fileUri.toString(), compressedSize, signal);
+              compressed = await downloadHttpFileInChunks(fileUri.toString(), compressedSize, signal);
             } else {
               const fullData = await vscode.workspace.fs.readFile(fileUri);
               compressed = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
@@ -1975,10 +925,10 @@ export class LocalFileProxy {
           } else {
             let totalSize = entry.size;
             if (!totalSize) {
-              totalSize = await this.getHttpRemoteSize(fileUri.toString());
+              totalSize = await getHttpRemoteSize(fileUri.toString(), this.httpCtx);
               entry.size = totalSize;
             }
-            rawData = await this.downloadHttpFileInChunks(fileUri.toString(), totalSize, signal);
+            rawData = await downloadHttpFileInChunks(fileUri.toString(), totalSize, signal);
             entry.dataCache = rawData;
           }
           header = entry.headerCache || this.parseEntryHeader(entry, rawData);
@@ -1999,7 +949,6 @@ export class LocalFileProxy {
           if (!cached) {
             const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
             const n = nx * ny * nz;
-            const bpv = Math.max(1, header.bitpix / 8);
             const byteOff = rawData.byteOffset + voxOffset;
             const le = littleEndian;
             const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
