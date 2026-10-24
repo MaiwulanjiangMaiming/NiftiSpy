@@ -47,8 +47,24 @@ export const metaImageFormat: VolumeFormat = {
     const msb = (fields.get('elementbyteordermsb') || '').toLowerCase() === 'true';
     const needsSwap = msb && bytesPerVoxel > 1;
 
+    // ITK MetaImage is LPS; TransformMatrix is row-major and maps
+    // index * spacing to physical coordinates. Convert the rows to RAS.
+    const matrix = (fields.get('transformmatrix') || '').trim().split(/\s+/).map(Number);
+    const offset = (fields.get('offset') || '').trim().split(/\s+/).map(Number);
+    let sform: number[][] | undefined;
+    if (matrix.length === 9 && matrix.every(Number.isFinite)) {
+      const signs = [-1, -1, 1];
+      const origin = [0, 1, 2].map(i => Number.isFinite(offset[i]) ? offset[i] : 0);
+      sform = [0, 1, 2].map(row => [
+        (signs[row] * matrix[row * 3] * dx) || 0,
+        (signs[row] * matrix[row * 3 + 1] * dy) || 0,
+        (signs[row] * matrix[row * 3 + 2] * dz) || 0,
+        (signs[row] * origin[row]) || 0,
+      ]);
+    }
+
     const headerFor = (voxOffset: number) => makeNiftiHeader({
-      nx, ny, nz, nt, dx, dy, dz, datatype, voxOffset,
+      nx, ny, nz, nt, dx, dy, dz, datatype, voxOffset, sform,
       descrip: `MetaImage ${fields.get('elementtype') || ''} (${dims.join('×')})`,
     });
 

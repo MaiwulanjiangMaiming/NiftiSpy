@@ -1,8 +1,8 @@
 import * as path from 'path';
 import * as zlib from 'zlib';
 import {
-  DATATYPE_BYTES, ensureLittleEndian, makeNiftiHeader, readFileBytes,
-  readTextHeader, toU8, typedToU8, writeTempVolume,
+  DATATYPE_BYTES, ensureLittleEndian, lpsToRas, makeNiftiHeader, normalize3,
+  readFileBytes, readTextHeader, sformFromDirections, toU8, typedToU8, writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -43,7 +43,14 @@ export const nrrdFormat: VolumeFormat = {
     const dataOffset = parseInt(fields.get('data offset') || '0', 10) || 0;
     const lineSkip = parseInt(fields.get('line skip') || '0', 10) || 0;
 
-    const spacing = nrrdSpacing(fields, dimension);
+    const geometry = nrrdGeometry(fields, dimension, nrrdSpacing(fields, dimension));
+    const spacing = geometry.spacing;
+    const sform = geometry.sform;
+    const headerFor = (voxOffset: number, dtype = datatype) => makeNiftiHeader({
+      nx, ny, nz, nt, dx: spacing[0], dy: spacing[1], dz: spacing[2],
+      datatype: dtype, voxOffset, sform,
+      descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
+    });
 
     if (encoding === 'ascii') {
       const raw = await readSource(dataPath);
@@ -58,11 +65,7 @@ export const nrrdFormat: VolumeFormat = {
       for (let i = 0; i < voxelCount; i++) out[i] = Number(tokens[i]);
       const rawData = typedToU8(out);
       return {
-        header: makeNiftiHeader({
-          nx, ny, nz, nt, dx: spacing[0], dy: spacing[1], dz: spacing[2],
-          datatype: datatype === 64 ? 64 : 16, voxOffset: 0,
-          descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
-        }),
+        header: headerFor(0, datatype === 64 ? 64 : 16),
         rawData,
       };
     }
@@ -80,11 +83,7 @@ export const nrrdFormat: VolumeFormat = {
           ? ensureLittleEndian(toU8(source.subarray(start, start + expectedBytes)), bytesPerVoxel)
           : source;
         return {
-          header: makeNiftiHeader({
-            nx, ny, nz, nt, dx: spacing[0], dy: spacing[1], dz: spacing[2],
-            datatype, voxOffset: needsSwap ? 0 : start,
-            descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
-          }),
+          header: headerFor(needsSwap ? 0 : start),
           rawData: finalData,
         };
       }
@@ -92,11 +91,7 @@ export const nrrdFormat: VolumeFormat = {
       // Remote-SSH: keep the original raw file and serve slices by offset.
       if (!needsSwap) {
         return {
-          header: makeNiftiHeader({
-            nx, ny, nz, nt, dx: spacing[0], dy: spacing[1], dz: spacing[2],
-            datatype, voxOffset: baseOffset + dataOffset,
-            descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
-          }),
+          header: headerFor(baseOffset + dataOffset),
           dataPath,
         };
       }
@@ -112,11 +107,7 @@ export const nrrdFormat: VolumeFormat = {
     const little = needsSwap
       ? ensureLittleEndian(payload.subarray(0, expectedBytes), bytesPerVoxel)
       : payload.subarray(0, expectedBytes);
-    const header = makeNiftiHeader({
-      nx, ny, nz, nt, dx: spacing[0], dy: spacing[1], dz: spacing[2],
-      datatype, voxOffset: 0,
-      descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
-    });
+    const header = headerFor(0);
     if (opts.memory) return { header, rawData: little };
     const tempPath = await writeTempVolume(little);
     return { header, dataPath: tempPath, tempFiles: [tempPath] };
@@ -171,6 +162,50 @@ function nrrdSpacing(fields: Map<string, string>, dimension: number): [number, n
     }
   }
   return out;
+}
+
+/**
+ * NRRD `space directions` are axis vectors. Only build an sform when the
+ * file declares its space (RAS/LPS); guessing would mislabel unknown data.
+ */
+function nrrdGeometry(
+  fields: Map<string, string>,
+  dimension: number,
+  spacing: [number, number, number],
+): { spacing: [number, number, number]; sform?: number[][] } {
+  if (dimension < 3) return { spacing };
+  const text = fields.get('space directions');
+  if (!text) return { spacing };
+  const vectors = [...text.matchAll(/\(([^)]*)\)/g)]
+    .map(m => m[1].split(',').map(v => Number(v.trim())))
+    .filter(v => v.length === 3 && v.every(Number.isFinite));
+  if (vectors.length < 3) return { spacing };
+
+  const space = (fields.get('space') || '').toLowerCase();
+  const lps = space === 'left-posterior-superior' || space === 'lps';
+  const ras = space === 'right-anterior-superior' || space === 'ras';
+  if (!lps && !ras) return { spacing };
+
+  const norms = vectors.slice(0, 3).map(v => Math.hypot(v[0], v[1], v[2]));
+  const outSpacing: [number, number, number] = [
+    norms[0] > 0 ? norms[0] : spacing[0],
+    norms[1] > 0 ? norms[1] : spacing[1],
+    norms[2] > 0 ? norms[2] : spacing[2],
+  ];
+  const directions = vectors.slice(0, 3).map(v => normalize3(lps ? lpsToRas(v) : v));
+
+  let origin: [number, number, number] = [0, 0, 0];
+  const originMatch = (fields.get('space origin') || '').match(/\(([^)]*)\)/);
+  if (originMatch) {
+    const p = originMatch[1].split(',').map(v => Number(v.trim()));
+    if (p.length === 3 && p.every(Number.isFinite)) {
+      origin = lps ? [-p[0], -p[1], p[2]] : [p[0], p[1], p[2]];
+    }
+  }
+  return {
+    spacing: outSpacing,
+    sform: sformFromDirections(directions, outSpacing, origin),
+  };
 }
 
 async function readSource(filePath: string): Promise<Uint8Array> {

@@ -263,6 +263,32 @@ test('nrrd: raw attached header', async () => {
   assertVolume(streamed.parsed, { offset: header.length });
 });
 
+test('nrrd: space directions and origin produce an sform', async () => {
+  await load();
+  const file = tmp('oriented.nrrd');
+  const header = [
+    'NRRD0004',
+    'type: float',
+    'dimension: 3',
+    'sizes: 3 2 2',
+    'encoding: raw',
+    'endian: little',
+    'space: right-anterior-superior',
+    'space directions: (0.7,0,0) (0,0.7,0) (0,0,0.7)',
+    'space origin: (1,2,3)',
+    '',
+    '',
+  ].join('\n');
+  fs.writeFileSync(file, Buffer.concat([Buffer.from(header, 'latin1'), floatsLE(VALUES)]));
+
+  const { parsed } = await registry.parseVolumeFile(file, { memory: true });
+  assert.equal(parsed.header.sform_code, 1);
+  assert.deepEqual(parsed.header.srow_x, [0.7, 0, 0, 1]);
+  assert.deepEqual(parsed.header.srow_y, [0, 0.7, 0, 2]);
+  assert.deepEqual(parsed.header.srow_z, [0, 0, 0.7, 3]);
+  assert.equal(parsed.header.dx, 0.7);
+});
+
 test('nrrd: gzip encoding and detached .nhdr data', async () => {
   await load();
   const data = floatsLE(VALUES);
@@ -316,6 +342,28 @@ test('mha / mhd: MetaImage attached and detached layouts', async () => {
   const detached = (await registry.parseVolumeFile(mhd, { memory: false })).parsed;
   assert.equal(detached.dataPath, mhdData);
   assertVolume(detached, { offset: 0 });
+});
+
+test('mha: TransformMatrix and Offset produce an RAS sform', async () => {
+  await load();
+  const file = tmp('oriented.mha');
+  const text = [
+    'ObjectType = Image',
+    'NDims = 3',
+    'DimSize = 3 2 2',
+    'ElementType = MET_FLOAT',
+    'ElementSpacing = 1 1 1',
+    'TransformMatrix = 1 0 0 0 1 0 0 0 1',
+    'Offset = 1 2 3',
+    'ElementDataFile = LOCAL',
+  ].join('\n') + '\n';
+  fs.writeFileSync(file, Buffer.concat([Buffer.from(text, 'latin1'), floatsLE(VALUES)]));
+
+  const { parsed } = await registry.parseVolumeFile(file, { memory: true });
+  assert.equal(parsed.header.sform_code, 1);
+  assert.deepEqual(parsed.header.srow_x, [-1, 0, 0, -1]);
+  assert.deepEqual(parsed.header.srow_y, [0, -1, 0, -2]);
+  assert.deepEqual(parsed.header.srow_z, [0, 0, 1, 3]);
 });
 
 test('mrc: int16 cryo-EM volume', async () => {
@@ -373,6 +421,7 @@ function dicomText(s) {
 function dicomFile({
   rows = 2, cols = 3, frames = 2, bits = 16, signed = true, ts = '1.2.840.10008.1.2.1',
   explicit = true, le = true, values = VALUES.map(v => Math.round(v)),
+  iop = [1, 0, 0, 0, 1, 0], ipp = [10, 20, 30],
 } = {}) {
   const preamble = Buffer.alloc(132);
   Buffer.from('DICM').copy(preamble, 128);
@@ -398,6 +447,8 @@ function dicomFile({
     dicomElement(0x0028, 0x0103, 'US', dicomUS(signed ? 1 : 0, le), o),
     dicomElement(0x0028, 0x0008, 'IS', dicomText(String(frames)), o),
     dicomElement(0x0028, 0x0030, 'DS', dicomText('1\\2'), o),
+    dicomElement(0x0020, 0x0032, 'DS', dicomText(ipp.join('\\')), o),
+    dicomElement(0x0020, 0x0037, 'DS', dicomText(iop.join('\\')), o),
   ];
   if (explicit) {
     // Defined-length sequence, then an undefined-length sequence with an item.
@@ -459,6 +510,18 @@ test('dicom: implicit VR dataset', async () => {
   assertDicom((await registry.parseVolumeFile(file, { memory: true })).parsed);
 });
 
+test('dicom: IOP/IPP produce an RAS sform', async () => {
+  await load();
+  const file = tmp('oriented.dcm');
+  fs.writeFileSync(file, dicomFile());
+
+  const { parsed } = await registry.parseVolumeFile(file, { memory: true });
+  assert.equal(parsed.header.sform_code, 1);
+  assert.deepEqual(parsed.header.srow_x, [-2, 0, 0, -10]);
+  assert.deepEqual(parsed.header.srow_y, [0, -1, 0, -20]);
+  assert.deepEqual(parsed.header.srow_z, [0, 0, 1, 30]);
+});
+
 test('dicom: big-endian transfer syntax is swapped once', async () => {
   await load();
   const file = tmp('bigendian.dcm');
@@ -485,6 +548,58 @@ test('dicom: compressed transfer syntaxes are rejected with a clear message', as
     registry.parseVolumeFile(file, { memory: true }),
     /compressed DICOM/,
   );
+});
+
+test('mrc: mapc/mapr/maps produce an axis-mapping sform', async () => {
+  await load();
+  const file = tmp('mapped.mrc');
+  const head = Buffer.alloc(1024);
+  head.writeInt32LE(3, 0);
+  head.writeInt32LE(2, 4);
+  head.writeInt32LE(2, 8);
+  head.writeInt32LE(1, 12);
+  head.writeFloatLE(3, 40);
+  head.writeFloatLE(2, 44);
+  head.writeFloatLE(2, 48);
+  head.writeInt32LE(2, 64); // columns → physical y
+  head.writeInt32LE(1, 68); // rows → physical x
+  head.writeInt32LE(3, 72);
+  const voxels = Buffer.alloc(VALUES.length * 2);
+  VALUES.forEach((v, i) => voxels.writeInt16LE(Math.round(v), i * 2));
+  fs.writeFileSync(file, Buffer.concat([head, voxels]));
+
+  const { parsed } = await registry.parseVolumeFile(file, { memory: true });
+  assert.equal(parsed.header.sform_code, 1);
+  assert.deepEqual(parsed.header.srow_x, [0, 1, 0, 0]);
+  assert.deepEqual(parsed.header.srow_y, [1, 0, 0, 0]);
+  assert.deepEqual(parsed.header.srow_z, [0, 0, 1, 0]);
+});
+
+test('mgh: ras_good_flag Mdc/Pxyz produce an sform', async () => {
+  await load();
+  const file = tmp('oriented.mgh');
+  const head = Buffer.alloc(284);
+  head.writeInt32BE(1, 0);
+  head.writeInt32BE(3, 4);
+  head.writeInt32BE(2, 8);
+  head.writeInt32BE(2, 12);
+  head.writeInt32BE(1, 16);
+  head.writeInt32BE(3, 20);
+  head.writeInt16BE(1, 28);       // ras_good_flag
+  head.writeFloatBE(1, 32);
+  head.writeFloatBE(1, 36);
+  head.writeFloatBE(1, 40);
+  [1, 0, 0, 0, 1, 0, 0, 0, 1].forEach((v, i) => head.writeFloatBE(v, 44 + i * 4));
+  head.writeFloatBE(1.5, 80);     // Pxyz_c = voxel-centre of the volume
+  head.writeFloatBE(1, 84);
+  head.writeFloatBE(1, 88);
+  fs.writeFileSync(file, Buffer.concat([head, floatsBE(VALUES)]));
+
+  const { parsed } = await registry.parseVolumeFile(file, { memory: true });
+  assert.equal(parsed.header.sform_code, 1);
+  assert.deepEqual(parsed.header.srow_x, [1, 0, 0, 0]);
+  assert.deepEqual(parsed.header.srow_y, [0, 1, 0, 0]);
+  assert.deepEqual(parsed.header.srow_z, [0, 0, 1, 0]);
 });
 
 test('mgh / mgz: big-endian FreeSurfer volume is swapped to little-endian', async () => {

@@ -1,5 +1,5 @@
 import {
-  readFileBytes, readRange, makeNiftiHeader, toU8,
+  readFileBytes, readRange, makeNiftiHeader, sformFromDirections, toU8,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -32,8 +32,20 @@ export const mrcFormat: VolumeFormat = {
 
     const nsymbt = Math.max(0, view.getInt32(92, true));
     const voxOffset = 1024 + nsymbt;
+
+    // mapc/mapr/maps describe how the stored columns/rows/sections map to
+    // the three cell axes. Most files use the identity mapping.
+    const axisMap = [view.getInt32(64, true), view.getInt32(68, true), view.getInt32(72, true)];
+    let sform: number[][] | undefined;
+    if (axisMap.every(v => v >= 1 && v <= 3) && new Set(axisMap).size === 3 &&
+        !(axisMap[0] === 1 && axisMap[1] === 2 && axisMap[2] === 3)) {
+      const directions = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      axisMap.forEach((axis, column) => { directions[column][axis - 1] = 1; });
+      sform = sformFromDirections(directions, [dx, dy, dz], [0, 0, 0]);
+    }
+
     const header = makeNiftiHeader({
-      nx, ny, nz, dx, dy, dz, datatype, voxOffset,
+      nx, ny, nz, dx, dy, dz, datatype, voxOffset, sform,
       descrip: `MRC mode ${mode} (${nx}×${ny}×${nz})`,
     });
 

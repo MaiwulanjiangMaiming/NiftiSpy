@@ -183,3 +183,44 @@ export function sformFromMdc(
     [mdc[2][0] * spacing[0], mdc[2][1] * spacing[1], mdc[2][2] * spacing[2], origin[2]],
   ];
 }
+
+/**
+ * sform from per-axis world directions (columns) in RAS.
+ * `directions[j]` is the direction of voxel axis `j`.
+ */
+export function sformFromDirections(
+  directions: number[][],
+  spacing: [number, number, number],
+  origin: [number, number, number],
+): number[][] {
+  const sform = [
+    [0, 0, 0, origin[0]],
+    [0, 0, 0, origin[1]],
+    [0, 0, 0, origin[2]],
+  ];
+  for (let axis = 0; axis < 3; axis++) {
+    const dir = directions[axis] || [0, 0, 0];
+    for (let row = 0; row < 3; row++) {
+      sform[row][axis] = (dir[row] || 0) * spacing[axis];
+    }
+  }
+  return sform;
+}
+
+export function normalize3(v: number[]): number[] {
+  const n = Math.hypot(v[0] || 0, v[1] || 0, v[2] || 0);
+  return n > 0 ? [v[0] / n, v[1] / n, v[2] / n] : [0, 0, 0];
+}
+
+export function cross3(a: number[], b: number[]): number[] {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+}
+
+/** LPS → RAS coordinate/direction conversion. */
+export function lpsToRas(v: number[]): number[] {
+  return [-v[0], -v[1], v[2]];
+}

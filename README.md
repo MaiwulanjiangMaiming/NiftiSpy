@@ -59,12 +59,14 @@ Every non-NIfTI format is parsed in the extension host into the same NIfTI-shape
 - **Remote-SSH**: raw layouts (`.mrc`, `.npy`, raw NRRD, MetaImage) are sliced on the remote disk through the local proxy, so scrolling never transfers the whole volume. Large WAN volumes use slice mode; small files stream once through the forwarded proxy.
 - **Compressed / big-endian**: `.npz`, `.mgz`, gzip NRRD, compressed MetaImage and big-endian data are materialized once into a little-endian temporary file, so each slice request is a random read instead of a re-inflation.
 - **Detached headers**: `.nhdr` / `.mhd` resolve their external data file relative to the header and are read directly.
+- **Orientation**: NRRD `space directions/origin`, MetaImage `TransformMatrix/Offset`, MRC `mapc/mapr/maps` and FreeSurfer `Mdc/Pxyz` are mapped to an sform when present.
 - **Limitations**: read-only; complex/structured NumPy dtypes and MRC complex/float16 modes are rejected.
 
 ## DICOM Support
 
 - **Layouts**: single-frame and multi-frame (enhanced) DICOM, explicit/implicit VR little endian and explicit VR big endian
 - **Metadata**: PixelSpacing, slice spacing/thickness, and rescale slope/intercept are applied to the intensity scale
+- **Orientation**: ImageOrientationPatient / ImagePositionPatient are converted from LPS to RAS and published as an sform
 - **Remote-SSH**: uncompressed little-endian files are sliced straight from the remote disk; big-endian files are byte-swapped once
 - **Limitations**: compressed transfer syntaxes (JPEG, JPEG-LS, JPEG 2000, RLE, deflated) and DICOM series folders are not supported; export an uncompressed copy or a NIfTI volume for those
 

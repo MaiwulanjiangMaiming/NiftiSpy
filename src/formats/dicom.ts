@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import {
-  ensureLittleEndian, makeNiftiHeader, readFileBytes, readRange, toU8, writeTempVolume,
+  cross3, ensureLittleEndian, lpsToRas, makeNiftiHeader, normalize3,
+  readFileBytes, readRange, sformFromDirections, toU8, writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -24,6 +25,8 @@ const TAG = {
   rescaleSlope: 0x00281052,
   sliceThickness: 0x00180050,
   spacingBetweenSlices: 0x00180088,
+  imagePosition: 0x00200032,
+  imageOrientation: 0x00200037,
   floatPixelData: 0x7fe00008,
   doubleFloatPixelData: 0x7fe00009,
   pixelData: 0x7fe00010,
@@ -33,6 +36,7 @@ const NEEDED = new Set<number>([
   TAG.rows, TAG.columns, TAG.samplesPerPixel, TAG.photometric, TAG.numberOfFrames,
   TAG.bitsAllocated, TAG.pixelRepresentation, TAG.pixelSpacing, TAG.rescaleIntercept,
   TAG.rescaleSlope, TAG.sliceThickness, TAG.spacingBetweenSlices,
+  TAG.imagePosition, TAG.imageOrientation,
 ]);
 
 interface Syntax {
@@ -126,9 +130,26 @@ export const dicomFormat: VolumeFormat = {
       throw new Error('truncated DICOM pixel data');
     }
 
+    // ImageOrientationPatient / ImagePositionPatient are in LPS; convert the
+    // row/column directions and origin to RAS for the viewer's sform.
+    const iop = readDS(tags.get(TAG.imageOrientation));
+    const ipp = readDS(tags.get(TAG.imagePosition));
+    let sform: number[][] | undefined;
+    if (iop.length >= 6) {
+      const row = normalize3(lpsToRas(iop.slice(0, 3)));
+      const col = normalize3(lpsToRas(iop.slice(3, 6)));
+      if (row.some(v => v !== 0) && col.some(v => v !== 0)) {
+        const normal = cross3(row, col);
+        const origin: [number, number, number] = ipp.length >= 3
+          ? [-ipp[0], -ipp[1], ipp[2]]
+          : [0, 0, 0];
+        sform = sformFromDirections([row, col, normal], [dx, dy, dz], origin);
+      }
+    }
+
     const header = makeNiftiHeader({
       nx: cols, ny: rows, nz, dx, dy, dz, datatype, voxOffset: scan.pixelOffset,
-      slope, inter,
+      slope, inter, sform,
       descrip: `DICOM ${cols}×${rows}×${nz}`,
     });
 
