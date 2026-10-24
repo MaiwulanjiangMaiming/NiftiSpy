@@ -151,6 +151,32 @@ test('SSH forwarded localhost slices expose dimensions, compress losslessly, and
   assert.equal(p.shouldCompress({ headers: { 'accept-encoding': 'gzip;q=0', host: 'localhost' } }), false);
 });
 
+test('proxy routes require the session capability token and restrict CORS', async t => {
+  const p = await productionRuntime(), f = setup(t);
+  const proxy = new p.LocalFileProxy(); await proxy.start(); t.after(() => proxy.stop());
+  const url = proxy.registerFile({ scheme: 'file', fsPath: f.file, toString: () => `file://${f.file}` });
+  const sliceUrl = url.replace('/file/', '/slice/') + '/axial/16';
+
+  const good = await fetch(sliceUrl);
+  assert.equal(good.status, 200);
+  assert.equal(good.headers.get('X-Content-Type-Options'), 'nosniff');
+  await good.arrayBuffer();
+
+  const stripped = sliceUrl.replace(/\/[^/]+\/slice\//, '/slice/');
+  const forbidden = await fetch(stripped);
+  assert.equal(forbidden.status, 403);
+
+  const evil = await fetch(sliceUrl, { headers: { Origin: 'https://evil.example' } });
+  assert.equal(evil.status, 200);
+  assert.equal(evil.headers.get('Access-Control-Allow-Origin'), null);
+  await evil.arrayBuffer();
+
+  const webview = await fetch(sliceUrl, { headers: { Origin: 'vscode-webview://test' } });
+  assert.equal(webview.headers.get('Access-Control-Allow-Origin'), 'vscode-webview://test');
+  assert.match(webview.headers.get('Vary'), /Origin/);
+  await webview.arrayBuffer();
+});
+
 test('persistent slice frames retain exact dimensions and reject mixed factors/truncation', async () => {
   const p = await productionRuntime();
   const data = new Float32Array([1, -2, 3, 4, 5, 6]);

@@ -2,6 +2,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
 import * as zlib from 'zlib';
+import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { VolumeCache } from './VolumeCache';
 import { parseNiiHeaderQuick, timepointByteOffset } from './nifti/headerParser';
@@ -87,6 +88,12 @@ export class LocalFileProxy {
   private port = 0;
   private files = new Map<string, FileEntry>();
   private idCounter = 0;
+  /**
+   * Capability token for every route. The webview is the only client and
+   * receives the token in each registered URL; a local process or a website
+   * scanning 127.0.0.1 cannot read volumes without it.
+   */
+  private readonly token = randomBytes(18).toString('base64url');
   private cleanupInterval: NodeJS.Timeout | null = null;
   private volumeCache: VolumeCache | null;
   private stats: ConnectionStats = { protocol: 'http/1.1', activeStreams: 0, totalRequests: 0, pushedSlices: 0 };
@@ -197,7 +204,7 @@ export class LocalFileProxy {
       sliceCache: new Map(),
       lodCache: new Map(),
     });
-    return `http://127.0.0.1:${this.port}/file/${id}`;
+    return `http://127.0.0.1:${this.port}/${this.token}/file/${id}`;
   }
 
   getEntry(entryId: string): FileEntry | undefined {
@@ -326,6 +333,42 @@ export class LocalFileProxy {
     return { ...this.stats, activeStreams: this.activeStreamCount };
   }
 
+  /**
+   * Echo CORS only for VS Code webview origins. Unknown origins get no
+   * `Access-Control-Allow-Origin`, so a website cannot read a response even
+   * if it guesses the localhost port.
+   */
+  private applySecurityHeaders(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const origin = req.headers.origin;
+    let allowedOrigin: string | null = null;
+    if (!origin) {
+      // Local tests, benchmarks and curl-style clients still need the token.
+      allowedOrigin = '*';
+    } else if (origin === 'null') {
+      allowedOrigin = 'null';
+    } else if (origin.startsWith('vscode-webview://')) {
+      allowedOrigin = origin;
+    } else {
+      try {
+        const url = new URL(origin);
+        if (url.protocol === 'https:' &&
+            (url.hostname === 'vscode-cdn.net' || url.hostname.endsWith('.vscode-cdn.net') ||
+             url.hostname === 'vscode-webview.net' || url.hostname.endsWith('.vscode-webview.net'))) {
+          allowedOrigin = origin;
+        }
+      } catch {
+        // Malformed Origin: leave CORS disabled.
+      }
+    }
+
+    if (allowedOrigin) res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+    if (origin) res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding, X-NiftiSpy-Priority');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source, X-Width, X-Height, X-Factor, Server-Timing');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'no-referrer');
+  }
+
   private async handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse
@@ -333,9 +376,7 @@ export class LocalFileProxy {
     const _req = req as http.IncomingMessage;
     const _res = res as http.ServerResponse;
 
-    _res.setHeader('Access-Control-Allow-Origin', '*');
-    _res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding, X-NiftiSpy-Priority');
-    _res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source, X-Width, X-Height, X-Factor, Server-Timing');
+    this.applySecurityHeaders(_req, _res);
     _res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
     _res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
     _res.setHeader('Connection', 'keep-alive');
@@ -347,6 +388,21 @@ export class LocalFileProxy {
       _res.setHeader('X-Remote-Source', 'true');
     }
 
+    const rawUrl = _req.url || '';
+    const qIndex = rawUrl.indexOf('?');
+    const pathname = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
+    const query = qIndex >= 0 ? new URLSearchParams(rawUrl.slice(qIndex + 1)) : new URLSearchParams();
+
+    // Every route lives behind a per-session capability token. Without it a
+    // local port scanner (or a website probing 127.0.0.1) cannot read data.
+    const tokenPrefix = `/${this.token}/`;
+    if (!pathname.startsWith(tokenPrefix)) {
+      _res.writeHead(403);
+      _res.end('Forbidden');
+      return;
+    }
+    const routePath = pathname.slice(tokenPrefix.length - 1);
+
     if (_req.method === 'OPTIONS') {
       _res.writeHead(204);
       _res.end();
@@ -355,27 +411,22 @@ export class LocalFileProxy {
 
     this.stats.totalRequests++;
 
-    const statsMatch = _req.url?.match(/^\/stats$/);
+    const statsMatch = routePath === '/stats';
     if (statsMatch) {
       _res.writeHead(200, { 'Content-Type': 'application/json' });
       _res.end(JSON.stringify(this.getStats()));
       return;
     }
 
-    const rawUrl = _req.url || '';
-    const qIndex = rawUrl.indexOf('?');
-    const pathname = qIndex >= 0 ? rawUrl.slice(0, qIndex) : rawUrl;
-    const query = qIndex >= 0 ? new URLSearchParams(rawUrl.slice(qIndex + 1)) : new URLSearchParams();
-
-    const headerMatch = pathname.match(/^\/header\/(\d+)$/);
-    const previewMatch = pathname.match(/^\/preview\/(\d+)$/);
-    const previewBinMatch = pathname.match(/^\/preview-bin\/(\d+)$/);
-    const previewVolumeMatch = pathname.match(/^\/preview-volume\/(\d+)/);
-    const previewOrthoMatch = pathname.match(/^\/preview-ortho\/(\d+)$/);
-    const metaMatch = pathname.match(/^\/meta\/(\d+)$/);
-    const sliceMatch = pathname.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
-    const lodMatch = pathname.match(/^\/lod\/(\d+)\/(\d+)$/);
-    const fileMatch = pathname.match(/^\/file\/(\d+)$/);
+    const headerMatch = routePath.match(/^\/header\/(\d+)$/);
+    const previewMatch = routePath.match(/^\/preview\/(\d+)$/);
+    const previewBinMatch = routePath.match(/^\/preview-bin\/(\d+)$/);
+    const previewVolumeMatch = routePath.match(/^\/preview-volume\/(\d+)/);
+    const previewOrthoMatch = routePath.match(/^\/preview-ortho\/(\d+)$/);
+    const metaMatch = routePath.match(/^\/meta\/(\d+)$/);
+    const sliceMatch = routePath.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
+    const lodMatch = routePath.match(/^\/lod\/(\d+)\/(\d+)$/);
+    const fileMatch = routePath.match(/^\/file\/(\d+)$/);
     const match = headerMatch || previewMatch || previewBinMatch || previewVolumeMatch || previewOrthoMatch || metaMatch || sliceMatch || lodMatch || fileMatch;
     if (!match) {
       _res.writeHead(404);

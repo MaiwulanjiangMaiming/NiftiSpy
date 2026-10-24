@@ -25,7 +25,8 @@ export function compressResponse(data: Buffer, req: http.IncomingMessage, res: h
 
   const queuedTiming = res.getHeader('Server-Timing');
   if (queuedTiming && extraHeaders?.['Server-Timing']) headers['Server-Timing'] = `${queuedTiming}, ${extraHeaders['Server-Timing']}`;
-  res.setHeader('Vary', 'Accept-Encoding');
+  const priorVary = res.getHeader('Vary');
+  res.setHeader('Vary', priorVary ? `${String(priorVary)}, Accept-Encoding` : 'Accept-Encoding');
   const encodeStartedAt = performance.now();
   const send = (compressed?: Buffer) => {
     if (res.destroyed || res.writableEnded) return;
