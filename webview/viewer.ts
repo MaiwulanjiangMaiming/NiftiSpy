@@ -1,4 +1,5 @@
 import { NiiHeader, DATATYPE_NAMES, parseNiiHeader } from './nii-parser';
+import { errorMessage, isAbortError } from '../src/errors';
 import { WebGPURenderer } from './webgpuRenderer';
 import { WebGLRenderer } from './viewer/webglRenderer';
 import { COLORMAPS } from './viewer/colormaps';
@@ -18,7 +19,12 @@ import { deriveFileHash, getVolumeCacheDB, makeTypedArrayFromBuffer } from './Sl
 import { shouldAutoloadFullVolume as evaluateFullVolumePolicy, SLICE_MODE_MIN_BYTES } from '../src/volumePolicy';
 import { initWasmBindings, getWasmBindings } from './wasmBridge';
 
-declare function acquireVsCodeApi(): any;
+interface VsCodeApi {
+  postMessage(message: unknown): void;
+  getState?(): unknown;
+  setState?(state: unknown): void;
+}
+declare function acquireVsCodeApi(): VsCodeApi;
 const vscode = acquireVsCodeApi();
 
 interface VolumeImage {
@@ -80,6 +86,156 @@ interface PerformanceProfile {
 type RenderBackend = 'webgpu' | 'webgl3d' | 'webgl2d' | 'canvas2d';
 type TypedArray = Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
 
+interface NiftiWindowGlobals {
+  WORKER_URL?: string;
+  REG_WORKER_URL?: string;
+  __NII_WORKER_BLOB_URL__?: string;
+  __NII_REG_WORKER_BLOB_URL__?: string;
+  __niftiPerf?: unknown;
+  requestIdleCallback?: typeof requestIdleCallback;
+}
+const win = window as Window & NiftiWindowGlobals;
+
+
+type MessageSlices = Record<string, ArrayBuffer | ArrayBufferView | number[]>;
+
+interface SliceIdxMessage { axial: number; coronal: number; sagittal: number; }
+
+interface PreviewData {
+  header: NiiHeader;
+  globalMin: number;
+  globalMax: number;
+  slope: number;
+  inter: number;
+  sliceIdx: SliceIdxMessage;
+  slices?: MessageSlices;
+  axialSlice?: ArrayBuffer | Float32Array;
+  coronalSlice?: ArrayBuffer | Float32Array;
+  sagittalSlice?: ArrayBuffer | Float32Array;
+  partialPreview?: boolean;
+  deferFullVolume?: boolean;
+  remoteStreaming?: boolean;
+  url?: string;
+  validationToken?: string;
+  preParsedHeader?: NiiHeader;
+  loadId?: string;
+  headerInfo?: NiiHeader;
+  reason?: string;
+  type?: string;
+}
+
+interface WorkerStreamMessage extends PreviewData {
+  id?: number;
+  type: string;
+  value?: number;
+  stage?: string;
+  error?: string;
+  bytes?: number;
+  durationMs?: number;
+  rttMs?: number;
+  voxelData?: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+  factor?: number;
+}
+
+interface CacheStatsMessage {
+  type: string;
+  cacheHits?: number;
+  cacheMisses?: number;
+  cacheSize?: number;
+  cacheEntries?: number;
+}
+
+interface CachedVolumeMessage {
+  header: NiiHeader;
+  globalMin: number;
+  globalMax: number;
+  slope: number;
+  inter: number;
+  voxelData: unknown;
+  voxOffset: number;
+  voxelLength: number;
+  datatype: number;
+  sliceIdx: SliceIdxMessage;
+  perfExtTiming?: Record<string, unknown>;
+  perfVoxelBytes?: number;
+}
+
+interface ChunkedVolumeMessage {
+  chunk: ArrayBuffer;
+  index: number;
+  total: number;
+  isGzip: boolean;
+  fileName: string;
+  fileSize: number;
+  validationToken: string;
+  perfExtTiming?: Record<string, unknown>;
+}
+
+interface CompressedVolumeMessage {
+  compressedData: ArrayBuffer;
+  perfExtTiming?: Record<string, unknown>;
+}
+
+interface LodDataMessage {
+  level: number;
+  axial?: ArrayBuffer | number[];
+  axialW?: number;
+  axialH?: number;
+  coronal?: ArrayBuffer | number[];
+  coronalW?: number;
+  coronalH?: number;
+  sagittal?: ArrayBuffer | number[];
+  sagittalW?: number;
+  sagittalH?: number;
+}
+
+interface RegProgressMessage { phase?: string; pct?: number; }
+
+interface RegResultMessage {
+  alignM?: number;
+  cost?: number;
+  costMode?: string;
+  durationMs?: number;
+  nx: number; ny: number; nz: number;
+  dx: number; dy: number; dz: number;
+  orientation?: NiiHeader['orientation'];
+  srow_x: number[];
+  srow_y: number[];
+  srow_z: number[];
+  tplData: ArrayBuffer;
+  tplMax: number;
+  tplMin: number;
+  tplName: string;
+}
+
+interface RegLaunchOptions {
+  mode: string;
+  name?: string;
+  tplName?: string;
+  bytes?: number;
+  moving?: {
+    data: ArrayBuffer;
+    datatype: number;
+    littleEndian: boolean;
+    slope: number;
+    inter: number;
+    dims: number[];
+    srow_x: number[];
+    srow_y: number[];
+    srow_z: number[];
+  };
+  template?: Uint8Array;
+  templateVolume?: {
+    data: ArrayBuffer;
+    dims: number[];
+    srow_x: number[];
+    srow_y: number[];
+    srow_z: number[];
+  };
+}
+
+interface RegInitMessage extends RegLaunchOptions { type: string; }
+
 const DEBUG = typeof window !== 'undefined' && typeof URLSearchParams !== 'undefined' && new URLSearchParams(window.location.search).has('debug');
 
 const images: VolumeImage[] = [];
@@ -100,8 +256,8 @@ function verifySABSupport(): boolean {
     // If we got here, SAB is available
     sabAvailable = true;
     return true;
-  } catch (err: any) {
-    console.warn('[NiftiSpy] SharedArrayBuffer not available:', err?.message || err);
+  } catch (err) {
+    console.warn('[NiftiSpy] SharedArrayBuffer not available:', errorMessage(err));
     sabAvailable = false;
     return false;
   }
@@ -110,7 +266,7 @@ function verifySABSupport(): boolean {
 // Verify SAB support on load
 verifySABSupport();
 
-function createSharedVolumeBuffer(data: any /* TypedArray */): SharedArrayBuffer | null {
+function createSharedVolumeBuffer(data: TypedArray): SharedArrayBuffer | null {
   if (!sabAvailable) return null;
   try {
     // Reserve 8 bytes at the front for metadata (avoid corrupting first voxel)
@@ -225,11 +381,11 @@ interface QueuedVolumeLoad {
   reason: VolumeLoadReason;
   cancelled: boolean;
   run: () => void;
-  reject: (reason?: any) => void;
+  reject: (reason?: unknown) => void;
 }
 const volumeLoadQueue: QueuedVolumeLoad[] = [];
 let nextStreamRequestId = 2000;
-const workerStreamHandlers = new Map<number, (msg: any) => void>();
+const workerStreamHandlers = new Map<number, (msg: WorkerStreamMessage) => void>();
 let activeVolumeLoadKey: string | null = null;
 const volumeWorkers = new Map<string, Worker>();
 const volumeWorkerCancels = new Map<string, () => void>();
@@ -255,7 +411,7 @@ const viewFlips: Record<string, { flipX: boolean, flipY: boolean }> = {
 const perfMonitor = {
   previewLoads: [] as number[],
   fullLoads: [] as number[],
-  sliceTimings: [] as any[],
+  sliceTimings: [] as unknown[],
   renderTimes: [] as number[],
   failures: 0,
   evictions: 0,
@@ -297,7 +453,7 @@ const viewerConfig: ViewerConfig = {
   nativeAcceleration: 'auto',
 };
 
-const previewRequestCache = new Map<string, Promise<any | null>>();
+const previewRequestCache = new Map<string, Promise<PreviewData | null>>();
 let thumbnailObserver: IntersectionObserver | null = null;
 
 // Disk cache statistics (updated from worker responses)
@@ -310,7 +466,7 @@ const diskCacheStats = {
 
 function requestDiskCacheStats(): void {
   if (slicePool) {
-    slicePool.dispatch<any>({ type: 'getCacheStats' }).then((msg: any) => {
+    slicePool.dispatch<CacheStatsMessage>({ type: 'getCacheStats' }).then((msg) => {
       if (msg && msg.type === 'cacheStats') {
         diskCacheStats.cacheHits = msg.cacheHits || 0;
         diskCacheStats.cacheMisses = msg.cacheMisses || 0;
@@ -322,7 +478,7 @@ function requestDiskCacheStats(): void {
 }
 
 function publishPerfMonitor() {
-  (window as any).__niftiPerf = {
+  win.__niftiPerf = {
     previewLoads: [...perfMonitor.previewLoads],
     fullLoads: [...perfMonitor.fullLoads],
     sliceTimings: [...perfMonitor.sliceTimings],
@@ -356,9 +512,9 @@ function makeAbortError(): Error {
 }
 
 let nextWorkerRequestId = 1;
-const workerRequests = new Map<number, { resolve: (value: any) => void; reject: (reason?: any) => void }>();
+const workerRequests = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>();
 const sliceQualityTimers: Partial<Record<Axis, number>> = {};
-let workerStreamListener: ((message: any) => void) | null = null;
+let workerStreamListener: ((message: WorkerStreamMessage) => void) | null = null;
 
 // Row-major 3x3 identity for the MIP virtual trackball (see computeMIP).
 const MIP_IDENTITY: number[] = [1, 0, 0, 0, 1, 0, 0, 0, 1];
@@ -505,7 +661,7 @@ async function warmupConnection(url: string): Promise<void> {
         if (DEBUG) console.log('[NiftiSpy] connection warmup RTT:', rtt.toFixed(1), 'ms for', url);
       }
     } catch (err) {
-      if (DEBUG) console.log('[NiftiSpy] connection warmup failed:', (err as any)?.message || err);
+      if (DEBUG) console.log('[NiftiSpy] connection warmup failed:', errorMessage(err));
     }
   })();
   warmupCache.set(url, promise);
@@ -540,7 +696,7 @@ function injectPreconnectHint(url: string): void {
 // Matches the CPU painter's zoom/pan geometry (image rect centered in the
 // container + pan offsets); a missing dst covers the full canvas.
 function detectPerformance(): PerformanceProfile {
-  const nav = navigator as any;
+  const nav = navigator as Navigator & { deviceMemory?: number };
   const cores = nav.hardwareConcurrency || 4;
   const memoryMB = nav.deviceMemory ? nav.deviceMemory * 1024 : 4096;
 
@@ -656,7 +812,7 @@ function restartCrashedWorker(axis: Axis): void {
   const oldWorker = sliceWorkers[idx];
   if (oldWorker) {
     oldWorker.terminate();
-    sliceWorkers[idx] = null as any;
+    sliceWorkers[idx] = null as unknown as Worker;
   }
   // Worker will be recreated on next use via getSliceWorker
   console.warn(`[NiftiSpy] Restarted worker for ${axis}`);
@@ -678,12 +834,14 @@ let sliceWorkers: Worker[] = [];
 const AXIS_TO_WORKER_IDX: Record<Axis, number> = { axial: 0, coronal: 1, sagittal: 2 };
 let cachedBlobUrl: string | null = null;
 
+type WorkerPayload = Record<string, unknown> & { signal?: AbortSignal };
+
 class SliceWorkerPool {
   private workers: Worker[] = [];
   private idle: Worker[] = [];
   private maxSize: number;
   private blobUrl: string | null = null;
-  private queue: Array<{ payload: Record<string, any>; resolve: (v: any) => void; reject: (e: any) => void }> = [];
+  private queue: Array<{ payload: WorkerPayload; resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
 
   constructor(maxSize: number) { this.maxSize = maxSize; }
 
@@ -698,23 +856,24 @@ class SliceWorkerPool {
     }
   }
 
-  dispatch<T = any>(payload: Record<string, any>): Promise<T> {
+  dispatch<T = unknown>(payload: WorkerPayload): Promise<T> {
     return new Promise<T>((resolve, reject) => {
+      const resolveUnknown = (v: unknown) => resolve(v as T);
       const idleWorker = this.idle.shift();
       if (idleWorker) {
-        this.exec(idleWorker, payload, resolve, reject);
+        this.exec(idleWorker, payload, resolveUnknown, reject);
       } else if (this.workers.length < this.maxSize) {
         const w = new Worker(this.blobUrl!);
         attachWorkerRouter(w);
         this.workers.push(w);
-        this.exec(w, payload, resolve, reject);
+        this.exec(w, payload, resolveUnknown, reject);
       } else {
-        this.queue.push({ payload, resolve, reject });
+        this.queue.push({ payload, resolve: resolveUnknown, reject });
       }
     });
   }
 
-  private exec(worker: Worker, payload: Record<string, any>, resolve: (v: any) => void, reject: (e: any) => void): void {
+  private exec(worker: Worker, payload: WorkerPayload, resolve: (v: unknown) => void, reject: (e: unknown) => void): void {
     // AbortSignal cannot be structured-cloned into a Worker. Keep it on the
     // caller side (requestSliceFrame ignores replies after abort) and skip
     // queued requests that have already become obsolete.
@@ -726,8 +885,8 @@ class SliceWorkerPool {
     }
     const id = nextWorkerRequestId++;
     workerRequests.set(id, {
-      resolve: (msg: any) => { resolve(msg); this.release(worker); },
-      reject: (err: any) => { reject(err); this.release(worker); },
+      resolve: (msg: unknown) => { resolve(msg); this.release(worker); },
+      reject: (err: unknown) => { reject(err); this.release(worker); },
     });
     try {
       worker.postMessage({ ...message, id });
@@ -747,14 +906,14 @@ class SliceWorkerPool {
     }
   }
 
-  broadcast(message: Record<string, any>): void {
+  broadcast(message: Record<string, unknown>): void {
     for (const w of this.workers) w.postMessage(message);
   }
 
   /** Send a message to only the first worker — avoids duplicate downloads
    *  when loading a volume (broadcast would make every worker fetch the
    *  same file simultaneously, wasting 2/3 of bandwidth). */
-  sendToFirst(message: Record<string, any>): void {
+  sendToFirst(message: Record<string, unknown>): void {
     if (this.workers.length > 0) this.workers[0].postMessage(message);
   }
 
@@ -774,20 +933,20 @@ let slicePool: SliceWorkerPool | null = null;
 let slicePoolInit: Promise<void> | null = null;
 
 async function ensureWorkerBlobUrl(): Promise<string> {
-  if ((window as any).__NII_WORKER_BLOB_URL__) return (window as any).__NII_WORKER_BLOB_URL__;
+  if (win.__NII_WORKER_BLOB_URL__) return win.__NII_WORKER_BLOB_URL__!;
   if (cachedBlobUrl) return cachedBlobUrl;
-  const workerResp = await fetch((window as any).WORKER_URL);
+  const workerResp = await fetch(win.WORKER_URL!);
   if (!workerResp.ok) throw new Error(`Worker fetch failed: ${workerResp.status}`);
   const workerSrc = await workerResp.text();
   const blob = new Blob([workerSrc], { type: 'application/javascript' });
   cachedBlobUrl = URL.createObjectURL(blob);
-  (window as any).__NII_WORKER_BLOB_URL__ = cachedBlobUrl;
+  win.__NII_WORKER_BLOB_URL__ = cachedBlobUrl;
   return cachedBlobUrl;
 }
 
 function attachWorkerRouter(worker: Worker) {
-  if ((worker as any).__routerAttached) return;
-  (worker as any).__routerAttached = true;
+  if ((worker as Worker & { __routerAttached?: boolean }).__routerAttached) return;
+  (worker as Worker & { __routerAttached?: boolean }).__routerAttached = true;
   worker.onmessage = (ev) => {
     const msg = ev.data;
     if (msg?.type === 'bandwidthSample') {
@@ -855,22 +1014,22 @@ async function ensureAllSliceWorkers(): Promise<void> {
   await getSlicePool();
 }
 
-function broadcastToSliceWorkers(message: Record<string, any>): void {
+function broadcastToSliceWorkers(message: Record<string, unknown>): void {
   if (slicePool) slicePool.broadcast(message);
   for (const worker of sliceWorkers) {
     if (worker) worker.postMessage(message);
   }
 }
 
-function sendWorkerRequest<T = any>(worker: Worker, payload: Record<string, any>): Promise<T> {
+function sendWorkerRequest<T = unknown>(worker: Worker, payload: Record<string, unknown>): Promise<T> {
   const id = nextWorkerRequestId++;
   return new Promise<T>((resolve, reject) => {
-    workerRequests.set(id, { resolve, reject });
+    workerRequests.set(id, { resolve: v => resolve(v as T), reject });
     worker.postMessage({ ...payload, id });
   });
 }
 
-function registerWorkerStream(requestId: number, handler: (msg: any) => void) {
+function registerWorkerStream(requestId: number, handler: (msg: WorkerStreamMessage) => void) {
   workerStreamHandlers.set(requestId, handler);
 }
 
@@ -1032,7 +1191,7 @@ function tryUploadVolume3D() {
     // Convert Float64 to Float32 for GPU upload (extremely rare datatype)
     const gpuData = volumeData instanceof Float64Array
       ? Float32Array.from(volumeData)
-      : volumeData as any;
+      : volumeData as unknown as Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array;
     for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
       // Eagerly create the renderer BEFORE uploading: tryUploadVolume3D often
       // runs from applyImageState before the first paint, and glRenderers used
@@ -1061,7 +1220,7 @@ function tryUploadVolume3D() {
     if (volumeRaycaster) {
       const gpuData = volumeData instanceof Float64Array
         ? Float32Array.from(volumeData)
-        : volumeData as any;
+        : volumeData as unknown as Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array;
       volumeRaycaster.uploadVolume(gpuData, nx, ny, nz, dataSlope, dataInter);
     }
   }
@@ -1128,7 +1287,7 @@ function displayLoadedImage(img: VolumeImage): void {
   setupInteraction();
 }
 
-async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: any) => void, directFetchUrl?: string, preParsedHeader?: NiiHeader): Promise<any> {
+async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, progress?: (msg: WorkerStreamMessage) => void, directFetchUrl?: string, preParsedHeader?: NiiHeader): Promise<WorkerStreamMessage> {
   const worker = new Worker(await ensureWorkerBlobUrl());
   const requestId = nextStreamRequestId++;
   return new Promise((resolve, reject) => {
@@ -1147,7 +1306,7 @@ async function loadVolumeViaWorker(loadKey: string, url: string, gz: boolean, pr
       reject(makeAbortError());
     });
     worker.onmessage = (ev) => {
-      const msg = ev.data;
+      const msg = ev.data as WorkerStreamMessage;
       if (msg.id !== requestId) return;
       if (msg.type === 'progress' || msg.type === 'preview' || msg.type === 'previewVolume') {
         progress?.(msg);
@@ -1204,7 +1363,7 @@ function scheduleActiveImageLoad(index: number): void {
     activeLoadDebounceTimer = null;
     if (scheduledActiveIndex !== index || activeImageIdx !== index) return;
     void ensureImageData(index, 'active', 'auto').catch((err) => {
-      if ((err as any)?.name !== 'AbortError') {
+      if (!isAbortError(err)) {
         console.error('Failed to activate image:', err);
       }
     });
@@ -1238,8 +1397,8 @@ function maybeScheduleFullVolume(index: number): void {
   const small = currentFileSize > 0 && currentFileSize <= SLICE_MODE_MIN_BYTES;
   if (policy === 'eager' || (policy === 'adaptive' && (small || !deferFullVolume))) {
     void ensureImageData(index, 'active', 'auto').catch((err) => {
-      if ((err as any)?.name !== 'AbortError') {
-        loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
+      if (!isAbortError(err)) {
+        loadingText.textContent = 'Error: ' + errorMessage(err);
       }
     });
     return;
@@ -1352,7 +1511,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
             globalMax = msg.globalMax;
             dataSlope = msg.slope || 1;
             dataInter = msg.inter || 0;
-            volumeData = msg.voxelData;
+            volumeData = msg.voxelData!;
 
             const h = msg.header;
             sliceIdx.axial = Math.floor(h.nz / 2);
@@ -1369,11 +1528,11 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
             updateImagePicker();
           }
           if (images[activeImageIdx] === img && msg.type === 'progress') {
-            updateProgress(0.5 + msg.value * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
+            updateProgress(0.5 + (msg.value ?? 0) * 0.5, undefined, msg.stage ? `${msg.stage}...` : undefined);
           }
         }, img.directUrl, img.preParsedHeader);
         img.header = result.header;
-        img.data = result.voxelData;
+        img.data = result.voxelData!;
         img.min = result.globalMin;
         img.max = result.globalMax;
         img.slope = result.slope || 1;
@@ -1406,7 +1565,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
         if (index === activeImageIdx) scheduleNextImagePreload(index);
         return;
       } catch (err) {
-        if ((err as any)?.name === 'AbortError') throw err;
+        if (isAbortError(err)) throw err;
         lastError = err;
       }
     }
@@ -1414,7 +1573,7 @@ async function ensureImageData(index: number, priority: VolumeLoadPriority = 'ba
     publishPerfMonitor();
     throw lastError;
   }, priority, reason).catch((err) => {
-    img.state = (err as any)?.name === 'AbortError' ? 'preview' : 'error';
+    img.state = isAbortError(err) ? 'preview' : 'error';
     throw err;
   }).finally(() => {
     img.loadPromise = undefined;
@@ -1478,8 +1637,8 @@ async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
     if (signal.aborted) return;
     if (response.index !== sliceIdx[axis]) return;
     setCurrentSlice(axis, response.data, response.width || geometry.width, response.height || geometry.height, response.factor);
-  } catch (err: any) {
-    if (err?.name === 'AbortError') return;
+  } catch (err) {
+    if (isAbortError(err)) return;
     throw err;
   }
 }
@@ -2964,7 +3123,7 @@ function resampleOverlaySlice(
     const ix = Math.round(vx), iy = Math.round(vy), iz = Math.round(vz);
     if (ix < 0 || ix >= n1x || iy < 0 || iy >= n1y || iz < 0 || iz >= n1z) return NaN;
     const idx = iz * n1y * n1x + iy * n1x + ix;
-    return (d1 as any)[idx] * slope1 + inter1;
+    return (d1 as ArrayLike<number>)[idx] * slope1 + inter1;
   };
 
   const getVoxel1Lerp = (vx: number, vy: number, vz: number): number => {
@@ -2974,14 +3133,14 @@ function resampleOverlaySlice(
     const fx = vx - x0, fy = vy - y0, fz = vz - z0;
     const cx0 = Math.max(0, x0), cy0 = Math.max(0, y0), cz0 = Math.max(0, z0);
 
-    const v000 = (d1 as any)[cz0 * n1y * n1x + cy0 * n1x + cx0] * slope1 + inter1;
-    const v100 = (d1 as any)[cz0 * n1y * n1x + cy0 * n1x + x1] * slope1 + inter1;
-    const v010 = (d1 as any)[cz0 * n1y * n1x + y1 * n1x + cx0] * slope1 + inter1;
-    const v110 = (d1 as any)[cz0 * n1y * n1x + y1 * n1x + x1] * slope1 + inter1;
-    const v001 = (d1 as any)[z1 * n1y * n1x + cy0 * n1x + cx0] * slope1 + inter1;
-    const v101 = (d1 as any)[z1 * n1y * n1x + cy0 * n1x + x1] * slope1 + inter1;
-    const v011 = (d1 as any)[z1 * n1y * n1x + y1 * n1x + cx0] * slope1 + inter1;
-    const v111 = (d1 as any)[z1 * n1y * n1x + y1 * n1x + x1] * slope1 + inter1;
+    const v000 = (d1 as ArrayLike<number>)[cz0 * n1y * n1x + cy0 * n1x + cx0] * slope1 + inter1;
+    const v100 = (d1 as ArrayLike<number>)[cz0 * n1y * n1x + cy0 * n1x + x1] * slope1 + inter1;
+    const v010 = (d1 as ArrayLike<number>)[cz0 * n1y * n1x + y1 * n1x + cx0] * slope1 + inter1;
+    const v110 = (d1 as ArrayLike<number>)[cz0 * n1y * n1x + y1 * n1x + x1] * slope1 + inter1;
+    const v001 = (d1 as ArrayLike<number>)[z1 * n1y * n1x + cy0 * n1x + cx0] * slope1 + inter1;
+    const v101 = (d1 as ArrayLike<number>)[z1 * n1y * n1x + cy0 * n1x + x1] * slope1 + inter1;
+    const v011 = (d1 as ArrayLike<number>)[z1 * n1y * n1x + y1 * n1x + cx0] * slope1 + inter1;
+    const v111 = (d1 as ArrayLike<number>)[z1 * n1y * n1x + y1 * n1x + x1] * slope1 + inter1;
 
     const c00 = v000 * (1 - fx) + v100 * fx;
     const c10 = v010 * (1 - fx) + v110 * fx;
@@ -3064,7 +3223,7 @@ function sampleImageAtWorld(img: VolumeImage, wx: number, wy: number, wz: number
   }
   const ix = Math.round(vx), iy = Math.round(vy), iz = Math.round(vz);
   if (ix < 0 || ix >= h.nx || iy < 0 || iy >= h.ny || iz < 0 || iz >= h.nz) return null;
-  return (img.data as any)[iz * h.ny * h.nx + iy * h.nx + ix] * (img.slope || 1) + (img.inter || 0);
+  return (img.data as ArrayLike<number>)[iz * h.ny * h.nx + iy * h.nx + ix] * (img.slope || 1) + (img.inter || 0);
 }
 
 function paintOverlaySlice(axis: string, data0: Float32Array, data1: Float32Array,
@@ -3717,7 +3876,7 @@ function renderColormapPreview() {
   ctx.putImageData(imgData, 0, 0);
 }
 
-function updateHeaderPanel(info?: Record<string, any>) {
+function updateHeaderPanel(info?: NiiHeader) {
   const h = info ? info : header;
   if (!h) return;
   const content = document.getElementById('header-info-content');
@@ -3744,7 +3903,7 @@ function updateHeaderPanel(info?: Record<string, any>) {
   }
 
   // Compute orientation from sform/qform matrix — never show "unknown"
-  let orientation = h.orientation;
+  let orientation: string | undefined = h.orientation;
   if ((!orientation || orientation === 'unknown') && h.srow_x && h.srow_y && h.srow_z) {
     orientation = computeOrientationFromSform(h.srow_x, h.srow_y, h.srow_z);
   }
@@ -3798,7 +3957,16 @@ function toggleMaximize(view: string) {
   requestAnimationFrame(() => renderAllViews());
 }
 
-function applyPreviewData(previewData: any) {
+/** Preview slices arrive as Float32Array (binary) or number arrays (JSON). */
+function toPreviewSlice(value: unknown): Float32Array {
+  if (value instanceof Float32Array) return value;
+  if (value instanceof ArrayBuffer) return new Float32Array(value);
+  if (ArrayBuffer.isView(value)) return new Float32Array(value.buffer, value.byteOffset, value.byteLength / 4);
+  if (Array.isArray(value)) return new Float32Array(value);
+  return new Float32Array(0);
+}
+
+function applyPreviewData(previewData: PreviewData) {
   header = previewData.header;
   computeViewFlips();
   globalMin = previewData.globalMin;
@@ -3811,15 +3979,12 @@ function applyPreviewData(previewData: any) {
 
   // Reuse preview slice arrays directly — avoid unnecessary copy.
   // If slices are empty (placeholder), skip them.
-  const axialSlice = previewData.slices.axial?.length > 0
-    ? (previewData.slices.axial instanceof Float32Array ? previewData.slices.axial : new Float32Array(previewData.slices.axial))
-    : null;
-  const coronalSlice = previewData.slices.coronal?.length > 0
-    ? (previewData.slices.coronal instanceof Float32Array ? previewData.slices.coronal : new Float32Array(previewData.slices.coronal))
-    : null;
-  const sagittalSlice = previewData.slices.sagittal?.length > 0
-    ? (previewData.slices.sagittal instanceof Float32Array ? previewData.slices.sagittal : new Float32Array(previewData.slices.sagittal))
-    : null;
+  const axialPreview = toPreviewSlice(previewData.slices?.axial);
+  const coronalPreview = toPreviewSlice(previewData.slices?.coronal);
+  const sagittalPreview = toPreviewSlice(previewData.slices?.sagittal);
+  const axialSlice = axialPreview.length > 0 ? axialPreview : null;
+  const coronalSlice = coronalPreview.length > 0 ? coronalPreview : null;
+  const sagittalSlice = sagittalPreview.length > 0 ? sagittalPreview : null;
   if (axialSlice) setCurrentSlice('axial', axialSlice, header!.nx, header!.ny, 1);
   if (coronalSlice) setCurrentSlice('coronal', coronalSlice, header!.nx, header!.nz, 1);
   if (sagittalSlice) setCurrentSlice('sagittal', sagittalSlice, header!.ny, header!.nz, 1);
@@ -3832,7 +3997,7 @@ function applyPreviewData(previewData: any) {
   if (headerPanelVisible) updateHeaderPanel();
 }
 
-function setPrimaryImageFromPreview(previewData: any) {
+function setPrimaryImageFromPreview(previewData: PreviewData) {
   images.length = 0;
   images.push({
     header: previewData.header,
@@ -3846,9 +4011,9 @@ function setPrimaryImageFromPreview(previewData: any) {
     inter: previewData.inter || 0,
     colormap: colormap,
     preview: {
-      axial: previewData.slices.axial instanceof Float32Array ? previewData.slices.axial : new Float32Array(previewData.slices.axial),
-      coronal: previewData.slices.coronal?.length > 0 ? (previewData.slices.coronal instanceof Float32Array ? previewData.slices.coronal : new Float32Array(previewData.slices.coronal)) : new Float32Array(0),
-      sagittal: previewData.slices.sagittal?.length > 0 ? (previewData.slices.sagittal instanceof Float32Array ? previewData.slices.sagittal : new Float32Array(previewData.slices.sagittal)) : new Float32Array(0),
+      axial: toPreviewSlice(previewData.slices?.axial),
+      coronal: toPreviewSlice(previewData.slices?.coronal),
+      sagittal: toPreviewSlice(previewData.slices?.sagittal),
     },
     state: 'preview',
     lastAccess: Date.now(),
@@ -3857,12 +4022,12 @@ function setPrimaryImageFromPreview(previewData: any) {
   publishPerfMonitor();
 }
 
-function decodePreviewBinary(buffer: ArrayBuffer): any {
+function decodePreviewBinary(buffer: ArrayBuffer): PreviewData {
   const view = new DataView(buffer);
   let offset = 0;
   const headerLen = view.getUint32(offset, true); offset += 4;
   const headerJson = new TextDecoder().decode(new Uint8Array(buffer, offset, headerLen)); offset += headerLen;
-  const header = JSON.parse(headerJson);
+  const header = JSON.parse(headerJson) as NiiHeader;
   const globalMin = view.getFloat32(offset, true); offset += 4;
   const globalMax = view.getFloat32(offset, true); offset += 4;
   const sliceIdxData = {
@@ -3888,15 +4053,15 @@ function decodePreviewBinary(buffer: ArrayBuffer): any {
   };
 }
 
-async function fetchWithRetry(url: string, responseType: 'json' | 'arrayBuffer'): Promise<any | null> {
+async function fetchWithRetry(url: string): Promise<ArrayBuffer | null> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const fetchStart = Date.now();
     const resp = await fetch(url);
     if (resp.ok) {
-      const payload = responseType === 'arrayBuffer' ? await resp.arrayBuffer() : await resp.json();
+      const payload = await resp.arrayBuffer();
       const fetchDuration = Date.now() - fetchStart;
       const contentLength = Number(resp.headers.get('Content-Length') || 0);
-      bandwidthEstimator.addSample(contentLength || (responseType === 'arrayBuffer' ? payload.byteLength : JSON.stringify(payload).length), Math.max(1, fetchDuration));
+      bandwidthEstimator.addSample(contentLength || payload.byteLength, Math.max(1, fetchDuration));
       return payload;
     }
     const retryable = resp.status === 408 || resp.status === 425 || resp.status === 429 || resp.status >= 500;
@@ -3906,23 +4071,23 @@ async function fetchWithRetry(url: string, responseType: 'json' | 'arrayBuffer')
   return null;
 }
 
-async function fetchPreviewData(url: string = fileUrl): Promise<any | null> {
+async function fetchPreviewData(url: string = fileUrl): Promise<PreviewData | null> {
   if (previewRequestCache.has(url)) {
     return previewRequestCache.get(url)!;
   }
   const request = (async () => {
     const startedAt = performance.now();
-    let previewData: any | null = null;
+    let previewData: PreviewData | null = null;
     if (viewerConfig.previewMode === 'binary') {
       const previewBinUrl = url.replace('/file/', '/preview-bin/');
-      const buffer = await fetchWithRetry(previewBinUrl, 'arrayBuffer');
+      const buffer = await fetchWithRetry(previewBinUrl);
       if (buffer) {
         previewData = decodePreviewBinary(buffer);
       }
     }
     if (!previewData) {
       const previewUrl = url.replace('/file/', '/preview/');
-      const buffer = await fetchWithRetry(previewUrl, 'arrayBuffer');
+      const buffer = await fetchWithRetry(previewUrl);
       if (buffer) {
         previewData = decodePreviewBinary(buffer);
       }
@@ -3980,12 +4145,12 @@ let regSourceIdx = -1;   // image the transform will be attached to (moving)
 let regRefIdx = -1;      // reference image index (align flow only)
 
 async function ensureRegWorkerUrl(): Promise<string> {
-  if ((window as any).__NII_REG_WORKER_BLOB_URL__) return (window as any).__NII_REG_WORKER_BLOB_URL__;
-  const resp = await fetch((window as any).REG_WORKER_URL);
+  if (win.__NII_REG_WORKER_BLOB_URL__) return win.__NII_REG_WORKER_BLOB_URL__!;
+  const resp = await fetch(win.REG_WORKER_URL!);
   if (!resp.ok) throw new Error(`Reg worker fetch failed: ${resp.status}`);
   const src = await resp.text();
   const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-  (window as any).__NII_REG_WORKER_BLOB_URL__ = url;
+  win.__NII_REG_WORKER_BLOB_URL__ = url;
   return url;
 }
 
@@ -4049,7 +4214,7 @@ async function cancelRegistration(): Promise<void> {
   showRegStatus('idle', 'Registration cancelled.');
 }
 
-function handleRegProgress(d: any): void {
+function handleRegProgress(d: RegProgressMessage): void {
   if (!regBusy) return;
   showRegStatus('busy', d.phase ? `${d.phase}… ${Math.round((d.pct ?? 0) * 100)}%` : 'Registering…', d.pct);
 }
@@ -4061,7 +4226,7 @@ function handleRegFailure(message: string, cancelled: boolean): void {
   console.error('[NiftiSpy] Registration:', message);
 }
 
-async function launchRegWorker(m: any): Promise<void> {
+async function launchRegWorker(m: RegLaunchOptions): Promise<void> {
   try {
     showRegStatus('busy', `Registering to ${m.name}…`, 0);
     const srcImg = images[regSourceIdx];
@@ -4090,7 +4255,7 @@ async function launchRegWorker(m: any): Promise<void> {
     };
     w.onerror = () => handleRegFailure('Registration worker crashed', false);
 
-    const msg: any = {
+    const msg: RegInitMessage = {
       type: 'initReg',
       mode: m.mode,
       tplName: m.name,
@@ -4105,7 +4270,7 @@ async function launchRegWorker(m: any): Promise<void> {
         srow_y: h.srow_y,
         srow_z: h.srow_z,
       },
-      template: new Uint8Array(m.bytes),
+      template: new Uint8Array(m.bytes ?? 0),
     };
     // Compare-mode Align flow: the reference is another loaded image, shipped
     // as a pre-decoded volume instead of NIfTI bytes.
@@ -4125,8 +4290,8 @@ async function launchRegWorker(m: any): Promise<void> {
       showRegStatus('busy', `Aligning ${srcImg.name} → ${refImg.name}…`, 0);
     }
     w.postMessage(msg);
-  } catch (err: any) {
-    handleRegFailure(err?.message || String(err), false);
+  } catch (err) {
+    handleRegFailure(errorMessage(err), false);
   }
 }
 
@@ -4165,7 +4330,7 @@ async function startAlign(refIdx: number): Promise<void> {
   void launchRegWorker({ mode: 'custom', name: ref.name });
 }
 
-function finishRegistration(d: any): void {
+function finishRegistration(d: RegResultMessage): void {
   try {
     terminateRegWorker();
     const srcImg = images[regSourceIdx];
@@ -4235,8 +4400,8 @@ function finishRegistration(d: any): void {
       enterCompareOverlayUI();
       showRegStatus('ok', `Aligned to ${tplTag} in ${secs}s${cm} · original preserved, overlay shown`);
     }
-  } catch (err: any) {
-    handleRegFailure(err?.message || String(err), false);
+  } catch (err) {
+    handleRegFailure(errorMessage(err), false);
   }
 }
 
@@ -4354,7 +4519,7 @@ window.addEventListener('message', async (e) => {
 
     if (images.length === 0) {
       images.push({
-        header: null as any,
+        header: null as unknown as NiiHeader,
         data: null,
         min: 0,
         max: 1,
@@ -4383,8 +4548,8 @@ window.addEventListener('message', async (e) => {
     updateProgress(0.02, 'Streaming volume (fast path)...', 'Stream');
     setupInteraction();
 
-    void ensureImageData(activeImageIdx, 'active').catch((err: any) => {
-      if (err?.name === 'AbortError') return;
+    void ensureImageData(activeImageIdx, 'active').catch((err) => {
+      if (isAbortError(err)) return;
       vscode.postMessage({
         type: 'remoteHttpFallback',
         webviewId: currentWebviewId,
@@ -4611,7 +4776,7 @@ window.addEventListener('message', async (e) => {
   }
 });
 
-function toFloat32Array(val: any, fallbackKey: string, msg: any): Float32Array {
+function toFloat32Array(val: unknown, fallbackKey: string, msg: { slices?: MessageSlices }): Float32Array {
   if (val instanceof ArrayBuffer) return new Float32Array(val);
   if (ArrayBuffer.isView(val)) return new Float32Array(val.buffer, val.byteOffset, val.byteLength / 4);
   const arr = msg.slices?.[fallbackKey];
@@ -4670,7 +4835,7 @@ function extractAxialZ0(raw: Uint8Array, hdr: NiiHeader): Float32Array | null {
   return out;
 }
 
-function applyRemoteOrthoPreview(msg: any): void {
+function applyRemoteOrthoPreview(msg: PreviewData): void {
   if ((volumeData && fullVolumeLoaded) || (msg.url && msg.url !== fileUrl)) return;
   if (msg.validationToken && msg.validationToken !== remotePreviewToken) return;
   // Scrolling transfers ownership of all planes to the interactive slice pipeline.
@@ -4696,7 +4861,7 @@ function applyRemoteOrthoPreview(msg: any): void {
   renderAllViews();
 }
 
-function showPartialPreviewFromMessage(msg: any, opts?: { fetchMissingSlices?: boolean }): void {
+function showPartialPreviewFromMessage(msg: PreviewData, opts?: { fetchMissingSlices?: boolean }): void {
   if (volumeData && fullVolumeLoaded) return;
   if (msg.deferFullVolume) deferFullVolume = true;
 
@@ -4794,7 +4959,7 @@ function showPartialPreviewFromMessage(msg: any, opts?: { fetchMissingSlices?: b
   }
 }
 
-function handleDirectPreview(msg: any): void {
+function handleDirectPreview(msg: PreviewData): void {
   // Remote streaming fast path: Extension Host skipped the preview download
   // because the Worker will stream the remote file directly (overlapping
   // download + decompress + early slice extraction). Start the Worker
@@ -4808,7 +4973,7 @@ function handleDirectPreview(msg: any): void {
 
     images.length = 0;
     images.push({
-      header: null as any,
+      header: null as unknown as NiiHeader,
       data: null,
       min: 0,
       max: 1,
@@ -4846,8 +5011,8 @@ function handleDirectPreview(msg: any): void {
     }
 
     void ensureImageData(0, 'active').catch((err) => {
-      if ((err as any)?.name !== 'AbortError') {
-        loadingText.textContent = 'Error: ' + ((err as any)?.message || String(err));
+      if (!isAbortError(err)) {
+        loadingText.textContent = 'Error: ' + errorMessage(err);
       }
     });
     return;
@@ -4926,7 +5091,7 @@ function handleDirectPreview(msg: any): void {
  * DecompressionStream, collect the decompressed output, and render once
  * complete. Early preview is shown as soon as the header is parseable.
  */
-async function handleChunkedVolume(msg: any): Promise<void> {
+async function handleChunkedVolume(msg: ChunkedVolumeMessage): Promise<void> {
   // First chunk: initialize streaming decompression state
   if (msg.index === 0) {
     // Abort any previous chunked transfer (user switched files)
@@ -4957,7 +5122,7 @@ async function handleChunkedVolume(msg: any): Promise<void> {
     // The DecompressionStream pipes it to decompressed output.
     const compressedStream = new ReadableStream<Uint8Array>({
       start(controller) {
-        (chunkedState as any).controller = controller;
+        chunkedState!.controller = controller;
       },
     });
 
@@ -4966,8 +5131,8 @@ async function handleChunkedVolume(msg: any): Promise<void> {
     const useGzip = msg.isGzip !== false;
     let decompressedStream: ReadableStream<Uint8Array> = compressedStream;
     if (useGzip) {
-      const ds = new (self as any).DecompressionStream('gzip');
-      decompressedStream = compressedStream.pipeThrough(ds) as unknown as ReadableStream<Uint8Array>;
+      const ds = new DecompressionStream('gzip');
+      decompressedStream = compressedStream.pipeThrough(ds as unknown as ReadableWritablePair<Uint8Array, Uint8Array>) as unknown as ReadableStream<Uint8Array>;
     }
     void readDecompressedStream(decompressedStream);
   }
@@ -5139,9 +5304,9 @@ async function readDecompressedStream(decompressedStream: ReadableStream<Uint8Ar
 
 // Cache for perfExtTiming from the last chunked message (readDecompressedStream
 // runs in a separate async context and can't access the msg parameter).
-let msg_perfExtTimingCache: any = null;
+let msg_perfExtTimingCache: Record<string, unknown> | null = null;
 
-async function handleCompressedVolume(msg: any): Promise<void> {
+async function handleCompressedVolume(msg: CompressedVolumeMessage): Promise<void> {
   const receiveTime = performance.now();
   const compressed = new Uint8Array(msg.compressedData as ArrayBuffer);
   const extTiming = msg.perfExtTiming || {};
@@ -5149,7 +5314,7 @@ async function handleCompressedVolume(msg: any): Promise<void> {
   // Feature detection: DecompressionStream is available in all modern
   // Chromium/WebView2 builds (VS Code's webview engine). If absent
   // (ancient runtime), fall back to the HTTP-proxy preview path.
-  const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
+  const hasNativeDecompress = typeof DecompressionStream !== 'undefined';
   if (!hasNativeDecompress) {
     fallbackToHttpPreview();
     return;
@@ -5181,7 +5346,7 @@ async function handleCompressedVolume(msg: any): Promise<void> {
   // Browser-native streaming inflate. The actual DEFLATE work runs off
   // the main thread in the renderer's compression service, so UI stays
   // responsive; we only do lightweight memcpy + header parse per chunk.
-  const ds = new (self as any).DecompressionStream('gzip');
+  const ds = new DecompressionStream('gzip');
   const resp = new Response(compressed);
   const decompressedStream = resp.body!.pipeThrough(ds);
   const reader = (decompressedStream as ReadableStream<Uint8Array>).getReader();
@@ -5369,7 +5534,7 @@ function computeVolumeStatsWebview(rawData: Uint8Array, header: NiiHeader): { mi
   return { min, max };
 }
 
-function handleCachedVolume(msg: any): void {
+function handleCachedVolume(msg: CachedVolumeMessage): void {
   // Webview performance.now() origin differs from extension host origin,
   // so we cannot subtract extension sendTime from webview receiveTime.
   // Instead, we measure the webview-internal interval (receive → render done)
@@ -5398,24 +5563,25 @@ function handleCachedVolume(msg: any): void {
   const datatype = msg.datatype || 16;
   let voxelBuffer: ArrayBuffer | null = null;
   let voxOffset = 0;   // byte offset within voxelBuffer where voxel data starts
-  if (msg.voxelData instanceof ArrayBuffer) {
-    voxelBuffer = msg.voxelData;
+  const voxelData = msg.voxelData;
+  if (voxelData instanceof ArrayBuffer) {
+    voxelBuffer = voxelData;
     voxOffset = msg.voxOffset || 0;
-  } else if (msg.voxelData?.buffer instanceof ArrayBuffer) {
+  } else if (ArrayBuffer.isView(voxelData)) {
     // Legacy path: caller passed a typed-array view. Slice it out.
-    const view = msg.voxelData;
-    voxelBuffer = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
+    voxelBuffer = voxelData.buffer.slice(voxelData.byteOffset, voxelData.byteOffset + voxelData.byteLength) as ArrayBuffer;
     voxOffset = 0;
-  } else if (Array.isArray(msg.voxelData)) {
-    const f32 = new Float32Array(msg.voxelData);
-    voxelBuffer = f32.buffer.slice(f32.byteOffset, f32.byteOffset + f32.byteLength);
+  } else if (Array.isArray(voxelData)) {
+    const f32 = new Float32Array(voxelData);
+    voxelBuffer = f32.buffer.slice(f32.byteOffset, f32.byteOffset + f32.byteLength) as ArrayBuffer;
     voxOffset = 0;
-  } else if (msg.voxelData && typeof msg.voxelData === 'object' && msg.voxelData.byteLength !== undefined) {
+  } else if (voxelData && typeof voxelData === 'object' && 'byteLength' in voxelData) {
     try {
-      const keys = Object.keys(msg.voxelData);
+      const record = voxelData as Record<number, number>;
+      const keys = Object.keys(record);
       if (keys.length > 0) {
         const arr = new Uint8Array(keys.length);
-        for (let i = 0; i < keys.length; i++) arr[i] = msg.voxelData[i];
+        for (let i = 0; i < keys.length; i++) arr[i] = record[i];
         voxelBuffer = arr.buffer;
         voxOffset = 0;
       }
@@ -5556,7 +5722,7 @@ function handleCachedVolume(msg: any): void {
   }
 }
 
-function handleLODData(msg: any): void {
+function handleLODData(msg: LodDataMessage): void {
   if (!enableLOD || !header) return;
   const level = msg.level as number;
 
@@ -5673,7 +5839,7 @@ function applyLODTransition(axis: Axis): void {
   });
 }
 
-function setPrimaryImageFromDirectPreview(msg: any, axial: Float32Array, coronal: Float32Array, sagittal: Float32Array): void {
+function setPrimaryImageFromDirectPreview(msg: PreviewData, axial: Float32Array, coronal: Float32Array, sagittal: Float32Array): void {
   images.length = 0;
   images.push({
     header: msg.header,
@@ -5723,8 +5889,8 @@ async function fallbackToHttpPreview(): Promise<void> {
     } catch (_) {}
 
     loadFullVolume();
-  } catch (err: any) {
-    loadingText.textContent = 'Error: ' + (err?.message ?? String(err));
+  } catch (err) {
+    loadingText.textContent = 'Error: ' + errorMessage(err);
   }
 }
 
@@ -5753,7 +5919,7 @@ function loadFullVolume() {
 
   workerStreamListener = (d) => {
     if (d.type === 'progress') {
-      updateProgress(0.5 + d.value * 0.5, undefined, d.stage ? `${d.stage}...` : undefined);
+      updateProgress(0.5 + (d.value ?? 0) * 0.5, undefined, d.stage ? `${d.stage}...` : undefined);
       return;
     }
     if (d.type === 'error') {
@@ -5774,7 +5940,7 @@ function loadFullVolume() {
       globalMax = d.globalMax;
       dataSlope = d.slope || 1;
       dataInter = d.inter || 0;
-      volumeData = d.voxelData;
+      volumeData = d.voxelData!;
 
       // Center slices within the low-res volume
       const h = d.header;
@@ -5819,9 +5985,9 @@ function loadFullVolume() {
         initialWindowLevel = windowLevel;
 
         const h = d.header;
-        paintSlice('axial', d.slices.axial, h.nx, h.ny, h.nx * h.dx, h.ny * h.dy);
-        paintSlice('coronal', d.slices.coronal, h.nx, h.nz, h.nx * h.dx, h.nz * h.dz);
-        paintSlice('sagittal', d.slices.sagittal, h.ny, h.nz, h.ny * h.dy, h.nz * h.dz);
+        paintSlice('axial', toPreviewSlice(d.slices?.axial), h.nx, h.ny, h.nx * h.dx, h.ny * h.dy);
+        paintSlice('coronal', toPreviewSlice(d.slices?.coronal), h.nx, h.nz, h.nx * h.dx, h.nz * h.dz);
+        paintSlice('sagittal', toPreviewSlice(d.slices?.sagittal), h.ny, h.nz, h.ny * h.dy, h.nz * h.dz);
 
         updateFileInfo();
         updateSliderValues();
@@ -5835,7 +6001,7 @@ function loadFullVolume() {
     if (d.type === 'volume') {
       if (volumeReceived) return;
       volumeReceived = true;
-      volumeData = d.voxelData;
+      volumeData = d.voxelData!;
       fullVolumeLoaded = true;
       // Full-resolution volume arrived — clear the low-res preview state.
       // `header` may already be set from `previewVolume`; only override if
@@ -5866,7 +6032,7 @@ function loadFullVolume() {
       const primary = images[0];
       if (primary) {
         primary.header = d.header;
-        primary.data = d.voxelData;
+        primary.data = d.voxelData!;
         primary.min = d.globalMin;
         primary.max = d.globalMax;
         primary.slope = d.slope || 1;
@@ -5876,7 +6042,7 @@ function loadFullVolume() {
       } else {
         images.push({
           header: d.header,
-          data: d.voxelData,
+          data: d.voxelData!,
           min: d.globalMin,
           max: d.globalMax,
           name: fileName,
@@ -6064,7 +6230,7 @@ function updateImagePicker() {
     if (idx === activeImageIdx || idx < 3 || !thumbnailObserver) {
       const renderThumb = () => renderThumbnail(thumbCanvas, img);
       if ('requestIdleCallback' in window) {
-        (window as any).requestIdleCallback(renderThumb, { timeout: 120 });
+        win.requestIdleCallback?.(renderThumb, { timeout: 120 });
       } else {
         globalThis.setTimeout(renderThumb, 0);
       }
@@ -6163,7 +6329,7 @@ async function loadNewImage(url: string, name: string, _gz: boolean, _remote?: b
 
   pendingAddImageIdx = images.length;
   images.push({
-    header: null as any,
+    header: null as unknown as NiiHeader,
     data: null,
     min: 0,
     max: 1,

@@ -9,13 +9,43 @@ import { buildViewerHtml } from './editor/html';
 import { LocalVolumeLoader } from './editor/localLoader';
 import { VolumeCache } from './VolumeCache';
 import { getNativeBindings } from './nativeBridge';
-import { parseNiiHeaderQuick } from './nifti/headerParser';
+import { parseNiiHeaderQuick, type NiiHeader } from './nifti/headerParser';
 import { prepareParsedPayload } from './formats/payload';
 import { findVolumeFormat, VOLUME_EXTENSIONS } from './formats/registry';
 import { removeTempVolumes } from './formats/header';
 import type { ParsedVolume, VolumeFormat } from './formats/types';
 import { isWanRemote, shouldUseSliceMode } from './remoteEnv';
 import { resolveAnalyzePair, isAnalyzeHeaderPath } from './io/analyzePair';
+import { errorMessage } from './errors';
+
+interface PerfTiming {
+  fsToFirstData?: number;
+  headerParse?: number;
+  previewReady?: number;
+  totalDecompress?: number;
+  statsCompute?: number;
+  nativeDecompress?: number;
+  postMessageSync?: number;
+  decompressedBytes?: number;
+  nativeBackend?: string;
+}
+
+interface PerfExt {
+  stream?: PerfTiming;
+  isRemoteSSH?: boolean;
+  totalLoad?: number;
+  downcastOrStats?: number;
+  cacheSet?: number;
+  postMessageSync?: number;
+}
+
+interface PerfReportMessage {
+  fileName?: string;
+  isGzip?: boolean;
+  voxelBytes: number;
+  viewSetupMs?: number;
+  ext?: PerfExt;
+}
 
 export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private proxy: LocalFileProxy | null = null;
@@ -135,7 +165,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     }
   }
 
-  private handlePerfReport(msg: any): void {
+  private handlePerfReport(msg: PerfReportMessage): void {
     try {
       const ext = msg.ext || {};
       const stream = ext.stream || {};
@@ -193,8 +223,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         }
         const decompressedMB = ((stream.decompressedBytes || 0) / (1024 * 1024)).toFixed(1);
         lines.push(`│   ${tag} decompressed size : ${decompressedMB} MB`);
-        if (stream.totalDecompress > 0 && stream.decompressedBytes > 0) {
-          const throughput = ((stream.decompressedBytes / (1024 * 1024)) / (stream.totalDecompress / 1000)).toFixed(0);
+        if ((stream.totalDecompress ?? 0) > 0 && (stream.decompressedBytes ?? 0) > 0) {
+          const totalDecompress = stream.totalDecompress!;
+          const decompressedBytes = stream.decompressedBytes!;
+          const throughput = ((decompressedBytes / (1024 * 1024)) / (totalDecompress / 1000)).toFixed(0);
           lines.push(`│   ${tag} decompress throughput: ${throughput} MB/s`);
         }
       }
@@ -457,9 +489,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
                 parsedFb.webview, parsedFb.uri.toString(), parsed.header, parsed.rawData, parsedFb.signal
               );
             }
-          } catch (err: any) {
+          } catch (err) {
             if (parsedFb.signal.aborted) return;
-            const message = err?.message || String(err);
+            const message = errorMessage(err);
             parsedFb.webview.postMessage({ type: 'loadError', message });
             vscode.window.showErrorMessage(`NiftiSpy: cannot open ${path.basename(parsedFb.uri.fsPath || parsedFb.uri.path)} — ${message}`);
           }
@@ -630,19 +662,19 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             name: path.basename(tplPath),
             bytes,
           });
-        } catch (err: any) {
+        } catch (err) {
           webview.postMessage({
             type: 'regStatus',
             mode: msg.mode,
             ok: false,
-            message: `Template load failed: ${err?.message || String(err)}`,
+            message: `Template load failed: ${errorMessage(err)}`,
           });
         }
       }
     });
   }
 
-  private parseNiiHeaderFromBuffer(buf: Uint8Array, separateImg = false): any | null {
+  private parseNiiHeaderFromBuffer(buf: Uint8Array, separateImg = false): NiiHeader | null {
     return parseNiiHeaderQuick(buf, { separateImg });
   }
 
@@ -710,9 +742,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       if (signal.aborted) return;
       if (!parsed.rawData) throw new Error('parser produced no voxel data');
       this.publishParsedVolume(webview, uriKey, parsed.header, parsed.rawData, signal);
-    } catch (err: any) {
+    } catch (err) {
       if (signal.aborted) return;
-      const message = err?.message || String(err);
+      const message = errorMessage(err);
       webview.postMessage({ type: 'loadError', message });
       vscode.window.showErrorMessage(
         `NiftiSpy: cannot open ${path.basename(uri.fsPath || uri.path)} — ${message}`
@@ -845,8 +877,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     if (fsPath && (uri.scheme === 'file' || uri.scheme.startsWith('vscode-remote'))) {
       try {
         return { parsed: await format.parse(fsPath, { memory }), tempFiles: [] };
-      } catch (err: any) {
-        if (err?.code !== 'ENOENT') throw err;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
       }
     }
     const bytes = new Uint8Array(await vscode.workspace.fs.readFile(uri));
@@ -871,7 +903,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private publishParsedVolume(
     webview: vscode.Webview,
     uriKey: string,
-    header: any,
+    header: NiiHeader,
     rawData: Uint8Array,
     signal: AbortSignal
   ): void {

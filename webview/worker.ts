@@ -2,6 +2,7 @@ import { gunzip } from 'fflate';
 import { parseNiiHeader, type NiiHeader } from './nii-parser';
 import { SliceCacheDB, deriveFileHash, getSliceCacheDB } from './SliceCacheDB';
 import { SliceService } from './worker/slices';
+import { asError, errorMessage, isAbortError } from '../src/errors';
 import { initWasmBindings, getWasmBindings, type WasmBindings } from './wasmBridge';
 
 // Initialize WASM SIMD module (async, non-blocking)
@@ -16,6 +17,8 @@ initWasmBindings().then(bindings => {
 });
 
 let volumeFetchPriority: 'user' | 'background' = 'background';
+
+type ByteWriter = { write(data: Uint8Array): Promise<void>; close(): Promise<void>; abort(reason?: unknown): Promise<void> };
 
 const MAX_RETRIES = 3;
 const CHUNK_SIZE = 16 * 1024 * 1024;
@@ -95,11 +98,11 @@ self.onmessage = async (e: MessageEvent) => {
     } else if (type === 'getCacheStats') {
       await handleGetCacheStats(id);
     }
-  } catch (err: any) {
-    if (err?.name === 'AbortError') {
+  } catch (err) {
+    if (isAbortError(err)) {
       self.postMessage({ id, type: 'cancelled' });
     } else {
-      self.postMessage({ id, type: 'error', error: String(err?.message ?? err) });
+      self.postMessage({ id, type: 'error', error: errorMessage(err) });
     }
   }
 };
@@ -193,9 +196,9 @@ async function fetchWithRetry(url: string, options?: RequestInit, retries: numbe
         continue;
       }
       return resp;
-    } catch (err: any) {
-      lastErr = err;
-      if (err?.name === 'AbortError') throw err;
+    } catch (err) {
+      lastErr = asError(err);
+      if (isAbortError(err)) throw err;
       if (attempt < retries - 1) {
         await sleep(RETRY_DELAY_BASE * Math.pow(2, attempt));
       }
@@ -315,7 +318,7 @@ async function fetchHeadersWatchdog(
 
   try {
     return await fetch(url, { ...init, signal: ctrl.signal });
-  } catch (err: any) {
+  } catch (err) {
     if (timedOut) throw makeIdleError();
     throw err;
   } finally {
@@ -361,9 +364,9 @@ async function fetchRangeBytesWithRetry(
     throwIfAborted(signal);
     try {
       return await fetchRangeWatchdog(url, { Range: `bytes=${start}-${end}` }, idleMs, signal);
-    } catch (err: any) {
-      if (err?.name === 'AbortError') throw err;
-      lastErr = err;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      lastErr = asError(err);
       if (attempt < retries - 1) {
         await sleep(RETRY_DELAY_BASE * Math.pow(2, attempt));
       }
@@ -394,7 +397,7 @@ async function nativeDecompressWithEarlyPreview(
   signal: AbortSignal,
   isGzip: boolean,
 ): Promise<Uint8Array> {
-  const ds = new (self as any).DecompressionStream('gzip');
+  const ds = new DecompressionStream('gzip');
   const decompressedStream = resp.body!.pipeThrough(ds);
   const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 
@@ -561,7 +564,7 @@ async function nativeDecompressWithEarlyPreview(
 }
 
 async function nativeDecompress(resp: Response, signal?: AbortSignal): Promise<Uint8Array> {
-  const ds = new (self as any).DecompressionStream('gzip');
+  const ds = new DecompressionStream('gzip');
   const decompressedStream = resp.body!.pipeThrough(ds);
 
   // Try to pre-allocate from Content-Length if available
@@ -630,8 +633,8 @@ async function downloadChunked(url: string, id: number, isGzip: boolean, signal?
         acceptRanges = headResp.headers.get('Accept-Ranges') === 'bytes';
         headCache.set(url, { totalSize, acceptRanges });
       }
-    } catch (err: any) {
-      if (err?.name === 'AbortError') throw err;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
       // HEAD failed — will fall through to single GET
     }
   }
@@ -678,9 +681,8 @@ async function downloadChunked(url: string, id: number, isGzip: boolean, signal?
                 value: progressBase + (received / totalSize) * progressRange,
                 stage: 'downloading',
               });
-            } catch (err: any) {
-              if (err?.name === 'AbortError') { poolError = err; }
-              else { poolError = err; }
+            } catch (err) {
+              poolError = asError(err);
             }
 
             running--;
@@ -782,13 +784,13 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
   if (!needsConversion) {
     // Fast path: no slope/inter conversion needed
     for (let i = 0; i < n; i += sampleStep) {
-      const v = (nativeData as any)[i];
+      const v = (nativeData as ArrayLike<number>)[i];
       if (v < min) min = v;
       if (v > max) max = v;
     }
   } else {
     for (let i = 0; i < n; i += sampleStep) {
-      const v = (nativeData as any)[i] * slope + inter;
+      const v = (nativeData as ArrayLike<number>)[i] * slope + inter;
       if (v < min) min = v;
       if (v > max) max = v;
     }
@@ -824,9 +826,9 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
     previewSlices.axial.set(src);
     for (let i = 0; i < nx * ny; i++) previewSlices.axial[i] = previewSlices.axial[i] * slope + inter;
   } else if (needsConversion) {
-    for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i] * slope + inter; }
+    for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as ArrayLike<number>)[base + i] * slope + inter; }
   } else {
-    for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as any)[base + i]; }
+    for (let i = 0; i < nx * ny; i++) { if (i % 4096 === 0) throwIfAborted(signal); previewSlices.axial[i] = (nativeData as ArrayLike<number>)[base + i]; }
   }
   }
 
@@ -845,7 +847,7 @@ async function processRawVolume(rawData: Uint8Array, id: number, signal: AbortSi
   // Always send native data — GPU shader handles slope/inter
   let voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
   voxelData = nativeData;
-  nativeData = null as any; // release reference for GC
+  nativeData = null as unknown as typeof nativeData; // release reference for GC
 
   self.postMessage({ id, type: 'progress', value: 1.0, stage: 'done' });
 
@@ -1068,7 +1070,7 @@ async function parallelDownloadWithEarlyPreview(
   estimatedRttMs = 0,
   firePreview?: (measuredBps: number) => void,
 ): Promise<Uint8Array> {
-  const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
+  const hasNativeDecompress = typeof DecompressionStream !== 'undefined';
 
   // ── Step 1: Range probe to get total size + first data ──
   // Probe size is chosen by network quality: tiny on slow links for fast
@@ -1096,8 +1098,8 @@ async function parallelDownloadWithEarlyPreview(
         probeResp = null;
         await sleep(RETRY_DELAY_BASE);
       }
-    } catch (err: any) {
-      if (err?.name === 'AbortError') throw err;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
       if (attempt === 1) throw err;
       await sleep(RETRY_DELAY_BASE);
     }
@@ -1204,8 +1206,8 @@ async function parallelGzipDownload(
   maxConcurrent: number,
   idleMs: number,
 ): Promise<Uint8Array> {
-  const ds = new (self as any).DecompressionStream('gzip');
-  const writer = ds.writable.getWriter();
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter() as unknown as ByteWriter;
   const reader = ds.readable.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 
   // Pre-allocate decompressed buffer — cap initial size to avoid OOM
@@ -1275,7 +1277,7 @@ async function parallelGzipDownload(
       if (batch.length === 0) return;
       // Merge batch into one write to reduce await overhead
       const writeBatch = async (data: Uint8Array) => {
-        try { await writer.write(data); } catch (err) { fatalStreamError = err as Error; }
+        try { await writer.write(data); } catch (err) { fatalStreamError = asError(err); }
       };
       if (batch.length === 1) {
         await writeBatch(batch[0]);
@@ -1339,9 +1341,9 @@ async function parallelGzipDownload(
             }
             pending.set(idx, data);
             await feedIfReady();
-          } catch (err: any) {
-            if (err?.name === 'AbortError') {
-              downloadError = err;
+          } catch (err) {
+            if (isAbortError(err)) {
+              downloadError = asError(err);
               reject(err);
               return;
             }
@@ -1352,7 +1354,7 @@ async function parallelGzipDownload(
             if (totalAttempts > 3 && failureCount / totalAttempts > 0.15) {
               effectiveMaxConcurrent = Math.max(2, Math.floor(effectiveMaxConcurrent / 2));
             }
-            if (!downloadError) downloadError = err;
+            if (!downloadError) downloadError = asError(err);
           }
           running--;
           if (launched >= numChunks && running === 0) {
@@ -1466,15 +1468,16 @@ async function parallelNiiDownload(
               value: 0.02 + (received / totalSize) * 0.85,
               stage: 'downloading (parallel)',
             });
-          } catch (err: any) {
-            if (err?.name === 'AbortError') { poolError = err; }
-            else {
+          } catch (err) {
+            if (isAbortError(err)) {
+              poolError = asError(err);
+            } else {
               failureCount++;
               const totalAttempts = successCount + failureCount;
               if (totalAttempts > 3 && failureCount / totalAttempts > 0.15) {
                 effectiveMaxConcurrent = Math.max(2, Math.floor(effectiveMaxConcurrent / 2));
               }
-              if (!poolError) poolError = err;
+              if (!poolError) poolError = asError(err);
             }
           }
           running--;
@@ -1510,7 +1513,7 @@ async function streamingGzipLoadFromResponse(
   id: number,
   signal: AbortSignal,
 ): Promise<Uint8Array> {
-  const ds = new (self as any).DecompressionStream('gzip');
+  const ds = new DecompressionStream('gzip');
   const decompressedStream = resp.body!.pipeThrough(ds);
   const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 
@@ -1575,7 +1578,7 @@ async function streamingNiiLoadFromResponse(
       } else {
         chunks.push(result.subarray(0, writeOffset));
         chunks.push(value);
-        result = null as any;
+        result = null as unknown as Uint8Array;
       }
     } else {
       chunks.push(value);
@@ -1662,8 +1665,8 @@ async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: Abort
     const headerJson = new TextDecoder().decode(data.subarray(offset, offset + headerLen));
     offset += headerLen;
 
-    let header: any;
-    try { header = JSON.parse(headerJson); } catch { return false; }
+    let header: NiiHeader;
+    try { header = JSON.parse(headerJson) as NiiHeader; } catch { return false; }
 
     if (offset + 32 > data.length) return false;
     const factor = dv.getUint32(offset, true); offset += 4;
@@ -1701,8 +1704,8 @@ async function tryFetchPreviewVolume(proxyUrl: string, id: number, signal: Abort
     // Only headers parsed from source bytes may be reused by processRawVolume.
     earlyPreviewSent.add(id);
     return true;
-  } catch (err: any) {
-    if (err?.name === 'AbortError') throw err;
+  } catch (err) {
+    if (isAbortError(err)) throw err;
     return false;
   }
 }
@@ -1749,14 +1752,14 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
     // server-side) while the full download goes direct to the remote
     // origin — different connections, fully overlapped.
     const firePreview = preParsedHeader ? undefined : (measuredBps: number) => {
-      tryFetchPreviewVolume(url, id, signal, measuredBps, isGzip).catch((err: any) => {
+      tryFetchPreviewVolume(url, id, signal, measuredBps, isGzip).catch((err) => {
         // AbortError is expected when the load is cancelled — swallow it to
         // avoid an unhandled rejection (this promise is intentionally not awaited).
-        if (err?.name === 'AbortError') return;
+        if (isAbortError(err)) return;
       });
     };
 
-    const hasNativeDecompress = typeof (self as any).DecompressionStream !== 'undefined';
+    const hasNativeDecompress = typeof DecompressionStream !== 'undefined';
     let rawData: Uint8Array;
 
     // ── Primary path: parallel download with early preview ──
@@ -1771,8 +1774,8 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
       rawData = await parallelDownloadWithEarlyPreview(fetchUrl, id, isGzip, signal, estimatedBps, estimatedRttMs, firePreview);
       throwIfAborted(signal);
       self.postMessage({ id, type: 'progress', value: 0.9, stage: 'processing' });
-    } catch (err: any) {
-      if (err?.name === 'AbortError') throw err;
+    } catch (err) {
+      if (isAbortError(err)) throw err;
 
       // If direct fetch failed and we have a different proxy URL, retry via proxy
       const retryUrl = (fetchUrl !== url) ? url : fetchUrl;
@@ -1796,8 +1799,8 @@ async function handleLoadVolume(id: number, url: string, isGzip: boolean, direct
         }
         throwIfAborted(signal);
         self.postMessage({ id, type: 'progress', value: 0.85, stage: 'processing' });
-      } catch (err2: any) {
-        if (err2?.name === 'AbortError') throw err2;
+      } catch (err2) {
+        if (isAbortError(err2)) throw err2;
         // Fallback 2: parallel chunked download + buffer decompress
         const compressedData = await downloadChunked(retryUrl, id, isGzip, signal);
         self.postMessage({ id, type: 'progress', value: 0.35, stage: 'decompressing' });
@@ -1846,7 +1849,7 @@ async function streamingGzipLoadWithEarlyPreview(url: string, id: number, signal
   if (!resp.ok) throw new Error(`Fetch failed: ${resp.status}`);
   if (!resp.body) throw new Error('No response body for streaming');
 
-  const ds = new (self as any).DecompressionStream('gzip');
+  const ds = new DecompressionStream('gzip');
   const decompressedStream = resp.body.pipeThrough(ds);
   const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 
@@ -1857,7 +1860,7 @@ async function streamingGzipLoadWithEarlyPreview(url: string, id: number, signal
 
   // Parse preview directly from result buffer — no separate previewBuf needed
   let previewSent = false;
-  let header: any = null;
+  let header: NiiHeader | null = null;
   let firstSliceNeeded = Infinity;
 
   const contentLength = Number(resp.headers.get('Content-Length') || 0);
@@ -2133,8 +2136,8 @@ async function streamingNiiLoadWithEarlyPreview(url: string, id: number, signal:
 }
 
 async function nativeDecompressFromBuffer(compressed: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
-  const ds = new (self as any).DecompressionStream('gzip');
-  const writer = ds.writable.getWriter();
+  const ds = new DecompressionStream('gzip');
+  const writer = ds.writable.getWriter() as unknown as ByteWriter;
   const reader = ds.readable.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 
   // Parallelize writing and reading — the writer feeds compressed data
@@ -2190,9 +2193,9 @@ async function handleLoadVolumeFromData(id: number, message: { rawData: ArrayBuf
     let rawData: Uint8Array;
     if (message.isGzip) {
       const compressed = new Uint8Array(message.rawData);
-      if (typeof (self as any).DecompressionStream !== 'undefined') {
-        const ds = new (self as any).DecompressionStream('gzip');
-        const writer = ds.writable.getWriter();
+      if (typeof DecompressionStream !== 'undefined') {
+        const ds = new DecompressionStream('gzip');
+        const writer = ds.writable.getWriter() as unknown as ByteWriter;
         writer.write(compressed);
         writer.close();
         const reader = ds.readable.getReader();

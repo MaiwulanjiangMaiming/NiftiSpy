@@ -28,7 +28,7 @@ export interface SliceDeps {
   ensureSliceCacheDB(): Promise<SliceCacheDB>;
   getSharedVolume(): SharedVolume | null;
   getFileHash(): string;
-  postMessage(message: any, transfer?: Transferable[]): void;
+  postMessage(message: unknown, transfer?: Transferable[]): void;
   maxRetries: number;
   maxSliceCache: number;
 }

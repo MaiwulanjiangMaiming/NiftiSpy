@@ -4,6 +4,7 @@ const path = require('node:path');
 const esbuild = require('esbuild');
 
 let parseNiiHeaderQuick;
+let parseNiiHeader;
 let timepointByteOffset;
 let ready;
 
@@ -18,9 +19,18 @@ async function load() {
       format: 'cjs',
       outfile,
     });
+    const outfileWebview = path.join(__dirname, '..', 'dist', 'nii-parser.webview.cjs');
+    await esbuild.build({
+      entryPoints: [path.join(__dirname, '..', 'webview/nii-parser.ts')],
+      bundle: true,
+      platform: 'node',
+      format: 'cjs',
+      outfile: outfileWebview,
+    });
     const mod = require(outfile);
     parseNiiHeaderQuick = mod.parseNiiHeaderQuick;
     timepointByteOffset = mod.timepointByteOffset;
+    parseNiiHeader = require(outfileWebview).parseNiiHeader;
   })();
   return ready;
 }
@@ -65,4 +75,22 @@ test('separateImg zeros voxOffset for a companion .img', async () => {
   assert.equal(paired.voxOffset, 0);
   const nii = parseNiiHeaderQuick(nifti1Header({ voxOffset: 352 }));
   assert.equal(nii.voxOffset, 352);
+});
+
+test('host and webview parsers return identical headers', async () => {
+  await load();
+  const buf = nifti1Header({ nt: 8, voxOffset: 352 });
+  const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
+  const quick = parseNiiHeaderQuick(buf);
+  const strict = parseNiiHeader(ab, false);
+  assert.deepEqual(strict, quick);
+
+  const gz = parseNiiHeader(ab, true);
+  assert.equal(gz.isGzip, true);
+  assert.equal(quick.isGzip, false);
+
+  assert.throws(() => parseNiiHeader(new ArrayBuffer(100), false), /Buffer too small/);
+  const bad = new Uint8Array(348).fill(0);
+  assert.equal(parseNiiHeaderQuick(bad), null);
+  assert.throws(() => parseNiiHeader(bad.buffer, false), /Invalid NIfTI file/);
 });

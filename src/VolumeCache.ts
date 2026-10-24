@@ -1,5 +1,7 @@
+import type { NiiHeader } from './nifti/headerParser';
+
 export interface CachedVolume {
-  header: any;
+  header: NiiHeader;
   voxelData:
     | Int8Array
     | Uint8Array

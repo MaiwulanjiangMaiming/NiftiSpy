@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import { timepointByteOffset } from './headerParser';
+import { timepointByteOffset, type NiiHeader } from './headerParser';
 
-export function decodeVoxel(bytes: Uint8Array, offset: number, header: any, view?: DataView): number {
+export function decodeVoxel(bytes: Uint8Array, offset: number, header: NiiHeader, view?: DataView): number {
   const bpv = Math.max(1, header.bitpix / 8);
   if (offset + bpv > bytes.length) return 0;
   const dv = view ?? new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -23,7 +23,7 @@ export function decodeVoxel(bytes: Uint8Array, offset: number, header: any, view
   return val * slope + inter;
 }
 
-export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any): Float32Array {
+export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: NiiHeader): Float32Array {
   const { nx, ny, datatype, scl_slope, scl_inter, littleEndian } = header;
   const bpv = Math.max(1, header.bitpix / 8);
   const le = littleEndian;
@@ -53,7 +53,7 @@ export function extractAxialSliceFromRange(sliceBytes: Uint8Array, header: any):
 }
 
 /** Little-endian typed view over the scratch buffer, or null for DataView. */
-function leTypedView(scratch: Buffer, bytes: number, header: any): any | null {
+function leTypedView(scratch: Buffer, bytes: number, header: NiiHeader): Uint8Array | Int8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array | null {
   if (!header.littleEndian) return null;
   const bpv = Math.max(1, header.bitpix / 8);
   if (scratch.byteOffset % bpv !== 0) return null;
@@ -72,7 +72,7 @@ function leTypedView(scratch: Buffer, bytes: number, header: any): any | null {
 
 /** A single file handle and an 8 MiB scratch budget, independent of volume depth. */
 export async function extractLocalSlice(
-  fsPath: string, header: any, axis: string, idx: number, timeIdx = 0, factor = 1,
+  fsPath: string, header: NiiHeader, axis: string, idx: number, timeIdx = 0, factor = 1,
   signal?: AbortSignal,
 ): Promise<Float32Array | null> {
   const { nx, ny, nz, voxOffset } = header;
@@ -162,7 +162,7 @@ export interface RawLocalSlice {
  * int16 MRI/CT case; the client applies scl_slope / scl_inter.
  */
 export async function extractLocalSliceRaw(
-  fsPath: string, header: any, axis: string, idx: number, timeIdx = 0, factor = 1,
+  fsPath: string, header: NiiHeader, axis: string, idx: number, timeIdx = 0, factor = 1,
   signal?: AbortSignal,
 ): Promise<RawLocalSlice | null> {
   const { nx, ny, nz, voxOffset } = header;
@@ -233,11 +233,11 @@ export async function extractLocalSliceRaw(
   } finally { await fd.close(); }
 }
 
-export async function extractCoronalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
+export async function extractCoronalSliceFromRange(fsPath: string, header: NiiHeader, idx: number, timeIdx = 0): Promise<Float32Array | null> {
   return extractLocalSlice(fsPath, header, 'coronal', idx, timeIdx);
 }
 
-export async function extractSagittalSliceFromRange(fsPath: string, header: any, idx: number, timeIdx = 0): Promise<Float32Array | null> {
+export async function extractSagittalSliceFromRange(fsPath: string, header: NiiHeader, idx: number, timeIdx = 0): Promise<Float32Array | null> {
   return extractLocalSlice(fsPath, header, 'sagittal', idx, timeIdx);
 }
 
@@ -249,7 +249,7 @@ export function sampleSlice(data: Float32Array, w: number, h: number, factor: nu
   return out;
 }
 
-export function extractPreviewSlices(rawData: Uint8Array, header: any): { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array } | null {
+export function extractPreviewSlices(rawData: Uint8Array, header: NiiHeader): { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array } | null {
   const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
   const n = nx * ny * nz;
   const bpv = Math.max(1, header.bitpix / 8);
@@ -304,7 +304,7 @@ export function extractPreviewSlices(rawData: Uint8Array, header: any): { axial:
   return { axial, coronal, sagittal };
 }
 
-export function extractSingleSlice(rawData: Uint8Array, header: any, axis: string, idx: number, timeIdx = 0): Float32Array | null {
+export function extractSingleSlice(rawData: Uint8Array, header: NiiHeader, axis: string, idx: number, timeIdx = 0): Float32Array | null {
   const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
   const bpv = Math.max(1, header.bitpix / 8);
   const tOff = timepointByteOffset(header, timeIdx);

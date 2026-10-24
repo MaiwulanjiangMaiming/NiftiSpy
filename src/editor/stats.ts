@@ -1,11 +1,12 @@
 import { getNativeBindings } from '../nativeBridge';
+import type { NiiHeader } from '../nifti/headerParser';
 
 /**
  * Sampled global min/max for a raw volume. Native mmap stats are used when
  * available; the JS path samples ~50k voxels and handles big-endian and
  * unaligned data via DataView.
  */
-export function computeVoxelStats(rawData: Uint8Array, header: any, fsPath?: string): { min: number; max: number } {
+export function computeVoxelStats(rawData: Uint8Array, header: NiiHeader, fsPath?: string): { min: number; max: number } {
   // Try native mmap_get_volume_stats for faster computation
   const native = getNativeBindings();
   if (native?.mmapGetVolumeStats && fsPath && !fsPath.endsWith('.gz')) {

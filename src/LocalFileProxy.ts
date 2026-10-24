@@ -3,7 +3,8 @@ import * as fs from 'fs';
 import { randomBytes } from 'crypto';
 import * as vscode from 'vscode';
 import { VolumeCache } from './VolumeCache';
-import { parseNiiHeaderQuick } from './nifti/headerParser';
+import { parseNiiHeaderQuick, type NiiHeader } from './nifti/headerParser';
+import { errorMessage, isAbortError } from './errors';
 import {
   extractAxialSliceFromRange,
   extractCoronalSliceFromRange,
@@ -106,14 +107,14 @@ export class LocalFileProxy {
           // HTTP/1.1 only: browser fetch() cannot speak cleartext HTTP/2
           // (h2c is unsupported in Chromium), so an http2.createServer()
           // would reject every webview request with a protocol error.
-          const createdServer = http.createServer(this.handleRequest.bind(this) as any);
+          const createdServer = http.createServer((req, res) => { void this.handleRequest(req, res); });
           this.stats.protocol = 'http/1.1';
           // Slice fetches pause while the user reads a plane. Keep the
           // forwarded socket alive instead of paying a new connection setup.
           createdServer.keepAliveTimeout = 30_000;
           createdServer.headersTimeout = 31_000;
 
-          createdServer.on('error', (err: any) => {
+          createdServer.on('error', (err: NodeJS.ErrnoException) => {
             if (err.code === 'EADDRINUSE' && tryPort !== 0) {
               reject(err);
             } else {
@@ -134,8 +135,8 @@ export class LocalFileProxy {
         });
         this.startCleanup();
         return;
-      } catch (err: any) {
-        if (err.code === 'EADDRINUSE' && tryPort !== 0 && attempt < maxRetries) {
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'EADDRINUSE' && tryPort !== 0 && attempt < maxRetries) {
           tryPort = tryPort + 1;
           continue;
         }
@@ -181,7 +182,7 @@ export class LocalFileProxy {
     this.server = null;
   }
 
-  registerFile(uri: vscode.Uri, dataUri?: vscode.Uri, hostHeader?: any): string {
+  registerFile(uri: vscode.Uri, dataUri?: vscode.Uri, hostHeader?: NiiHeader): string {
     const id = String(this.idCounter++);
     const data = dataUri || uri;
     let sourceStamp: string | undefined;
@@ -286,7 +287,7 @@ export class LocalFileProxy {
     return (entry.dataUri || entry.uri).fsPath;
   }
 
-  private parseEntryHeader(entry: FileEntry, bytes: Uint8Array): any | null {
+  private parseEntryHeader(entry: FileEntry, bytes: Uint8Array): NiiHeader | null {
     if (entry.hostHeader) return entry.hostHeader;
     return parseNiiHeaderQuick(bytes, { separateImg: !!entry.separateImg });
   }
@@ -560,9 +561,9 @@ export class LocalFileProxy {
 
       entry.headerCache = header;
       compressResponse(Buffer.from(JSON.stringify(header)), req, res, 'application/json');
-    } catch (err: any) {
+    } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: String(err?.message ?? err) }));
+      res.end(JSON.stringify({ error: errorMessage(err) }));
     }
   }
 
@@ -588,9 +589,9 @@ export class LocalFileProxy {
       }
 
       await this.handlePreviewRemote(entry, res, req);
-    } catch (err: any) {
+    } catch (err) {
       res.writeHead(500);
-      res.end(String(err?.message ?? err));
+      res.end(errorMessage(err));
     }
   }
 
@@ -720,6 +721,7 @@ export class LocalFileProxy {
       if (isGzip) {
         try {
           const { header, axialSlice } = await streamingHttpGunzipPreview(uriStr);
+          if (!header) throw new Error('No NIfTI header in stream');
           entry.headerCache = header;
           const { nx, ny, nz } = header;
           const emptyCoronal = new Float32Array(nx * nz);
@@ -835,13 +837,13 @@ export class LocalFileProxy {
       entry.headerCache = header;
 
       compressResponse(buf, req, res, 'application/octet-stream');
-    } catch (err: any) {
+    } catch (err) {
       res.writeHead(500);
-      res.end(String(err?.message ?? err));
+      res.end(errorMessage(err));
     }
   }
 
-  public async loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: any }> {
+  public async loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: NiiHeader | null }> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
     if (entry.dataCache && entry.headerCache) {
@@ -861,7 +863,7 @@ export class LocalFileProxy {
 
     entry.pendingLoad = (async () => {
       try {
-        let header: any;
+        let header: NiiHeader | null;
         let rawData: Uint8Array;
 
         if (entry.separateImg) {
@@ -869,7 +871,7 @@ export class LocalFileProxy {
           header = this.parseEntryHeader(entry, new Uint8Array(headerData.buffer, headerData.byteOffset, headerData.byteLength));
           const fullData = await vscode.workspace.fs.readFile(fileUri);
           rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
-          entry.headerCache = header;
+          if (header) entry.headerCache = header;
           entry.dataCache = rawData;
         } else if (isLocal && isGzip) {
           if (entry.dataCache) {
@@ -940,7 +942,7 @@ export class LocalFileProxy {
           entry.dataCache = rawData;
         }
 
-        entry.headerCache = header;
+        if (header) entry.headerCache = header;
         entry.lastAccess = Date.now();
 
         if (this.volumeCache && header) {
@@ -984,7 +986,7 @@ export class LocalFileProxy {
             const slope = scl_slope || 1;
             const inter = scl_inter || 0;
             for (let i = 0; i < n; i += sampleStep) {
-              const v = (voxelData as any)[i] * slope + inter;
+              const v = (voxelData as ArrayLike<number>)[i] * slope + inter;
               if (v < min) min = v;
               if (v > max) max = v;
             }
@@ -1004,7 +1006,7 @@ export class LocalFileProxy {
   }
 
   async extractPreviewForWebview(entryId: string, signal?: AbortSignal): Promise<{
-    header: any;
+    header: NiiHeader;
     slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array };
     globalMin: number;
     globalMax: number;
@@ -1175,8 +1177,8 @@ export class LocalFileProxy {
         sliceIdx: { axial: Math.floor(header.nz / 2), coronal: Math.floor(header.ny / 2), sagittal: Math.floor(header.nx / 2) },
         slope: header.scl_slope || 1, inter: header.scl_inter || 0,
       };
-    } catch (err: any) {
-      if (err?.name === 'AbortError') return null;
+    } catch (err) {
+      if (isAbortError(err)) return null;
       console.error('extractPreviewForWebview error:', err);
       return null;
     }

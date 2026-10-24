@@ -6,8 +6,10 @@
  * wire.
  */
 
+import type { NiiHeader } from '../nifti/headerParser';
+
 export interface PreparedPayload {
-  header: any;
+  header: NiiHeader;
   payload: Uint8Array;
   totalVoxels: number;
   voxelBytes: number;
@@ -16,7 +18,7 @@ export interface PreparedPayload {
   max?: number;
 }
 
-export function prepareParsedPayload(header: any, rawData: Uint8Array): PreparedPayload {
+export function prepareParsedPayload(header: NiiHeader, rawData: Uint8Array): PreparedPayload {
   const nx = Math.max(1, Math.floor(header.nx || 1));
   const ny = Math.max(1, Math.floor(header.ny || 1));
   const nz = Math.max(1, Math.floor(header.nz || 1));

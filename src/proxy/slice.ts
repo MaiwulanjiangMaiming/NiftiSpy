@@ -12,6 +12,8 @@ import {
   downsampleSlice,
   sampleSlice,
 } from '../nifti/sliceExtractor';
+import type { NiiHeader } from '../nifti/headerParser';
+import { errorMessage } from '../errors';
 import type { FileEntry, RawSliceMeta } from './types';
 
 /** Per-entry slice cache bounds (server-side L2 behind the client cache). */
@@ -22,13 +24,13 @@ const MAX_SLICE_CACHE_BYTES = 64 * 1024 * 1024;
 export interface SliceHost {
   headerPath(entry: FileEntry): string;
   dataPath(entry: FileEntry): string;
-  parseEntryHeader(entry: FileEntry, bytes: Uint8Array): any | null;
+  parseEntryHeader(entry: FileEntry, bytes: Uint8Array): NiiHeader | null;
   ensureGzipScan(entry: FileEntry, onProgress?: (pct: number) => void): GzipScanSession | null;
-  loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: any }>;
+  loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: NiiHeader | null }>;
 }
 
 export function sliceHeaders(
-  header: any,
+  header: NiiHeader,
   axis: string,
   factor: number,
   startedAt: number,
@@ -65,7 +67,7 @@ export function trimSliceCache(entry: FileEntry): void {
 }
 
 /** Raw slices only for little-endian 8/16-bit data; others stay Float32. */
-export function rawSliceMeta(header: any): RawSliceMeta | null {
+export function rawSliceMeta(header: NiiHeader): RawSliceMeta | null {
   if (!header || !header.littleEndian) return null;
   const dtype = header.datatype;
   if (dtype !== 2 && dtype !== 256 && dtype !== 4 && dtype !== 512) return null;
@@ -93,7 +95,7 @@ export async function handleSlice(
     const cacheKey = `${entry.id}:${axis}:${idx}:${timeIdx}:${factor}`;
     const cached = entry.sliceCache?.get(cacheKey);
     if (cached) {
-      const h = entry.headerCache;
+      const h = entry.headerCache!;
       compressResponse(cached.data, req, res, 'application/octet-stream',
         sliceHeaders(h, axis, factor, startedAt, 'memory', cached.raw));
       return;
@@ -105,7 +107,7 @@ export async function handleSlice(
 
     const reply = (slice: Float32Array, sampled = false) => {
       if (ac.signal.aborted) return;
-      const h = entry.headerCache;
+      const h = entry.headerCache!;
       if (!sampled && factor > 1) slice = sampleSlice(slice, axis === 'sagittal' ? h.ny : h.nx, axis === 'axial' ? h.ny : h.nz, factor);
       const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
       entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
@@ -115,7 +117,7 @@ export async function handleSlice(
 
     const replyRaw = (slice: { data: Uint8Array; width: number; height: number }, raw: RawSliceMeta) => {
       if (ac.signal.aborted) return;
-      const h = entry.headerCache;
+      const h = entry.headerCache!;
       const buf = Buffer.from(slice.data.buffer, slice.data.byteOffset, slice.data.byteLength);
       entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now(), raw });
       trimSliceCache(entry);
@@ -244,9 +246,9 @@ export async function handleSlice(
     }
 
     reply(slice);
-  } catch (err: any) {
+  } catch (err) {
     res.writeHead(500);
-    res.end(String(err?.message ?? err));
+    res.end(errorMessage(err));
   }
 }
 
@@ -289,8 +291,8 @@ export async function handleLOD(
 
     const result = { header: lodHeader, axial: Array.from(downsampled.data) };
     compressResponse(Buffer.from(JSON.stringify(result)), req, res, 'application/json');
-  } catch (err: any) {
+  } catch (err) {
     res.writeHead(500);
-    res.end(String(err?.message ?? err));
+    res.end(errorMessage(err));
   }
 }

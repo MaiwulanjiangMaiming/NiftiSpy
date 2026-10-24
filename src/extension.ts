@@ -1,3 +1,4 @@
+import { errorMessage } from './errors';
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -142,8 +143,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const provider = new NiiEditorProvider(context, volumeCache);
 
   // Register keyboard shortcut commands
-  const postToActiveWebview = (msg: Record<string, any>) => {
-    for (const [, entry] of (provider as any).activeWebviews ?? []) {
+  const postToActiveWebview = (msg: Record<string, unknown>) => {
+    const active = (provider as unknown as { activeWebviews?: Map<string, { panel: vscode.WebviewPanel }> }).activeWebviews;
+    for (const [, entry] of active ?? []) {
       if (entry.panel.active) {
         entry.panel.webview.postMessage(msg);
         break;
@@ -199,8 +201,8 @@ export async function activate(context: vscode.ExtensionContext) {
             const voxel = zarrProvider.getVoxelSize();
             const totalChunks = zarrProvider.getTotalChunksCount();
             zarrInfo = `Zarr v2 dataset: ${dims.nx}×${dims.ny}×${dims.nz} · chunk ${chunk.cx}×${chunk.cy}×${chunk.cz} · ${totalChunks} chunks · dtype ${info.datatype} · spacing ${voxel.dx}×${voxel.dy}×${voxel.dz}`;
-          } catch (err: any) {
-            zarrInfo = `Error loading Zarr metadata: ${err?.message || err}`;
+          } catch (err) {
+            zarrInfo = `Error loading Zarr metadata: ${errorMessage(err)}`;
           }
 
           const version = context.extension.packageJSON.version;
@@ -274,8 +276,8 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
           try {
             await vscode.commands.executeCommand('vscode.openWith', header, 'niftispy.nifti');
             webviewPanel.dispose();
-          } catch (err: any) {
-            webview.html = rawEditorHtml('Cannot open volume', `${headerName}: ${err?.message || err}`);
+          } catch (err) {
+            webview.html = rawEditorHtml('Cannot open volume', `${headerName}: ${errorMessage(err)}`);
           }
         },
       },

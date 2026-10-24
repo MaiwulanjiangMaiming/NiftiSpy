@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import { serialize, deserialize } from 'v8';
 import { createHash } from 'crypto';
-import { parseNiiHeaderQuick, timepointByteOffset } from '../nifti/headerParser';
+import { parseNiiHeaderQuick, timepointByteOffset, type NiiHeader } from '../nifti/headerParser';
 import { decodeVoxel, extractAxialSliceFromRange, extractLocalSlice } from '../nifti/sliceExtractor';
 import { GzipIndex, loadCachedIndex, saveCachedIndex } from './gzipIndex';
 import { unpackGzipToCache, persistGzipPreview, GzipCacheOptions } from './gzipUnpack';
@@ -10,7 +10,7 @@ import { readLocalFilePartial } from './fileReader';
 export const GZIP_LOD_FACTOR = 8;
 
 export interface GzipOrthoPreview {
-  header: any;
+  header: NiiHeader;
   axial: Float32Array;
   coronal: Float32Array;
   sagittal: Float32Array;
@@ -22,7 +22,7 @@ export interface GzipOrthoPreview {
 }
 
 export interface GzipLodVolume {
-  header: any;
+  header: NiiHeader;
   factor: number;
   volume: Float32Array;
   outNx: number;
@@ -50,7 +50,7 @@ function deferred<T>(): Deferred<T> {
 
 /** One shared scan publishes useful previews and prepares seekable remote reads. */
 export class GzipScanSession {
-  header: any = null;
+  header: NiiHeader | null = null;
   axial0: Float32Array | null = null;
   coronal: Float32Array | null = null;
   sagittal: Float32Array | null = null;
@@ -112,7 +112,7 @@ export class GzipScanSession {
       const now = Date.now();
       if (collector.centerReady && (!centerPublished || now - lastPublished >= 500) && !collector.orthoComplete) {
         const h = collector.header;
-        if (4 * (h.nx * h.ny + h.nx * h.nz + h.ny * h.nz) <= 4 * 1024 ** 2) {
+        if (h && 4 * (h.nx * h.ny + h.nx * h.nz + h.ny * h.nz) <= 4 * 1024 ** 2) {
           this.publish(collector.snapshot(false));
           lastPublished = now;
           centerPublished = true;
@@ -129,7 +129,7 @@ export class GzipScanSession {
         if (!collector.orthoComplete) {
           if (!(await this.restorePreview(unpacked))) {
             await this.previewFromUnpack(unpacked, signal);
-            this.lod = await extractStridedVolumeFromFile(unpacked, this.header, GZIP_LOD_FACTOR, signal);
+            this.lod = await extractStridedVolumeFromFile(unpacked, this.header!, GZIP_LOD_FACTOR, signal);
             await this.savePreview(unpacked, options.budgetBytes);
           }
         } else {
@@ -225,7 +225,9 @@ export class GzipScanSession {
       const h = p.header;
       if (!h || p.axial.length !== h.nx * h.ny || p.coronal.length !== h.nx * h.nz || p.sagittal.length !== h.ny * h.nz) return false;
       const actual = parseNiiHeaderQuick(await readLocalFilePartial(file, 0, 543));
-      if (!actual || ['nx', 'ny', 'nz', 'datatype', 'voxOffset', 'scl_slope', 'scl_inter'].some(k => actual[k] !== h[k])) return false;
+      if (!actual || actual.nx !== h.nx || actual.ny !== h.ny || actual.nz !== h.nz ||
+          actual.datatype !== h.datatype || actual.voxOffset !== h.voxOffset ||
+          actual.scl_slope !== h.scl_slope || actual.scl_inter !== h.scl_inter) return false;
       this.header = h;
       const lod = value.lod;
       if (lod && (!(lod.volume instanceof Float32Array) || lod.factor !== GZIP_LOD_FACTOR || lod.volume.length !== lod.outNx * lod.outNy * lod.outNz || lod.outNx !== Math.max(1, Math.floor(h.nx / lod.factor)) || lod.outNy !== Math.max(1, Math.floor(h.ny / lod.factor)) || lod.outNz !== Math.max(1, Math.floor(h.nz / lod.factor)))) return false;
@@ -239,7 +241,7 @@ export class GzipScanSession {
 }
 
 class NiftiInflateCollector {
-  header: any = null;
+  header: NiiHeader | null = null;
   axial0: Float32Array | null = null;
   coronal: Float32Array | null = null;
   sagittal: Float32Array | null = null;
@@ -299,7 +301,7 @@ class NiftiInflateCollector {
   }
 
   snapshot(axialOnly: boolean): GzipOrthoPreview {
-    const header = this.header;
+    const header = this.header!;
     const { nx, ny, nz } = header;
     return {
       header,
@@ -319,7 +321,8 @@ class NiftiInflateCollector {
   }
 
   private allocFromHeader(): void {
-    const { nx, ny, nz, bytesPerVoxel } = this.header;
+    const header = this.header!;
+    const { nx, ny, nz, bytesPerVoxel } = header;
     this.sliceBytes = nx * ny * Math.max(1, bytesPerVoxel);
     this.coMid = Math.floor(ny / 2);
     this.saMid = Math.floor(nx / 2);
@@ -328,17 +331,20 @@ class NiftiInflateCollector {
     this.outNx = Math.max(1, Math.floor(nx / this.lodFactor));
     this.outNy = Math.max(1, Math.floor(ny / this.lodFactor));
     this.outNz = Math.max(1, Math.floor(nz / this.lodFactor));
-    const loHeader: any = { ...this.header };
+    const loHeader: NiiHeader = { ...header };
     loHeader.nx = this.outNx;
     loHeader.ny = this.outNy;
     loHeader.nz = this.outNz;
-    loHeader.dx = (this.header.dx || 1) * this.lodFactor;
-    loHeader.dy = (this.header.dy || 1) * this.lodFactor;
-    loHeader.dz = (this.header.dz || 1) * this.lodFactor;
+    loHeader.dx = (header.dx || 1) * this.lodFactor;
+    loHeader.dy = (header.dy || 1) * this.lodFactor;
+    loHeader.dz = (header.dz || 1) * this.lodFactor;
     loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
-    for (const key of ['srow_x', 'srow_y', 'srow_z']) if (Array.isArray(this.header[key])) loHeader[key] = this.header[key].map((v: number, i: number) => i < 3 ? v * this.lodFactor : v);
-    if (Array.isArray(this.header.sform)) {
-      const sform = this.header.sform.map((row: number[]) => [...row]);
+    const scaleRow = (row: number[]): number[] => row.map((v, i) => i < 3 ? v * this.lodFactor : v);
+    loHeader.srow_x = scaleRow(header.srow_x);
+    loHeader.srow_y = scaleRow(header.srow_y);
+    loHeader.srow_z = scaleRow(header.srow_z);
+    if (Array.isArray(header.sform)) {
+      const sform = header.sform.map((row: number[]) => [...row]);
       for (const row of sform) { row[0] *= this.lodFactor; row[1] *= this.lodFactor; row[2] *= this.lodFactor; }
       loHeader.sform = sform;
     }
@@ -355,7 +361,7 @@ class NiftiInflateCollector {
   }
 
   private consumeSlice(sliceBytes: Uint8Array, z: number): void {
-    const header = this.header;
+    const header = this.header!;
     const { nx, ny } = header;
     const bpv = Math.max(1, header.bytesPerVoxel);
     const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
@@ -445,7 +451,7 @@ export async function previewFromGzipIndex(
   };
 }
 
-export async function extractStridedVolumeFromFile(file: string, header: any, factor: number, signal?: AbortSignal): Promise<GzipLodVolume> {
+export async function extractStridedVolumeFromFile(file: string, header: NiiHeader, factor: number, signal?: AbortSignal): Promise<GzipLodVolume> {
   const f = Math.max(2, Math.min(32, factor));
   const outNx = Math.max(1, Math.floor(header.nx / f)), outNy = Math.max(1, Math.floor(header.ny / f)), outNz = Math.max(1, Math.floor(header.nz / f));
   const volume = new Float32Array(outNx * outNy * outNz);
@@ -456,9 +462,12 @@ export async function extractStridedVolumeFromFile(file: string, header: any, fa
     volume.set(plane, z * outNx * outNy);
     for (const v of plane) { min = Math.min(min, v); max = Math.max(max, v); }
   }
-  const loHeader = { ...header, nx: outNx, ny: outNy, nz: outNz, dx: header.dx * f, dy: header.dy * f, dz: header.dz * f };
+  const loHeader: NiiHeader = { ...header, nx: outNx, ny: outNy, nz: outNz, dx: header.dx * f, dy: header.dy * f, dz: header.dz * f };
   loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
-  for (const key of ['srow_x', 'srow_y', 'srow_z']) if (Array.isArray(header[key])) loHeader[key] = header[key].map((v: number, i: number) => i < 3 ? v * f : v);
+  const scaleRow = (row: number[]): number[] => row.map((v, i) => i < 3 ? v * f : v);
+  loHeader.srow_x = scaleRow(header.srow_x);
+  loHeader.srow_y = scaleRow(header.srow_y);
+  loHeader.srow_z = scaleRow(header.srow_z);
   return { header: loHeader, factor: f, volume, outNx, outNy, outNz, min, max: max > min ? max : min + 1 };
 }
 
@@ -500,7 +509,7 @@ export async function extractStridedVolumeFromIndex(
   }
   if (min === max) max = min + 1;
 
-  const loHeader: any = { ...header };
+  const loHeader: NiiHeader = { ...header };
   loHeader.nx = outNx;
   loHeader.ny = outNy;
   loHeader.nz = outNz;
@@ -524,7 +533,7 @@ export async function extractStridedVolumeFromIndex(
 export async function extractSliceFromGzipIndex(
   fsPath: string,
   index: GzipIndex,
-  header: any,
+  header: NiiHeader,
   axis: string,
   idx: number,
   timeIdx = 0,

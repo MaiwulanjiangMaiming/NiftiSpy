@@ -3,18 +3,21 @@ import type { VolumeCache } from '../VolumeCache';
 import { compressResponse, streamingGunzipPreviewVolume } from '../io/compression';
 import { extractStridedVolumeFromIndex, type GzipScanSession } from '../io/gzipScan';
 import { readHttpPartial, readLocalFilePartial } from '../io/fileReader';
+import type { NiiHeader } from '../nifti/headerParser';
+import { errorMessage, isAbortError } from '../errors';
+import type { CachedVolume } from '../VolumeCache';
 import type { FileEntry } from './types';
 
 /** Proxy services the preview-volume handler needs. */
 export interface PreviewHost {
   ensureGzipScan(entry: FileEntry): GzipScanSession | null;
-  parseEntryHeader(entry: FileEntry, bytes: Uint8Array): any | null;
-  loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: any }>;
+  parseEntryHeader(entry: FileEntry, bytes: Uint8Array): NiiHeader | null;
+  loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: NiiHeader | null }>;
   readonly volumeCache: VolumeCache | null;
 }
 
 export function sendPreviewVolumeBuffer(
-  loHeader: any,
+  loHeader: NiiHeader,
   volume: Float32Array,
   factor: number,
   outNx: number,
@@ -115,7 +118,7 @@ export async function handlePreviewVolume(
             ac.signal,
           );
           // Build a low-res header (scaled spacings + adjusted sform)
-          const loHeader: any = { ...result.header };
+          const loHeader: NiiHeader = { ...result.header };
           loHeader.nx = result.outNx;
           loHeader.ny = result.outNy;
           loHeader.nz = result.outNz;
@@ -150,11 +153,11 @@ export async function handlePreviewVolume(
           buf.writeFloatLE(inter, offset); offset += 4;
           voxelBuf.copy(buf, offset);
           compressResponse(buf, req, res, 'application/octet-stream');
-        } catch (err: any) {
-          if (err?.name === 'AbortError') return;
+        } catch (err) {
+          if (isAbortError(err)) return;
           if (!res.headersSent) {
             res.writeHead(500);
-            res.end(String(err?.message ?? err));
+            res.end(errorMessage(err));
           }
         }
         return;
@@ -174,7 +177,7 @@ export async function handlePreviewVolume(
       } else {
         // Other remote (vscode-remote://): must load full data to parse header
         const { header } = await host.loadFileData(entry);
-        entry.headerCache = header;
+        if (header) entry.headerCache = header;
         headerBytes = new Uint8Array(0);
       }
       if (!entry.headerCache) {
@@ -217,7 +220,7 @@ export async function handlePreviewVolume(
     // directly from the cached decoded voxel data.  This avoids 16 fresh
     // HTTP Range requests and DataView decoding — pure memory copy, ~100x
     // faster for a cached remote file.
-    let cachedVolume: { voxelData: any; min: number; max: number } | null = null;
+    let cachedVolume: { voxelData: CachedVolume['voxelData']; min: number; max: number } | null = null;
     if (isHttpRemote && host.volumeCache) {
       const cv = host.volumeCache.get(uriStr);
       if (cv) cachedVolume = { voxelData: cv.voxelData, min: cv.min, max: cv.max };
@@ -329,7 +332,7 @@ export async function handlePreviewVolume(
 
     // ── Build a low-res header for the viewer ──
     // Scale voxel sizes so the physical volume dimensions are preserved.
-    const loHeader: any = { ...header };
+    const loHeader: NiiHeader = { ...header };
     loHeader.nx = outNx;
     loHeader.ny = outNy;
     loHeader.nz = outNz;
@@ -390,10 +393,10 @@ export async function handlePreviewVolume(
     voxelBuf.copy(buf, offset);
 
     compressResponse(buf, req, res, 'application/octet-stream');
-  } catch (err: any) {
+  } catch (err) {
     if (!res.headersSent) {
       res.writeHead(500);
-      res.end(String(err?.message ?? err));
+      res.end(errorMessage(err));
     }
   }
 }
@@ -412,9 +415,12 @@ export function coarsenLod(
     volume[(z * outNy + y) * outNx + x] = v;
     min = Math.min(min, v); max = Math.max(max, v);
   }
-  const header: any = { ...lod.header, nx: outNx, ny: outNy, nz: outNz, dx: lod.header.dx * step, dy: lod.header.dy * step, dz: lod.header.dz * step };
+  const header: NiiHeader = { ...lod.header, nx: outNx, ny: outNy, nz: outNz, dx: lod.header.dx * step, dy: lod.header.dy * step, dz: lod.header.dz * step };
   header.pixDims = [header.dx, header.dy, header.dz];
-  for (const key of ['srow_x', 'srow_y', 'srow_z']) if (Array.isArray(lod.header[key])) header[key] = lod.header[key].map((v: number, i: number) => i < 3 ? v * step : v);
-  if (Array.isArray(lod.header.sform)) header.sform = lod.header.sform.map((row: number[]) => row.map((v, i) => i < 3 ? v * step : v));
+  const scaleRow = (row: number[]): number[] => row.map((v, i) => i < 3 ? v * step : v);
+  header.srow_x = scaleRow(lod.header.srow_x);
+  header.srow_y = scaleRow(lod.header.srow_y);
+  header.srow_z = scaleRow(lod.header.srow_z);
+  if (Array.isArray(lod.header.sform)) header.sform = lod.header.sform.map(scaleRow);
   return { header, factor, volume, outNx, outNy, outNz, min, max: max > min ? max : min + 1 };
 }

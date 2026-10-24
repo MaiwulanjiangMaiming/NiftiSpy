@@ -5,9 +5,11 @@
  * have to describe the voxel layout; they never touch the webview.
  */
 
+import type { NiiHeader } from '../nifti/headerParser';
+
 export interface ParsedVolume {
   /** NIfTI-shaped header (fields consumed by the viewer + proxy). */
-  header: any;
+  header: NiiHeader;
   /**
    * Voxel bytes held in memory. `header.voxOffset` is absolute within this
    * buffer. Mutually exclusive with `dataPath`.

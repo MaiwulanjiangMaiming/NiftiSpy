@@ -7,6 +7,10 @@ import { compressResponse } from '../io/compression';
 import { getAgentForUrl, readHttpPartial, readHttpPartialInto } from '../io/fileReader';
 import type { FileEntry } from './types';
 
+function headerValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
 /** Shared state between the proxy router and the streaming helpers. */
 export interface HttpStreamContext {
   inflightFileStreams: Set<{ destroy: () => void; background: boolean }>;
@@ -158,7 +162,7 @@ export function pipeLocalFile(
     };
     const destroy = () => {
       try { extra?.destroy(); } catch { /* already closed */ }
-      try { (stream as any).destroy?.(); } catch { /* already closed */ }
+      try { (stream as { destroy?: () => void }).destroy?.(); } catch { /* already closed */ }
       if (!res.writableEnded) {
         try { res.destroy(); } catch { /* already closed */ }
       }
@@ -203,8 +207,8 @@ export function getHttpRemoteSize(url: string, ctx: HttpStreamContext): Promise<
       agent: getAgentForUrl(url),
     };
     const mod = parsed.protocol === 'https:' ? https : http;
-    const request = mod.request(options, (response: any) => {
-      const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+    const request = mod.request(options, (response: http.IncomingMessage) => {
+      const contentLength = parseInt(headerValue(response.headers['content-length']) || '0', 10);
       if (contentLength > 0) {
         ctx.remoteSizeCache.set(url, contentLength);
         resolve(contentLength);
@@ -230,7 +234,7 @@ export function streamHttpRangeToResponse(
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
-    const options: any = {
+    const options: http.RequestOptions = {
       hostname: parsed.hostname,
       port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
       path: parsed.pathname + parsed.search,
@@ -240,10 +244,10 @@ export function streamHttpRangeToResponse(
     };
     const mod = parsed.protocol === 'https:' ? https : http;
     let untrack = () => {};
-    const request = mod.request(options, (response: any) => {
+    const request = mod.request(options, (response: http.IncomingMessage) => {
       if (response.statusCode === 206 || response.statusCode === 200) {
-        const contentRange = response.headers['content-range'];
-        const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+        const contentRange = headerValue(response.headers['content-range']);
+        const contentLength = parseInt(headerValue(response.headers['content-length']) || '0', 10);
 
         // Cache total size from Content-Range so subsequent requests
         // (and the HEAD path) don't need another round-trip.
@@ -301,9 +305,9 @@ export function streamHttpToResponse(
     };
     const mod = parsed.protocol === 'https:' ? https : http;
     let untrack = () => {};
-    const request = mod.request(options, (response: any) => {
+    const request = mod.request(options, (response: http.IncomingMessage) => {
       if (response.statusCode === 200) {
-        const contentLength = parseInt(response.headers['content-length'] || '0', 10);
+        const contentLength = parseInt(headerValue(response.headers['content-length']) || '0', 10);
         if (entry && contentLength) entry.size = contentLength;
         const headers: Record<string, string | number> = {
           'Accept-Ranges': 'bytes',

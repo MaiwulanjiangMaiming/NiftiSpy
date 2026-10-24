@@ -1,3 +1,4 @@
+import type { NiiHeader } from './headerParser';
 export function computeSliceMinMax(...slices: Float32Array[]): { min: number; max: number } {
   let min = Infinity;
   let max = -Infinity;
@@ -18,7 +19,7 @@ export function computeSliceMinMax(...slices: Float32Array[]): { min: number; ma
 }
 
 export function encodePreviewBinary(
-  header: any,
+  header: NiiHeader,
   slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array },
   min: number,
   max: number,

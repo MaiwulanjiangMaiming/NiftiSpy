@@ -55,7 +55,9 @@ export function computeOrientationFromSform(srow_x: number[], srow_y: number[], 
 // Compute orientation from qform quaternion (ITK-SNAP/niivue approach)
 // Reconstructs the rotation matrix from the quaternion (b, c, d) and
 // derives the srow vectors, then uses the same column-based analysis
-export function computeOrientationFromQform(h: any): string {
+export function computeOrientationFromQform(
+  h: Partial<Pick<NiiHeader, 'quatern_b' | 'quatern_c' | 'quatern_d' | 'dx' | 'dy' | 'dz'>>,
+): string {
   const qb = h.quatern_b || 0;
   const qc = h.quatern_c || 0;
   const qd = h.quatern_d || 0;

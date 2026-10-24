@@ -408,11 +408,11 @@ export interface ZarrMetadata {
   dtype: string;
   compressor: {
     id: string;
-    [key: string]: any;
+    [key: string]: unknown;
   } | null;
   fill_value: number | null;
   order: 'C' | 'F';
-  filters: any[] | null;
+  filters: unknown[] | null;
 }
 
 export class ZarrVolumeProvider extends VolumeProvider {
@@ -626,7 +626,7 @@ export class ZarrVolumeProvider extends VolumeProvider {
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
       const mod = urlObj.protocol === 'https:' ? https : http;
-      mod.get(url, (res: any) => {
+      mod.get(url, (res: import('http').IncomingMessage) => {
         if (res.statusCode !== 200) {
           reject(new Error(`HTTP ${res.statusCode}`));
           return;
@@ -669,7 +669,7 @@ export class ZarrVolumeProvider extends VolumeProvider {
     return this.convertToFloat32(rawBytes);
   }
 
-  private async decompressZarrChunk(data: Uint8Array, compressor: { id: string; [key: string]: any }): Promise<Uint8Array> {
+  private async decompressZarrChunk(data: Uint8Array, compressor: { id: string; [key: string]: unknown }): Promise<Uint8Array> {
     const id = compressor.id;
 
     if (id === 'zlib' || id === 'gzip') {

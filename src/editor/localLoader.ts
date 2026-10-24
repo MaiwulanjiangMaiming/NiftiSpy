@@ -7,10 +7,13 @@ import { LocalFileProxy } from '../LocalFileProxy';
 import { VolumeCache } from '../VolumeCache';
 import { LoadQueue } from './loadQueue';
 import { getNativeBindings } from '../nativeBridge';
-import { parseNiiHeaderQuick } from '../nifti/headerParser';
+import { parseNiiHeaderQuick, type NiiHeader } from '../nifti/headerParser';
 import { isWanRemote, shouldUseSliceMode, SLICE_MODE_MIN_BYTES } from '../remoteEnv';
 import { resolveAnalyzePair, type AnalyzePair } from '../io/analyzePair';
 import { computeVoxelStats } from './stats';
+import { isAbortError } from '../errors';
+
+export type Timing = Record<string, number | string | boolean | undefined>;
 
 /** Fallback context stashed per remote-SSH dispatch (see NiiEditorProvider). */
 export interface RemoteHttpFallback {
@@ -53,7 +56,7 @@ export class LocalVolumeLoader {
   private isWebviewActive(webviewId: string): boolean { return this.host.isWebviewActive(webviewId); }
   private logPerf(line: string): void { this.host.logPerf(line); }
   private updateCacheStatusBar(): void { this.host.updateCacheStatusBar(); }
-  private parseNiiHeaderFromBuffer(buf: Uint8Array, separateImg = false): any | null {
+  private parseNiiHeaderFromBuffer(buf: Uint8Array, separateImg = false): NiiHeader | null {
     return parseNiiHeaderQuick(buf, { separateImg });
   }
 
@@ -107,7 +110,7 @@ export class LocalVolumeLoader {
           const fsPath = uri.fsPath;
           const isGzip = fsPath.endsWith('.gz');
           const perfT0 = performance.now();
-          let streamTiming: Record<string, any> = {};
+          let streamTiming: Timing = {};
 
           // ── Optimized single-pass load ──
           // For .nii.gz: stream-decompress ONCE, send z=0 preview early,
@@ -116,7 +119,7 @@ export class LocalVolumeLoader {
           // This eliminates the previous double-read/double-decompress bug.
 
           let rawData: Uint8Array;
-          let header: any;
+          let header: NiiHeader | null = null;
           let streamStats: { min: number; max: number } | null = null;
           // Hoisted out of the isGzip block so the finalize path's
           // perfExtTiming (which runs for both .nii and .nii.gz) can read it.
@@ -217,7 +220,7 @@ export class LocalVolumeLoader {
             //   is significant even vs network transfer time.
             const REMOTE_PARALLEL_THRESHOLD_MB = 200;  // only use parallel on huge files when remote
 
-            let result: { rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null = null;
+            let result: { rawData: Uint8Array; header: NiiHeader; stats: { min: number; max: number } | null; timing: Timing } | null = null;
 
             // Determine the parallel threshold based on environment:
             //   Local: > 50MB → parallel (decompress speed matters)
@@ -407,8 +410,8 @@ export class LocalVolumeLoader {
           // Update the ext timing with actual sync time for the report
           streamTiming.postMessageSync = +(postMsgEnd - postMsgStart).toFixed(1);
 
-        } catch (err: any) {
-          if (err?.name !== 'AbortError') {
+        } catch (err) {
+          if (!isAbortError(err)) {
             console.error('Local load error:', err);
           }
         }
@@ -426,7 +429,7 @@ export class LocalVolumeLoader {
     webview: vscode.Webview,
     fsPath: string,
     signal: AbortSignal
-  ): Promise<{ rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, number> } | null> {
+  ): Promise<{ rawData: Uint8Array; header: NiiHeader; stats: { min: number; max: number } | null; timing: Record<string, number> } | null> {
     const timing: Record<string, number> = {};
     return new Promise((resolve, reject) => {
       // chunkSize: output buffer per flush. Default 16KB causes ~29000 data
@@ -465,7 +468,7 @@ export class LocalVolumeLoader {
       const chunks: Buffer[] = [];
       let totalSize = 0;
       let resolved = false;
-      let header: any = null;
+      let header: NiiHeader | null = null;
       let previewSent = false;
       let firstSliceNeeded = Infinity;
       let tFsStart = 0, tFirstData = 0, tHeaderParsed = 0, tPreviewSent = 0, tDecompressEnd = 0;
@@ -609,8 +612,8 @@ export class LocalVolumeLoader {
     webview: vscode.Webview,
     fsPath: string,
     signal: AbortSignal
-  ): Promise<{ rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null> {
-    const timing: Record<string, any> = {};
+  ): Promise<{ rawData: Uint8Array; header: NiiHeader; stats: { min: number; max: number } | null; timing: Timing } | null> {
+    const timing: Timing = {};
     const native = getNativeBindings();
     if (!native?.fastDecompressGzipParallelAsync) {
       throw new Error('native fastDecompressGzipParallelAsync unavailable');
@@ -689,8 +692,8 @@ export class LocalVolumeLoader {
     webview: vscode.Webview,
     fsPath: string,
     signal: AbortSignal
-  ): Promise<{ rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null> {
-    const timing: Record<string, any> = {};
+  ): Promise<{ rawData: Uint8Array; header: NiiHeader; stats: { min: number; max: number } | null; timing: Timing } | null> {
+    const timing: Timing = {};
     const native = getNativeBindings();
 
     // ── Strategy selection ──
@@ -1085,7 +1088,7 @@ export class LocalVolumeLoader {
     webview: vscode.Webview,
     fsPath: string,
     signal: AbortSignal
-  ): Promise<{ rawData: Uint8Array; header: any; stats: { min: number; max: number } | null; timing: Record<string, any> } | null> {
+  ): Promise<{ rawData: Uint8Array; header: NiiHeader; stats: { min: number; max: number } | null; timing: Timing } | null> {
     const tStart = performance.now();
     // 1. Single readFile — no stream, no pipe, no event-loop scheduling.
     const compressed = await fs.promises.readFile(fsPath);
@@ -1138,7 +1141,7 @@ export class LocalVolumeLoader {
    */
   private sendEarlyPreviewFromBuffer(
     webview: vscode.Webview,
-    header: any,
+    header: NiiHeader,
     buf: Buffer,
     signal: AbortSignal
   ): void {
@@ -1200,7 +1203,7 @@ export class LocalVolumeLoader {
    */
   private sendEarlyPreviewFromRawData(
     webview: vscode.Webview,
-    header: any,
+    header: NiiHeader,
     rawData: Uint8Array,
     signal: AbortSignal
   ): void {
@@ -1417,8 +1420,8 @@ export class LocalVolumeLoader {
             },
           });
 
-        } catch (err: any) {
-          if (err?.name !== 'AbortError') {
+        } catch (err) {
+          if (!isAbortError(err)) {
             console.error('Preview load error:', err);
           }
         }

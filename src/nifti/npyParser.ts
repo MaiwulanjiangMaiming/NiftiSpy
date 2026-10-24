@@ -1,3 +1,4 @@
+import type { NiiHeader } from './headerParser';
 /**
  * Minimal NumPy `.npy` reader: converts an array into the NIfTI-shaped
  * header + flat voxel buffer that the existing viewer pipeline renders.
@@ -26,7 +27,7 @@ const DTYPE_MAP: Record<string, { datatype: number; bytes: number }> = {
 
 export interface NpyVolume {
   /** NIfTI-compatible header (fields consumed by the webview renderer). */
-  header: any;
+  header: NiiHeader;
   /** Exact-size buffer; `header.voxOffset` is absolute within this buffer. */
   rawData: Uint8Array;
 }
@@ -96,7 +97,7 @@ export function parseNpyLayout(source: Uint8Array, totalSize = source.length): N
 }
 
 /** Build the viewer header for a decoded/streamed `.npy` layout. */
-export function npyHeaderFromLayout(layout: NpyLayout, voxOffset: number): any {
+export function npyHeaderFromLayout(layout: NpyLayout, voxOffset: number): NiiHeader {
   const axes = layout.fortran ? layout.shape : layout.shape.slice().reverse();
   const nx = axes[0] || 1;
   const ny = axes[1] || 1;

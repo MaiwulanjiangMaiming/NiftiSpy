@@ -334,9 +334,11 @@ const VOL_DB_VERSION = 1;
 const VOL_STORE_NAME = 'volumes';
 const VOL_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 
+import type { NiiHeader } from '../src/nifti/headerParser';
+
 export interface CachedVolumeEntry {
   key: string;             // image URL
-  header: any;             // NiiHeader (structured-cloneable plain object)
+  header: NiiHeader;       // structured-cloneable plain object
   voxelData: ArrayBuffer;  // raw voxel buffer
   datatype: number;        // NIfTI datatype code (to reconstruct typed array)
   min: number;

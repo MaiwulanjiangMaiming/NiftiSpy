@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as stream from 'stream';
 import * as zlib from 'zlib';
 import { extractAxialSliceFromRange } from '../nifti/sliceExtractor';
-import { parseNiiHeaderQuick } from '../nifti/headerParser';
+import { parseNiiHeaderQuick, type NiiHeader } from '../nifti/headerParser';
 import { getAgentForUrl } from './fileReader';
 
 export function shouldCompress(req: http.IncomingMessage): boolean {
@@ -55,13 +55,13 @@ export function gunzipAsync(data: Uint8Array, signal?: AbortSignal): Promise<Uin
   });
 }
 
-export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array; coronalSlice?: Float32Array; sagittalSlice?: Float32Array }> {
+export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: NiiHeader | null; axialSlice: Float32Array; coronalSlice?: Float32Array; sagittalSlice?: Float32Array }> {
   return new Promise((resolve, reject) => {
     const gunzip = zlib.createGunzip();
     const chunks: Buffer[] = [];
     let totalSize = 0;
     let resolved = false;
-    let header: any = null;
+    let header: NiiHeader | null = null;
     let firstSliceNeeded = Infinity;   // z=0 slice — instant preview
 
     const fileStream = fs.createReadStream(fsPath);
@@ -163,7 +163,7 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
   });
 }
 
-export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal): Promise<{ header: any; axialSlice: Float32Array }> {
+export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal): Promise<{ header: NiiHeader | null; axialSlice: Float32Array }> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
     const mod = url.protocol === 'https:' ? https : http;
@@ -171,7 +171,7 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
     const chunks: Buffer[] = [];
     let totalSize = 0;
     let resolved = false;
-    let header: any = null;
+    let header: NiiHeader | null = null;
     let firstSliceNeeded = Infinity;   // z=0 slice — instant preview
 
     const options: http.RequestOptions = {
@@ -266,7 +266,7 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
 }
 
 export interface VolumePreviewResult {
-  header: any;
+  header: NiiHeader;
   volume: Float32Array;
   min: number;
   max: number;
@@ -297,7 +297,7 @@ export function streamingGunzipPreviewVolume(
     const chunks: Buffer[] = [];
     let totalSize = 0;
     let resolved = false;
-    let header: any = null;
+    let header: NiiHeader | null = null;
     let output: Float32Array | null = null;
     let outNx = 0, outNy = 0, outNz = 0;
     let nextNeededZ = 0;
@@ -307,7 +307,7 @@ export function streamingGunzipPreviewVolume(
 
     const cleanup = (): void => {
       try { gunzip.destroy(); } catch { /* best-effort cleanup */ }
-      try { (sourceStream as any)?.destroy?.(); } catch { /* best-effort cleanup */ }
+      try { (sourceStream as { destroy?: () => void })?.destroy?.(); } catch { /* best-effort cleanup */ }
       try { req?.destroy(); } catch { /* best-effort cleanup */ }
     };
 

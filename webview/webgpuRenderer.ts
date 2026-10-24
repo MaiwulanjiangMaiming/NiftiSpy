@@ -138,7 +138,7 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     if (typeof navigator === 'undefined') return false;
     if (!('gpu' in navigator)) return false;
     try {
-      const adapter = await (navigator as any).gpu.requestAdapter();
+      const adapter = await navigator.gpu.requestAdapter();
       return !!adapter;
     } catch {
       return false;
@@ -149,7 +149,7 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     try {
       if (!('gpu' in navigator)) return false;
 
-      const adapter = await (navigator as any).gpu.requestAdapter();
+      const adapter = await navigator.gpu.requestAdapter();
       if (!adapter) return false;
 
       this.device = await adapter.requestDevice();
@@ -163,7 +163,7 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       this.gpuCanvas = gpuCanvas;
       this.context = context;
 
-      this.format = (navigator as any).gpu.getPreferredCanvasFormat();
+      this.format = navigator.gpu.getPreferredCanvasFormat();
       this.context.configure({
         device: this.device,
         format: this.format,

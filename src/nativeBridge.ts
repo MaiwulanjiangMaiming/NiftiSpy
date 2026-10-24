@@ -1,7 +1,8 @@
 import { createRequire } from 'module';
+import type { NiiHeader } from './nifti/headerParser';
 
 export interface NativePreviewResult {
-  header: any;
+  header: NiiHeader;
   axial: Float32Array;
   coronal: Float32Array;
   sagittal: Float32Array;
@@ -43,19 +44,19 @@ interface RawVolumeStats {
 }
 
 interface NativeBindings {
-  parseHeader?(buffer: Buffer): any | null;
+  parseHeader?(buffer: Buffer): NiiHeader | null;
   extractPreview?(buffer: Buffer): NativePreviewResult | null;
-  extractSlice?(buffer: Buffer, header: any, axis: string, index: number, factor?: number): Float32Array | null;
+  extractSlice?(buffer: Buffer, header: NiiHeader, axis: string, index: number, factor?: number): Float32Array | null;
   decompressGzip?(buffer: Buffer): Uint8Array | Buffer;
-  mmapParseHeader?(path: string): { header: any; size: number } | null;
-  mmapExtractSlice?(path: string, header: any, axis: string, index: number, factor?: number): Float32Array | null;
+  mmapParseHeader?(path: string): { header: NiiHeader; size: number } | null;
+  mmapExtractSlice?(path: string, header: NiiHeader, axis: string, index: number, factor?: number): Float32Array | null;
   mmapExtractPreview?(path: string): NativePreviewResult | null;
   fastDecompressGzip?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipOneshot?(buffer: Buffer): Uint8Array | Buffer;
   fastDecompressGzipFileAsync?(path: string): Promise<Uint8Array | Buffer>;
   fastDecompressGzipParallelAsync?(path: string): Promise<Uint8Array | Buffer>;
-  mmapExtractSliceBatch?(path: string, header: any, axis: string, indices: number[]): Float32Array[] | null;
-  mmapGetVolumeStats?(path: string, header: any): VolumeStats | null;
+  mmapExtractSliceBatch?(path: string, header: NiiHeader, axis: string, indices: number[]): Float32Array[] | null;
+  mmapGetVolumeStats?(path: string, header: NiiHeader): VolumeStats | null;
   fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array | null;
   fastApplyWindowLevel?(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Uint8Array | null;
 }
@@ -96,7 +97,7 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
       const result = raw.extractPreview?.(buffer);
       if (!result) return null;
       return {
-        header: JSON.parse(result.header),
+        header: JSON.parse(result.header) as NiiHeader,
         axial: bufferToFloat32Array(result.axial),
         coronal: bufferToFloat32Array(result.coronal),
         sagittal: bufferToFloat32Array(result.sagittal),
@@ -104,7 +105,7 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
         max: result.max,
       };
     },
-    extractSlice(buffer: Buffer, header: any, axis: string, index: number, factor?: number) {
+    extractSlice(buffer: Buffer, header: NiiHeader, axis: string, index: number, factor?: number) {
       const slice = raw.extractSlice?.(buffer, JSON.stringify(header), axis, index, factor);
       return slice ? bufferToFloat32Array(slice) : null;
     },
@@ -112,9 +113,9 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
     mmapParseHeader(path: string) {
       const result = raw.mmapParseHeader?.(path);
       if (!result) return null;
-      return { header: JSON.parse(result.header), size: result.size };
+      return { header: JSON.parse(result.header) as NiiHeader, size: result.size };
     },
-    mmapExtractSlice(path: string, header: any, axis: string, index: number, factor?: number) {
+    mmapExtractSlice(path: string, header: NiiHeader, axis: string, index: number, factor?: number) {
       const slice = raw.mmapExtractSlice?.(path, JSON.stringify(header), axis, index, factor);
       return slice ? bufferToFloat32Array(slice) : null;
     },
@@ -122,7 +123,7 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
       const result = raw.mmapExtractPreview?.(path);
       if (!result) return null;
       return {
-        header: JSON.parse(result.header),
+        header: JSON.parse(result.header) as NiiHeader,
         axial: bufferToFloat32Array(result.axial),
         coronal: bufferToFloat32Array(result.coronal),
         sagittal: bufferToFloat32Array(result.sagittal),
@@ -134,12 +135,12 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
     fastDecompressGzipOneshot: raw.fastDecompressGzipOneshot?.bind(raw),
     fastDecompressGzipFileAsync: raw.fastDecompressGzipFileAsync?.bind(raw),
     fastDecompressGzipParallelAsync: raw.fastDecompressGzipParallelAsync?.bind(raw),
-    mmapExtractSliceBatch(path: string, header: any, axis: string, indices: number[]) {
+    mmapExtractSliceBatch(path: string, header: NiiHeader, axis: string, indices: number[]) {
       const buffers = raw.mmapExtractSliceBatch?.(path, JSON.stringify(header), axis, indices);
       if (!buffers) return null;
       return buffers.map(b => bufferToFloat32Array(b));
     },
-    mmapGetVolumeStats(path: string, header: any) {
+    mmapGetVolumeStats(path: string, header: NiiHeader) {
       return raw.mmapGetVolumeStats?.(path, JSON.stringify(header)) ?? null;
     },
     fastResampleSlice(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number) {

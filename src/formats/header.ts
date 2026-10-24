@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createHash } from 'crypto';
+import type { NiiHeader, NiiOrientation } from '../nifti/headerParser';
 
 /** NIfTI datatype → bytes per voxel. */
 export const DATATYPE_BYTES: Record<number, number> = {
@@ -35,7 +36,7 @@ export interface HeaderSpec {
 }
 
 /** Build the exact NIfTI-shaped header consumed by the viewer/proxy. */
-export function makeNiftiHeader(spec: HeaderSpec): any {
+export function makeNiftiHeader(spec: HeaderSpec): NiiHeader {
   const nx = Math.max(1, Math.floor(spec.nx));
   const ny = Math.max(1, Math.floor(spec.ny));
   const nz = Math.max(1, Math.floor(spec.nz));
@@ -72,7 +73,7 @@ export function makeNiftiHeader(spec: HeaderSpec): any {
     pixDims: [dx, dy, dz],
     descrip: (spec.descrip || '').slice(0, 80),
     xyzt_units: 0,
-    orientation: spec.orientation || 'RAS',
+    orientation: (spec.orientation || 'RAS') as NiiOrientation,
   };
 }
 
