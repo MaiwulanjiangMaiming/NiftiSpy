@@ -237,6 +237,12 @@
           "default": 0,
           "description": "HTTP proxy port (0 = auto assign)"
         },
+        "niftispy.volumeCacheBudgetMB": {
+          "type": "number",
+          "default": 1024,
+          "minimum": 128,
+          "description": "Host memory budget for fully decoded volumes (MiB). Reopen the editor or reload the window to apply."
+        },
         "niftispy.mniTemplatePath": {
           "type": "string",
           "default": "",

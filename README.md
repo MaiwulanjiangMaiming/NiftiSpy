@@ -196,6 +196,7 @@ The extension contributes these settings:
 | Setting | Default | Description |
 | --- | --- | --- |
 | `niftispy.proxyPort` | `0` | HTTP proxy port, `0` means auto-assign |
+| `niftispy.volumeCacheBudgetMB` | `1024` | Host memory budget for fully decoded volumes (MiB); reload to apply |
 | `niftispy.defaultColormap` | `gray` | Initial colormap |
 | `niftispy.enableLOD` | `true` | Enables preview / LOD flow for gzip volumes |
 | `niftispy.previewMode` | `binary` | Preview transport format |

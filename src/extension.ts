@@ -134,7 +134,11 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   }
 
-  const volumeCache = new VolumeCache();
+  const cacheBudgetMB = Math.max(
+    128,
+    vscode.workspace.getConfiguration('niftispy').get<number>('volumeCacheBudgetMB', 1024),
+  );
+  const volumeCache = new VolumeCache(5, cacheBudgetMB * 1024 * 1024);
   const provider = new NiiEditorProvider(context, volumeCache);
 
   // Register keyboard shortcut commands
