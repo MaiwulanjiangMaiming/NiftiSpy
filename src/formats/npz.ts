@@ -1,7 +1,7 @@
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { parseNpyVolume } from '../nifti/npyParser';
-import { readFileBytes, writeTempVolume } from './header';
+import { fileStamp, readFileBytes, tempFilesFor, writeTempVolume } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
 /** Minimal ZIP reader for NumPy `.npz` archives (stored + deflate). */
@@ -23,11 +23,12 @@ export const npzFormat: VolumeFormat = {
       parsed.header.voxOffset,
       parsed.header.voxOffset + voxelBytes,
     );
-    const dataPath = await writeTempVolume(data);
+    const stamp = await fileStamp([filePath]);
+    const dataPath = await writeTempVolume(data, stamp ? `npz:${stamp}` : undefined);
     return {
       header: { ...parsed.header, voxOffset: 0 },
       dataPath,
-      tempFiles: [dataPath],
+      tempFiles: tempFilesFor(dataPath),
     };
   },
 };

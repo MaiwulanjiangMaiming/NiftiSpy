@@ -190,6 +190,30 @@ test('payload: Float64 4D is downcast across all timepoints', async () => {
   );
 });
 
+test('materialized cache reuses npz output and invalidates on source change', async () => {
+  await load();
+  const file = tmp('cached.npz');
+  fs.writeFileSync(file, zipFile('vol.npy', npyFile({ shape: [2, 2, 3], values: floatsLE(VALUES) })));
+
+  const first = (await registry.parseVolumeFile(file, { memory: false })).parsed;
+  const second = (await registry.parseVolumeFile(file, { memory: false })).parsed;
+  assert.equal(first.dataPath, second.dataPath);
+  assert.deepEqual(first.tempFiles, []);
+  assert.deepEqual(second.tempFiles, []);
+  assert.match(first.dataPath, /niftispy-materialized-cache/);
+
+  const updated = VALUES.map(v => v + 100);
+  fs.writeFileSync(file, zipFile('vol.npy', npyFile({ shape: [2, 2, 3], values: floatsLE(updated) })));
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(file, future, future);
+  const third = (await registry.parseVolumeFile(file, { memory: false })).parsed;
+  assert.notEqual(third.dataPath, first.dataPath);
+  assert.deepEqual(Array.from(readVoxels(third, Float32Array, 12)), updated);
+
+  fs.rmSync(first.dataPath, { force: true });
+  fs.rmSync(third.dataPath, { force: true });
+});
+
 test('npy: 4D array keeps nt and all timepoints', async () => {
   await load();
   const file = tmp('vol4d.npy');
@@ -235,7 +259,9 @@ test('npz: reads a deflated member and supports slice materialization', async ()
   const streamed = await registry.parseVolumeFile(file, { memory: false });
   assert.equal(streamed.parsed.header.voxOffset, 0);
   assertVolume(streamed.parsed, { offset: 0 });
-  fs.rmSync(streamed.parsed.tempFiles[0], { force: true });
+  // Materialized containers live in the reusable cache, not per-editor temps.
+  assert.deepEqual(streamed.parsed.tempFiles, []);
+  fs.rmSync(streamed.parsed.dataPath, { force: true });
 });
 
 test('nrrd: raw attached header', async () => {
@@ -537,7 +563,8 @@ test('dicom: big-endian transfer syntax is swapped once', async () => {
   const streamed = (await registry.parseVolumeFile(file, { memory: false })).parsed;
   assert.equal(streamed.header.voxOffset, 0);
   assertDicom(streamed);
-  fs.rmSync(streamed.tempFiles[0], { force: true });
+  assert.deepEqual(streamed.tempFiles, []);
+  fs.rmSync(streamed.dataPath, { force: true });
 });
 
 test('dicom: compressed transfer syntaxes are rejected with a clear message', async () => {

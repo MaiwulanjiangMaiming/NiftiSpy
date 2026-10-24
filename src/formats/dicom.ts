@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import {
-  cross3, ensureLittleEndian, lpsToRas, makeNiftiHeader, normalize3,
-  readFileBytes, readRange, sformFromDirections, toU8, writeTempVolume,
+  cross3, ensureLittleEndian, fileStamp, lpsToRas, makeNiftiHeader, normalize3,
+  readFileBytes, readRange, sformFromDirections, tempFilesFor, toU8, writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -172,9 +172,10 @@ export const dicomFormat: VolumeFormat = {
     // Big-endian transfer syntax: swap once, then serve random slices.
     const raw = await readRange(filePath, scan.pixelOffset, scan.pixelOffset + voxelBytes);
     const swapped = ensureLittleEndian(raw, bpv);
-    const temp = await writeTempVolume(swapped);
+    const stamp = await fileStamp([filePath]);
+    const temp = await writeTempVolume(swapped, stamp ? `dcm:${stamp}:be` : undefined);
     header.voxOffset = 0;
-    return { header, dataPath: temp, tempFiles: [temp] };
+    return { header, dataPath: temp, tempFiles: tempFilesFor(temp) };
   },
 };
 

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import { npyHeaderFromLayout, parseNpyLayout, parseNpyVolume } from '../nifti/npyParser';
-import { readFileBytes, readRange, writeTempVolume } from './header';
+import { fileStamp, readFileBytes, readRange, tempFilesFor, writeTempVolume } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
 /** NumPy `.npy` arrays (1D–4D). */
@@ -24,7 +24,12 @@ export const npyFormat: VolumeFormat = {
 
     const parsed = parseNpyVolume(await readFileBytes(filePath));
     const data = parsed.rawData.subarray(parsed.header.voxOffset);
-    const tempPath = await writeTempVolume(data);
-    return { header: { ...parsed.header, voxOffset: 0 }, dataPath: tempPath, tempFiles: [tempPath] };
+    const stamp = await fileStamp([filePath]);
+    const tempPath = await writeTempVolume(data, stamp ? `npy:${stamp}:${layout.descr}` : undefined);
+    return {
+      header: { ...parsed.header, voxOffset: 0 },
+      dataPath: tempPath,
+      tempFiles: tempFilesFor(tempPath),
+    };
   },
 };

@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { createHash } from 'crypto';
 
 /** NIfTI datatype → bytes per voxel. */
 export const DATATYPE_BYTES: Record<number, number> = {
@@ -114,12 +115,111 @@ export async function readTextHeader(
 
 let tempCounter = 0;
 
-/** Persist a materialized volume under a private temp directory. */
-export async function writeTempVolume(data: Uint8Array): Promise<string> {
-  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'niftispy-'));
-  const file = path.join(dir, `volume-${process.pid}-${tempCounter++}.raw`);
-  await fs.promises.writeFile(file, data);
-  return file;
+/**
+ * Reusable materialization cache for containers (npz/mgz/gzip NRRD/...).
+ * Kept outside the per-editor temp dirs so reopening a file does not
+ * re-inflate or byte-swap the whole volume again.
+ */
+const MATERIALIZED_DIR = path.join(os.tmpdir(), 'niftispy-materialized-cache');
+const MATERIALIZED_BUDGET = 2 * 1024 * 1024 * 1024;
+const MATERIALIZED_MIN_AGE_MS = 10 * 60 * 1000;
+let pruneScheduled = false;
+
+/** Identity of the source file(s) used as a materialization cache key. */
+export async function fileStamp(paths: string[]): Promise<string | null> {
+  try {
+    const stats = await Promise.all(paths.map(p => fs.promises.stat(p)));
+    return stats.map(st => `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino || 0}`).join('|');
+  } catch {
+    return null;
+  }
+}
+
+export function isMaterializedCachePath(file: string): boolean {
+  return path.dirname(file) === MATERIALIZED_DIR;
+}
+
+/** Materialized files are shared; per-editor cleanup must not delete them. */
+export function tempFilesFor(file: string): string[] {
+  return isMaterializedCachePath(file) ? [] : [file];
+}
+
+/** Persist a materialized volume under a private temp directory (or cache). */
+export async function writeTempVolume(data: Uint8Array, cacheKey?: string): Promise<string> {
+  if (!cacheKey) {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'niftispy-'));
+    const file = path.join(dir, `volume-${process.pid}-${tempCounter++}.raw`);
+    await fs.promises.writeFile(file, data);
+    return file;
+  }
+
+  try {
+    await fs.promises.mkdir(MATERIALIZED_DIR, { recursive: true, mode: 0o700 });
+    const name = createHash('sha1').update(cacheKey).digest('hex');
+    const file = path.join(MATERIALIZED_DIR, `${name}.raw`);
+    try {
+      const st = await fs.promises.stat(file);
+      if (st.size === data.byteLength) {
+        // Touch so LRU keeps recently reopened volumes.
+        await fs.promises.utimes(file, new Date(), new Date()).catch(() => {});
+        scheduleMaterializedPrune();
+        return file;
+      }
+    } catch {
+      // Missing or stale: rewrite below.
+    }
+
+    const tmp = `${file}.${process.pid}.${tempCounter++}.tmp`;
+    try {
+      await fs.promises.writeFile(tmp, data, { mode: 0o600 });
+      await fs.promises.rename(tmp, file);
+    } catch (err) {
+      await fs.promises.rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
+    scheduleMaterializedPrune();
+    return file;
+  } catch {
+    // Cache is optional; fall back to a per-open temp.
+    return writeTempVolume(data);
+  }
+}
+
+function scheduleMaterializedPrune(): void {
+  if (pruneScheduled) return;
+  pruneScheduled = true;
+  const timer = setTimeout(() => {
+    pruneScheduled = false;
+    void pruneMaterializedCache();
+  }, 1000);
+  timer.unref?.();
+}
+
+async function pruneMaterializedCache(): Promise<void> {
+  try {
+    const names = await fs.promises.readdir(MATERIALIZED_DIR);
+    const entries: Array<{ file: string; size: number; mtimeMs: number }> = [];
+    for (const name of names) {
+      if (!name.endsWith('.raw')) continue;
+      const file = path.join(MATERIALIZED_DIR, name);
+      const st = await fs.promises.stat(file).catch(() => null);
+      if (st) entries.push({ file, size: st.size, mtimeMs: st.mtimeMs });
+    }
+    let total = entries.reduce((sum, e) => sum + e.size, 0);
+    if (total <= MATERIALIZED_BUDGET) return;
+    entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    const now = Date.now();
+    for (const entry of entries) {
+      if (total <= MATERIALIZED_BUDGET) break;
+      // Only evict files that have not been touched recently, so an open
+      // editor's random-access reads cannot be pulled out from under it.
+      if (now - entry.mtimeMs < MATERIALIZED_MIN_AGE_MS) continue;
+      await fs.promises.rm(entry.file, { force: true }).catch(() => {});
+      total -= entry.size;
+    }
+  } catch {
+    // Pruning is best-effort.
+  }
 }
 
 /** Remove all files produced by writeTempVolume (and their private dirs). */
@@ -128,7 +228,10 @@ export async function removeTempVolumes(files: string[] | undefined): Promise<vo
   await Promise.all(files.map(async file => {
     try {
       const dir = path.dirname(file);
-      if (path.basename(dir).startsWith('niftispy-')) {
+      if (dir === MATERIALIZED_DIR) {
+        // Shared cache: never delete the whole directory.
+        await fs.promises.rm(file, { force: true });
+      } else if (path.basename(dir).startsWith('niftispy-')) {
         await fs.promises.rm(dir, { recursive: true, force: true });
       } else {
         await fs.promises.rm(file, { force: true });

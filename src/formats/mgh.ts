@@ -1,6 +1,7 @@
 import * as zlib from 'zlib';
 import {
-  DATATYPE_BYTES, ensureLittleEndian, makeNiftiHeader, readFileBytes, writeTempVolume,
+  DATATYPE_BYTES, ensureLittleEndian, fileStamp, makeNiftiHeader, readFileBytes,
+  tempFilesFor, writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -63,8 +64,9 @@ export const mghFormat: VolumeFormat = {
       orientation: 'RAS',
     });
     if (opts.memory) return { header, rawData: little };
-    const tempPath = await writeTempVolume(little);
-    return { header, dataPath: tempPath, tempFiles: [tempPath] };
+    const stamp = await fileStamp([filePath]);
+    const tempPath = await writeTempVolume(little, stamp ? `mgh:${stamp}:${type}` : undefined);
+    return { header, dataPath: tempPath, tempFiles: tempFilesFor(tempPath) };
   },
 };
 

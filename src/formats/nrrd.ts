@@ -1,8 +1,9 @@
 import * as path from 'path';
 import * as zlib from 'zlib';
 import {
-  DATATYPE_BYTES, ensureLittleEndian, lpsToRas, makeNiftiHeader, normalize3,
-  readFileBytes, readTextHeader, sformFromDirections, toU8, typedToU8, writeTempVolume,
+  DATATYPE_BYTES, ensureLittleEndian, fileStamp, lpsToRas, makeNiftiHeader, normalize3,
+  readFileBytes, readTextHeader, sformFromDirections, tempFilesFor, toU8, typedToU8,
+  writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -109,8 +110,9 @@ export const nrrdFormat: VolumeFormat = {
       : payload.subarray(0, expectedBytes);
     const header = headerFor(0);
     if (opts.memory) return { header, rawData: little };
-    const tempPath = await writeTempVolume(little);
-    return { header, dataPath: tempPath, tempFiles: [tempPath] };
+    const stamp = await fileStamp([filePath, dataPath]);
+    const tempPath = await writeTempVolume(little, stamp ? `nrrd:${stamp}:${encoding}` : undefined);
+    return { header, dataPath: tempPath, tempFiles: tempFilesFor(tempPath) };
   },
 };
 
