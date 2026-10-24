@@ -18,6 +18,8 @@ export const VOLUME_FORMATS: VolumeFormat[] = [
   dicomFormat,
 ];
 
+export { prepareParsedPayload } from './payload';
+
 export const VOLUME_EXTENSIONS = VOLUME_FORMATS.flatMap(f => f.extensions);
 
 export function findVolumeFormat(filePath: string): VolumeFormat | undefined {

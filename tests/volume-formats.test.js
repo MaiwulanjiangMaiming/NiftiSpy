@@ -149,6 +149,69 @@ test('npy: memory parse maps C-order axes and keeps an absolute offset', async (
   assert.ok(!parsed.dataPath);
 });
 
+test('payload: 4D int16 keeps every frame and compacts unaligned data', async () => {
+  await load();
+  const header = {
+    nx: 2, ny: 2, nz: 2, nt: 2,
+    datatype: 4, bytesPerVoxel: 2, voxOffset: 3, volumeBytes: 0,
+  };
+  const raw = new Uint8Array(3 + 16 * 2);
+  const source = new DataView(raw.buffer);
+  for (let i = 0; i < 16; i++) source.setInt16(3 + i * 2, i + 1, true);
+
+  const prepared = registry.prepareParsedPayload(header, raw);
+  assert.equal(prepared.totalVoxels, 16);
+  assert.equal(prepared.voxelBytes, 32);
+  assert.equal(header.voxOffset, 0);
+  assert.equal(header.volumeBytes, 32);
+
+  const view = new DataView(prepared.payload.buffer, prepared.payload.byteOffset, prepared.payload.byteLength);
+  assert.equal(view.getInt16(0, true), 1);
+  assert.equal(view.getInt16(15 * 2, true), 16);
+});
+
+test('payload: Float64 4D is downcast across all timepoints', async () => {
+  await load();
+  const raw = new Float64Array([1.5, 9.5]);
+  const header = {
+    nx: 1, ny: 1, nz: 1, nt: 2,
+    datatype: 64, bytesPerVoxel: 8, voxOffset: 0, volumeBytes: 0,
+  };
+  const prepared = registry.prepareParsedPayload(header, new Uint8Array(raw.buffer));
+  assert.equal(prepared.totalVoxels, 2);
+  assert.equal(prepared.voxelBytes, 8);
+  assert.equal(header.datatype, 16);
+  assert.equal(header.volumeBytes, 8);
+  assert.equal(prepared.min, 1.5);
+  assert.equal(prepared.max, 9.5);
+  assert.deepEqual(
+    Array.from(new Float32Array(prepared.payload.buffer, prepared.payload.byteOffset, 2)),
+    [1.5, 9.5],
+  );
+});
+
+test('npy: 4D array keeps nt and all timepoints', async () => {
+  await load();
+  const file = tmp('vol4d.npy');
+  const values = Array.from({ length: 16 }, (_, i) => i + 0.5);
+  fs.writeFileSync(file, npyFile({ shape: [2, 2, 2, 2], values: floatsLE(values) }));
+
+  const { parsed } = await registry.parseVolumeFile(file, { memory: true });
+  assert.equal(parsed.header.nt, 2);
+  const prepared = registry.prepareParsedPayload(parsed.header, parsed.rawData);
+  assert.equal(prepared.totalVoxels, 16);
+  assert.equal(prepared.voxelBytes, 64);
+  assert.equal(parsed.header.volumeBytes, 64);
+  assert.deepEqual(
+    Array.from(new Float32Array(
+      prepared.payload.buffer,
+      prepared.payload.byteOffset + parsed.header.voxOffset,
+      16,
+    )),
+    values,
+  );
+});
+
 test('npy: stream parse keeps the file as the data source', async () => {
   await load();
   const file = tmp('stream.npy');

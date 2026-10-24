@@ -8,6 +8,7 @@ import { VolumeCache } from './VolumeCache';
 import { downsampleSlice } from './nifti/sliceExtractor';
 import { getNativeBindings } from './nativeBridge';
 import { parseNiiHeaderQuick } from './nifti/headerParser';
+import { prepareParsedPayload } from './formats/payload';
 import { findVolumeFormat, VOLUME_EXTENSIONS } from './formats/registry';
 import { removeTempVolumes } from './formats/header';
 import type { ParsedVolume, VolumeFormat } from './formats/types';
@@ -675,7 +676,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     }
 
     const { nx, ny, nz, datatype, scl_slope, scl_inter, littleEndian, voxOffset } = header;
-    const n = nx * ny * nz;
+    const n = nx * ny * nz * Math.max(1, header.nt || 1);
     const slope = scl_slope || 1;
     const inter = scl_inter || 0;
     const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
@@ -2342,58 +2343,24 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     rawData: Uint8Array,
     signal: AbortSignal
   ): void {
-    // Only the first 3D volume is rendered (4D time series reuse the same
-    // viewer buffer convention as the NIfTI local path).
-    const totalVoxels = header.nx * header.ny * header.nz;
-    const voxelBytes = totalVoxels * header.bytesPerVoxel;
     const slope = header.scl_slope || 1;
     const inter = header.scl_inter || 0;
 
-    // Text headers (NRRD/MetaImage) can end on an unaligned byte. The
-    // webview creates typed-array views at voxOffset, which requires natural
-    // alignment, so compact once when needed.
-    if ((rawData.byteOffset + header.voxOffset) % Math.max(1, header.bytesPerVoxel) !== 0) {
-      const aligned = new Uint8Array(voxelBytes);
-      aligned.set(rawData.subarray(header.voxOffset, header.voxOffset + voxelBytes));
-      rawData = aligned;
-      header.voxOffset = 0;
-    }
-
-    let payload = rawData;
+    // Publish every timepoint so header.nt always matches the bytes on the
+    // wire. Alignment and Float64 downcast are handled in one place.
+    const prepared = prepareParsedPayload(header, rawData);
+    const payload = prepared.payload;
+    const outBytes = prepared.voxelBytes;
     let min: number;
     let max: number;
-
-    if (header.datatype === 64) {
-      // Same Float64 → Float32 downcast as the NIfTI loader: halves the
-      // postMessage payload with no visible quality loss.
-      const src = new Float64Array(rawData.buffer, rawData.byteOffset + header.voxOffset, totalVoxels);
-      const dst = new Float32Array(totalVoxels);
-      let lo = Infinity;
-      let hi = -Infinity;
-      for (let i = 0; i < totalVoxels; i++) {
-        const v = src[i];
-        dst[i] = v;
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-      }
-      if (lo === hi) hi = lo + 1;
-      if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
-      min = lo;
-      max = hi;
-      header.datatype = 16;
-      header.bitpix = 32;
-      header.bytesPerVoxel = 4;
-      header.voxOffset = 0;
-      header.volumeBytes = totalVoxels * 4;
-      payload = new Uint8Array(dst.buffer);
+    if (prepared.min !== undefined && prepared.max !== undefined) {
+      min = prepared.min;
+      max = prepared.max;
     } else {
-      const stats = this.computeVoxelStats(rawData, header);
+      const stats = this.computeVoxelStats(payload, header);
       min = stats.min;
       max = stats.max;
     }
-
-    // `bytesPerVoxel` may have changed in the Float64 downcast above.
-    const outBytes = totalVoxels * header.bytesPerVoxel;
     const voxelOnly = payload.subarray(header.voxOffset, header.voxOffset + outBytes);
 
     this.volumeCache.set(uriKey, {
