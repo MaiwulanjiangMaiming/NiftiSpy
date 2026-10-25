@@ -1,0 +1,5 @@
+*
+!.gitignore
+!niftispy_wasm.js
+!niftispy_wasm.d.ts
+!niftispy_wasm_bg.wasm.d.ts
