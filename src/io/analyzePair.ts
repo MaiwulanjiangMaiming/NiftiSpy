@@ -7,15 +7,9 @@ export function isAnalyzeHeaderPath(p: string): boolean {
 /** Sibling `.img` / `.IMG` candidates for an Analyze / NIfTI header file. */
 export function companionImagePaths(headerPath: string): string[] {
   if (/\.hdr\.gz$/i.test(headerPath)) {
-    return [
-      headerPath.replace(/\.hdr\.gz$/i, '.img.gz'),
-      headerPath.replace(/\.hdr\.gz$/i, '.IMG.gz'),
-    ];
+    return [headerPath.replace(/\.hdr\.gz$/i, '.img.gz'), headerPath.replace(/\.hdr\.gz$/i, '.IMG.gz')];
   }
-  return [
-    headerPath.replace(/\.hdr$/i, '.img'),
-    headerPath.replace(/\.hdr$/i, '.IMG'),
-  ];
+  return [headerPath.replace(/\.hdr$/i, '.img'), headerPath.replace(/\.hdr$/i, '.IMG')];
 }
 
 function withFsPath(uri: vscode.Uri, fsPath: string): vscode.Uri {

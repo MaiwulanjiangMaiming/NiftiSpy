@@ -1,7 +1,12 @@
 import * as zlib from 'zlib';
 import {
-  DATATYPE_BYTES, ensureLittleEndian, fileStamp, makeNiftiHeader, readFileBytes,
-  tempFilesFor, writeTempVolume,
+  DATATYPE_BYTES,
+  ensureLittleEndian,
+  fileStamp,
+  makeNiftiHeader,
+  readFileBytes,
+  tempFilesFor,
+  writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -30,7 +35,10 @@ export const mghFormat: VolumeFormat = {
 
     const datatype = mghDatatype(type);
     const bytesPerVoxel = DATATYPE_BYTES[datatype];
-    const nx = width, ny = height, nz = depth, nt = Math.max(1, nframes);
+    const nx = width,
+      ny = height,
+      nz = depth,
+      nt = Math.max(1, nframes);
 
     const dx = Math.abs(view.getFloat32(32, false)) || 1;
     const dy = Math.abs(view.getFloat32(36, false)) || 1;
@@ -45,11 +53,9 @@ export const mghFormat: VolumeFormat = {
       ];
       const pxyz = [view.getFloat32(80, false), view.getFloat32(84, false), view.getFloat32(88, false)];
       const zoom = [dx, dy, dz];
-      const a: number[][] = [0, 1, 2].map(r => [0, 1, 2].map(c => mdc[c][r] * zoom[c]));
-      const origin = [0, 1, 2].map(r =>
-        pxyz[r] - (a[r][0] * (nx / 2) + a[r][1] * (ny / 2) + a[r][2] * (nz / 2)),
-      );
-      sform = [0, 1, 2].map(r => [a[r][0], a[r][1], a[r][2], origin[r]]);
+      const a: number[][] = [0, 1, 2].map((r) => [0, 1, 2].map((c) => mdc[c][r] * zoom[c]));
+      const origin = [0, 1, 2].map((r) => pxyz[r] - (a[r][0] * (nx / 2) + a[r][1] * (ny / 2) + a[r][2] * (nz / 2)));
+      sform = [0, 1, 2].map((r) => [a[r][0], a[r][1], a[r][2], origin[r]]);
     }
 
     const payload = raw.subarray(MGH_HEADER_SIZE);
@@ -59,7 +65,16 @@ export const mghFormat: VolumeFormat = {
     const little = ensureLittleEndian(payload.subarray(0, expected), bytesPerVoxel);
 
     const header = makeNiftiHeader({
-      nx, ny, nz, nt, dx, dy, dz, datatype, voxOffset: 0, sform,
+      nx,
+      ny,
+      nz,
+      nt,
+      dx,
+      dy,
+      dz,
+      datatype,
+      voxOffset: 0,
+      sform,
       descrip: `FreeSurfer ${isGzip ? 'MGZ' : 'MGH'} type ${type}`,
       orientation: 'RAS',
     });
@@ -72,12 +87,18 @@ export const mghFormat: VolumeFormat = {
 
 function mghDatatype(type: number): number {
   switch (type) {
-    case 0: return 2;   // MRI_UCHAR
-    case 1: return 8;   // MRI_INT (4-byte signed)
-    case 2: return 8;   // MRI_LONG (4-byte on FreeSurfer platforms)
-    case 3: return 16;  // MRI_FLOAT
-    case 4: return 4;   // MRI_SHORT
-    default: throw new Error(`unsupported MGH voxel type ${type}`);
+    case 0:
+      return 2; // MRI_UCHAR
+    case 1:
+      return 8; // MRI_INT (4-byte signed)
+    case 2:
+      return 8; // MRI_LONG (4-byte on FreeSurfer platforms)
+    case 3:
+      return 16; // MRI_FLOAT
+    case 4:
+      return 4; // MRI_SHORT
+    default:
+      throw new Error(`unsupported MGH voxel type ${type}`);
   }
 }
 

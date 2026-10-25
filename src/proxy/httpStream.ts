@@ -49,7 +49,11 @@ export async function handleFile(
   if (method === 'HEAD') {
     if (!entry.size) {
       if (isHttpRemote) {
-        try { entry.size = await getHttpRemoteSize(fileUri.toString(), ctx); } catch { /* unknown */ }
+        try {
+          entry.size = await getHttpRemoteSize(fileUri.toString(), ctx);
+        } catch {
+          /* unknown */
+        }
       }
       if (!entry.size) {
         const stat = await vscode.workspace.fs.stat(fileUri);
@@ -139,7 +143,9 @@ export async function handleFile(
       if (!entry.dataCache) {
         entry.dataCache = await vscode.workspace.fs.readFile(fileUri);
       }
-      compressResponse(Buffer.from(entry.dataCache), req, res, 'application/octet-stream', { 'Accept-Ranges': 'bytes' });
+      compressResponse(Buffer.from(entry.dataCache), req, res, 'application/octet-stream', {
+        'Accept-Ranges': 'bytes',
+      });
     }
   }
 }
@@ -161,10 +167,22 @@ export function pipeLocalFile(
       resolve();
     };
     const destroy = () => {
-      try { extra?.destroy(); } catch { /* already closed */ }
-      try { (stream as { destroy?: () => void }).destroy?.(); } catch { /* already closed */ }
+      try {
+        extra?.destroy();
+      } catch {
+        /* already closed */
+      }
+      try {
+        (stream as { destroy?: () => void }).destroy?.();
+      } catch {
+        /* already closed */
+      }
       if (!res.writableEnded) {
-        try { res.destroy(); } catch { /* already closed */ }
+        try {
+          res.destroy();
+        } catch {
+          /* already closed */
+        }
       }
       finish();
     };
@@ -185,7 +203,11 @@ export function trackHttpAbort(
   ctx: HttpStreamContext,
 ): () => void {
   const destroy = () => {
-    try { remoteReq.destroy(); } catch { /* already closed */ }
+    try {
+      remoteReq.destroy();
+    } catch {
+      /* already closed */
+    }
   };
   const handle = { destroy, background };
   ctx.inflightFileStreams.add(handle);
@@ -218,7 +240,10 @@ export function getHttpRemoteSize(url: string, ctx: HttpStreamContext): Promise<
       response.resume(); // drain the response
     });
     request.on('error', reject);
-    request.setTimeout(5000, () => { request.destroy(); reject(new Error('HEAD request timeout')); });
+    request.setTimeout(5000, () => {
+      request.destroy();
+      reject(new Error('HEAD request timeout'));
+    });
     request.end();
   });
 }
@@ -271,8 +296,14 @@ export function streamHttpRangeToResponse(
         }
         res.writeHead(response.statusCode, headers);
         response.pipe(res, { end: true });
-        response.on('end', () => { untrack(); resolve(); });
-        response.on('error', (err: Error) => { untrack(); reject(err); });
+        response.on('end', () => {
+          untrack();
+          resolve();
+        });
+        response.on('error', (err: Error) => {
+          untrack();
+          reject(err);
+        });
       } else {
         untrack();
         reject(new Error(`Remote responded with ${response.statusCode}`));
@@ -280,8 +311,15 @@ export function streamHttpRangeToResponse(
       }
     });
     untrack = trackHttpAbort(clientReq, request, background, ctx);
-    request.on('error', (err) => { untrack(); reject(err); });
-    request.setTimeout(30000, () => { request.destroy(); untrack(); reject(new Error('Range request timeout')); });
+    request.on('error', (err) => {
+      untrack();
+      reject(err);
+    });
+    request.setTimeout(30000, () => {
+      request.destroy();
+      untrack();
+      reject(new Error('Range request timeout'));
+    });
     request.end();
   });
 }
@@ -319,8 +357,14 @@ export function streamHttpToResponse(
         }
         res.writeHead(200, headers);
         response.pipe(res, { end: true });
-        response.on('end', () => { untrack(); resolve(); });
-        response.on('error', (err: Error) => { untrack(); reject(err); });
+        response.on('end', () => {
+          untrack();
+          resolve();
+        });
+        response.on('error', (err: Error) => {
+          untrack();
+          reject(err);
+        });
       } else {
         untrack();
         reject(new Error(`Remote responded with ${response.statusCode}`));
@@ -328,8 +372,15 @@ export function streamHttpToResponse(
       }
     });
     untrack = trackHttpAbort(clientReq, request, background, ctx);
-    request.on('error', (err) => { untrack(); reject(err); });
-    request.setTimeout(60000, () => { request.destroy(); untrack(); reject(new Error('Full file request timeout')); });
+    request.on('error', (err) => {
+      untrack();
+      reject(err);
+    });
+    request.setTimeout(60000, () => {
+      request.destroy();
+      untrack();
+      reject(new Error('Full file request timeout'));
+    });
     request.end();
   });
 }
@@ -340,9 +391,13 @@ export function streamHttpToResponse(
  * sequential small requests, which is critical for large uncompressed
  * NIfTI volumes.
  */
-export async function downloadHttpFileInChunks(url: string, totalSize: number, signal?: AbortSignal): Promise<Uint8Array> {
+export async function downloadHttpFileInChunks(
+  url: string,
+  totalSize: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   const CHUNK_SIZE = 32 * 1024 * 1024; // 32 MB — larger chunks = fewer requests, better throughput
-  const MAX_CONCURRENT = 32;            // match agent maxSockets for full utilization
+  const MAX_CONCURRENT = 32; // match agent maxSockets for full utilization
 
   if (totalSize <= CHUNK_SIZE) {
     return readHttpPartial(url, 0, totalSize - 1, signal);
@@ -373,7 +428,7 @@ export async function downloadHttpFileInChunks(url: string, totalSize: number, s
           .then(() => {
             if (poolError) return;
           })
-          .catch(err => {
+          .catch((err) => {
             if (!poolError) poolError = err;
           })
           .finally(() => {

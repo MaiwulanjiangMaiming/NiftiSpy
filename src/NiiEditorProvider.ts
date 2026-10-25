@@ -66,22 +66,28 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   // If the webview cannot fetch the port-forwarded proxy URL (forwarding
   // blocked, CSP, tunnel hiccup), it reports back and we fall back to the
   // chunked postMessage transfer from this stashed context.
-  private remoteHttpFallbacks = new Map<string, {
-    webview: vscode.Webview;
-    fsPath: string;
-    fileSize: number;
-    validationToken: string;
-    signal: AbortSignal;
-    isGzip: boolean;
-  }>();
+  private remoteHttpFallbacks = new Map<
+    string,
+    {
+      webview: vscode.Webview;
+      fsPath: string;
+      fileSize: number;
+      validationToken: string;
+      signal: AbortSignal;
+      isGzip: boolean;
+    }
+  >();
   // Same idea for host-parsed formats: re-read the volume in the host and
   // push it as cachedVolume when the forwarded proxy URL is unreachable.
-  private parsedRemoteFallbacks = new Map<string, {
-    webview: vscode.Webview;
-    uri: vscode.Uri;
-    format: VolumeFormat;
-    signal: AbortSignal;
-  }>();
+  private parsedRemoteFallbacks = new Map<
+    string,
+    {
+      webview: vscode.Webview;
+      uri: vscode.Uri;
+      format: VolumeFormat;
+      signal: AbortSignal;
+    }
+  >();
   private loadIdCounter = 0;
   private readonly loader: LocalVolumeLoader;
 
@@ -98,7 +104,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   // the "niftispy.showPerfReport" setting for backward compatibility.
   private debugMode = false;
 
-  constructor(private readonly context: vscode.ExtensionContext, volumeCache: VolumeCache) {
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    volumeCache: VolumeCache,
+  ) {
     this.volumeCache = volumeCache;
     this.loadQueue = new LoadQueue();
     this.cacheStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
@@ -127,11 +136,13 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       loadQueue: this.loadQueue,
       remoteHttpFallbacks: this.remoteHttpFallbacks,
       gzipIndexStatusItems: this.gzipIndexStatusItems,
-      isWebviewActive: id => this.isWebviewActive(id),
-      logPerf: line => this.logPerf(line),
+      isWebviewActive: (id) => this.isWebviewActive(id),
+      logPerf: (line) => this.logPerf(line),
       updateCacheStatusBar: () => this.updateCacheStatusBar(),
       getProxy: () => this.proxy,
-      setProxy: proxy => { this.proxy = proxy; },
+      setProxy: (proxy) => {
+        this.proxy = proxy;
+      },
     });
   }
 
@@ -184,17 +195,11 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         //                libdeflate (native single-core oneshot, nativeBackend='libdeflate'),
         //                rusty-rapidgzip (native multi-core libdeflate-based speculative parallel,
         //                                 nativeBackend='rusty-rapidgzip').
-        const backendName = stream.nativeBackend;  // undefined | 'system-zlib' | 'libdeflate' | 'rusty-rapidgzip'
+        const backendName = stream.nativeBackend; // undefined | 'system-zlib' | 'libdeflate' | 'rusty-rapidgzip'
         const isStream = backendName === undefined;
         const isLibdeflate = backendName === 'libdeflate';
         const isParallel = backendName === 'rusty-rapidgzip';
-        const tag = isStream
-          ? '[stream]'
-          : isParallel
-            ? '[parallel]'
-            : isLibdeflate
-              ? '[libdeflate]'
-              : '[gunzip]';
+        const tag = isStream ? '[stream]' : isParallel ? '[parallel]' : isLibdeflate ? '[libdeflate]' : '[gunzip]';
         const backendSuffix = !isStream ? ` (${backendName})` : '';
         lines.push(`│   ${tag} fs read            : ${stream.fsToFirstData ?? '?'} ms${backendSuffix}`);
         if (isStream) {
@@ -205,7 +210,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         } else if (isParallel) {
           lines.push(`│   ${tag} header parse      : ${stream.headerParse ?? '?'} ms`);
           lines.push(`│   ${tag} → preview ready   : ${stream.previewReady ?? '?'} ms (after parallel decompress)`);
-          lines.push(`│   ${tag} parallel decompress: ${stream.nativeDecompress ?? '?'} ms (mmap + rusty-rapidgzip, all cores)`);
+          lines.push(
+            `│   ${tag} parallel decompress: ${stream.nativeDecompress ?? '?'} ms (mmap + rusty-rapidgzip, all cores)`,
+          );
           lines.push(`│   ${tag} total decompress  : ${stream.totalDecompress ?? '?'} ms (Rust worker thread)`);
           lines.push(`│   ${tag} stats (min/max)   : ${stream.statsCompute ?? '?'} ms`);
         } else if (isLibdeflate) {
@@ -217,7 +224,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         } else {
           // [gunzip] path (JS gunzipSync, nativeBackend='system-zlib')
           lines.push(`│   ${tag} header parse      : ${stream.headerParse ?? '?'} ms`);
-          lines.push(`│   ${tag} decompress        : ${stream.nativeDecompress ?? stream.totalDecompress ?? '?'} ms (pure gunzipSync)`);
+          lines.push(
+            `│   ${tag} decompress        : ${stream.nativeDecompress ?? stream.totalDecompress ?? '?'} ms (pure gunzipSync)`,
+          );
           lines.push(`│   ${tag} total decompress  : ${stream.totalDecompress ?? '?'} ms (fs read + gunzip)`);
           lines.push(`│   ${tag} stats (min/max)   : ${stream.statsCompute ?? '?'} ms`);
         }
@@ -226,17 +235,19 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         if ((stream.totalDecompress ?? 0) > 0 && (stream.decompressedBytes ?? 0) > 0) {
           const totalDecompress = stream.totalDecompress!;
           const decompressedBytes = stream.decompressedBytes!;
-          const throughput = ((decompressedBytes / (1024 * 1024)) / (totalDecompress / 1000)).toFixed(0);
+          const throughput = (decompressedBytes / (1024 * 1024) / (totalDecompress / 1000)).toFixed(0);
           lines.push(`│   ${tag} decompress throughput: ${throughput} MB/s`);
         }
       }
       lines.push(`│   total load (decompress)    : ${ext.totalLoad ?? '?'} ms`);
-      lines.push(`│   downcast/stats             : ${ext.downcastOrStats ?? '?'} ms${msg.isGzip ? '' : ' (Float64→Float32 or sampled stats)'}`);
+      lines.push(
+        `│   downcast/stats             : ${ext.downcastOrStats ?? '?'} ms${msg.isGzip ? '' : ' (Float64→Float32 or sampled stats)'}`,
+      );
       lines.push(`│   volumeCache.set            : ${ext.cacheSet ?? '?'} ms`);
       const postMsgSync = ext.postMessageSync ?? stream.postMessageSync ?? 0;
       lines.push(`│   postMessage sync (serial)  : ${postMsgSync} ms (structured-clone of ${voxelMB} MB)`);
       if (postMsgSync > 0) {
-        const serialRate = ((msg.voxelBytes / (1024 * 1024)) / (postMsgSync / 1000)).toFixed(0);
+        const serialRate = (msg.voxelBytes / (1024 * 1024) / (postMsgSync / 1000)).toFixed(0);
         lines.push(`│   serialize throughput       : ${serialRate} MB/s`);
       }
       lines.push('├─────────────────────────────────────────────────────────────┤');
@@ -249,17 +260,29 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       lines.push(`│ ESTIMATED TOTAL (ext + sync + webview): ${grandTotal.toFixed(1)} ms`);
       lines.push(`│   Note: webview viewSetupMs includes IPC transfer time`);
       lines.push(`│   (cannot be separated from render time due to clock-origin mismatch)`);
-      const pct = (v: number) => grandTotal > 0 ? ((v / grandTotal) * 100).toFixed(0) + '%' : '?';
+      const pct = (v: number) => (grandTotal > 0 ? ((v / grandTotal) * 100).toFixed(0) + '%' : '?');
       lines.push(`│   decompress   : ${pct(ext.totalLoad || 0)}${(ext.totalLoad || 0) > 1500 ? '  ← BOTTLENECK' : ''}`);
       lines.push(`│   postMsg sync : ${pct(postMsgSync || 0)}`);
       lines.push(`│   webview      : ${pct(msg.viewSetupMs || 0)}`);
-      lines.push(`│   other        : ${pct(grandTotal - (ext.totalLoad || 0) - (postMsgSync || 0) - (msg.viewSetupMs || 0))}`);
+      lines.push(
+        `│   other        : ${pct(grandTotal - (ext.totalLoad || 0) - (postMsgSync || 0) - (msg.viewSetupMs || 0))}`,
+      );
       lines.push('└─────────────────────────────────────────────────────────────┘');
       for (const line of lines) {
         this.logPerf(line);
       }
     } catch (err) {
       this.logPerf('Perf report error: ' + String(err));
+    }
+  }
+
+  /** Deliver a message to the currently focused NiftiSpy webview, if any. */
+  postToActiveWebview(message: Record<string, unknown>): void {
+    for (const [, entry] of this.activeWebviews) {
+      if (entry.panel.active) {
+        entry.panel.webview.postMessage(message);
+        return;
+      }
     }
   }
 
@@ -301,7 +324,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   async openCustomDocument(
     uri: vscode.Uri,
     _openContext: vscode.CustomDocumentOpenContext,
-    _token: vscode.CancellationToken
+    _token: vscode.CancellationToken,
   ): Promise<vscode.CustomDocument> {
     return { uri, dispose: () => {} };
   }
@@ -309,7 +332,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   async resolveCustomEditor(
     document: vscode.CustomDocument,
     webviewPanel: vscode.WebviewPanel,
-    _token: vscode.CancellationToken
+    _token: vscode.CancellationToken,
   ): Promise<void> {
     const uri = document.uri;
     // Any format the host can decode (npy/npz/nrrd/mha/mrc/mgh/...) is
@@ -329,7 +352,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       localResourceRoots: [
         vscode.Uri.joinPath(this.context.extensionUri, 'dist'),
         vscode.Uri.joinPath(uri, '.'),
-        ...(vscode.workspace.workspaceFolders?.map(f => f.uri) ?? []),
+        ...(vscode.workspace.workspaceFolders?.map((f) => f.uri) ?? []),
       ],
     };
 
@@ -407,7 +430,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           this.nativeStatusBarItem.show();
           if (!this.nativeFallbackWarned) {
             this.nativeFallbackWarned = true;
-            vscode.window.showInformationMessage('NiftiSpy: Native acceleration unavailable, using WASM SIMD + JavaScript fallback.');
+            vscode.window.showInformationMessage(
+              'NiftiSpy: Native acceleration unavailable, using WASM SIMD + JavaScript fallback.',
+            );
           }
         }
 
@@ -424,7 +449,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               const stat = await vscode.workspace.fs.stat(pair.dataUri);
               fileSize = Number(stat.size);
               validationToken = `${stat.mtime}:${stat.size}`;
-            } catch { /* remote stat optional */ }
+            } catch {
+              /* remote stat optional */
+            }
           }
         } catch {
           // stat may fail for remote URIs; validationToken stays empty
@@ -444,7 +471,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           // or a full fetch (small files). The webview skips the HTTP-preview
           // fallback timer while that message is in flight.
           isRemoteSsh: !isParsed && !isRemote && isWanRemote(),
-          deferFullVolume: isParsed ? false : (isRemote || shouldUseSliceMode(fileSize)),
+          deferFullVolume: isParsed ? false : isRemote || shouldUseSliceMode(fileSize),
           skipHttpFallback: isParsed,
           hostParsed: isParsed,
           fileUrl,
@@ -458,7 +485,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
         if (parsedFormat) {
           await this.loadParsedVolume(
-            webview, webviewId, loadId, uri, abortController.signal, parsedFormat, fileSize, validationToken
+            webview,
+            webviewId,
+            loadId,
+            uri,
+            abortController.signal,
+            parsedFormat,
+            fileSize,
+            validationToken,
           );
           return;
         }
@@ -470,7 +504,16 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         if (isRemote && entryId) {
           this.loader.startPreviewLoad(entryId, webview, webviewId, loadId, uri, abortController.signal);
         } else if (!isRemote) {
-          this.loader.startLocalLoad(webview, webviewId, loadId, uri, abortController.signal, fileSize, validationToken, pair);
+          this.loader.startLocalLoad(
+            webview,
+            webviewId,
+            loadId,
+            uri,
+            abortController.signal,
+            fileSize,
+            validationToken,
+            pair,
+          );
         }
       } else if (msg.type === 'remoteHttpFallback') {
         // Host-parsed volume: the forwarded proxy URL is unreachable, so read
@@ -486,14 +529,20 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
             if (tempFiles.length) this.trackParsedTemps(msg.webviewId, tempFiles);
             if (parsed.rawData && !parsedFb.signal.aborted) {
               this.publishParsedVolume(
-                parsedFb.webview, parsedFb.uri.toString(), parsed.header, parsed.rawData, parsedFb.signal
+                parsedFb.webview,
+                parsedFb.uri.toString(),
+                parsed.header,
+                parsed.rawData,
+                parsedFb.signal,
               );
             }
           } catch (err) {
             if (parsedFb.signal.aborted) return;
             const message = errorMessage(err);
             parsedFb.webview.postMessage({ type: 'loadError', message });
-            vscode.window.showErrorMessage(`NiftiSpy: cannot open ${path.basename(parsedFb.uri.fsPath || parsedFb.uri.path)} — ${message}`);
+            vscode.window.showErrorMessage(
+              `NiftiSpy: cannot open ${path.basename(parsedFb.uri.fsPath || parsedFb.uri.path)} — ${message}`,
+            );
           }
           return;
         }
@@ -503,15 +552,24 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         const fb = this.remoteHttpFallbacks.get(fallbackId);
         this.remoteHttpFallbacks.delete(fallbackId);
         if (!fb || fb.signal.aborted) return;
-        this.logPerf(`[remote-ssh-http] webview fetch failed (${String(msg.reason || 'unknown')}), falling back to chunked transfer`);
-        await this.loader.remoteSshChunkedLoad(fb.webview, fb.fsPath, fb.fileSize, fb.validationToken, fb.signal, fb.isGzip);
+        this.logPerf(
+          `[remote-ssh-http] webview fetch failed (${String(msg.reason || 'unknown')}), falling back to chunked transfer`,
+        );
+        await this.loader.remoteSshChunkedLoad(
+          fb.webview,
+          fb.fsPath,
+          fb.fileSize,
+          fb.validationToken,
+          fb.signal,
+          fb.isGzip,
+        );
       } else if (msg.type === 'perfReport') {
         this.handlePerfReport(msg);
       } else if (msg.type === 'selectImage') {
         const files = await vscode.window.showOpenDialog({
           canSelectMany: false,
           filters: {
-            'Volumes': ['nii', 'nii.gz', 'hdr', 'img', ...VOLUME_EXTENSIONS.map(ext => ext.slice(1))],
+            Volumes: ['nii', 'nii.gz', 'hdr', 'img', ...VOLUME_EXTENSIONS.map((ext) => ext.slice(1))],
           },
           title: 'Select Image File',
         });
@@ -554,8 +612,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               loadId: imgLoadId,
             });
             await this.loadParsedVolume(
-              webview, imgWebviewId, imgLoadId, imgUri, new AbortController().signal,
-              imgFormat, imgFileSize, imgValidationToken
+              webview,
+              imgWebviewId,
+              imgLoadId,
+              imgUri,
+              new AbortController().signal,
+              imgFormat,
+              imgFileSize,
+              imgValidationToken,
             );
             return;
           }
@@ -566,7 +630,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               await this.proxy.start();
               this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
             }
-            const imgUrl = this.proxy.registerFile(imgPair.headerUri, imgPair.separateImg ? imgPair.dataUri : undefined);
+            const imgUrl = this.proxy.registerFile(
+              imgPair.headerUri,
+              imgPair.separateImg ? imgPair.dataUri : undefined,
+            );
             const entryId = imgUrl.split('/').pop()!;
             webview.postMessage({
               type: 'newImage',
@@ -578,7 +645,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               webviewId: imgWebviewId,
               loadId: imgLoadId,
             });
-            this.loader.startPreviewLoad(entryId, webview, imgWebviewId, imgLoadId, imgUri, new AbortController().signal);
+            this.loader.startPreviewLoad(
+              entryId,
+              webview,
+              imgWebviewId,
+              imgLoadId,
+              imgUri,
+              new AbortController().signal,
+            );
           } else {
             // Local file: direct webview URI + postMessage (same as initial open).
             const imgUrl = webview.asWebviewUri(imgPair.dataUri).toString();
@@ -603,7 +677,16 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
               webviewId: imgWebviewId,
               loadId: imgLoadId,
             });
-            this.loader.startLocalLoad(webview, imgWebviewId, imgLoadId, imgUri, new AbortController().signal, imgFileSize, imgValidationToken, imgPair);
+            this.loader.startLocalLoad(
+              webview,
+              imgWebviewId,
+              imgLoadId,
+              imgUri,
+              new AbortController().signal,
+              imgFileSize,
+              imgValidationToken,
+              imgPair,
+            );
           }
         }
       } else if (msg.type === 'exportSlice') {
@@ -634,17 +717,24 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         // sidebar button state recovers cleanly.
         try {
           const cfg = vscode.workspace.getConfiguration('niftispy');
-          let tplPath = msg.mode === 'mni' ? (cfg.get<string>('mniTemplatePath') || '') : '';
+          let tplPath = msg.mode === 'mni' ? cfg.get<string>('mniTemplatePath') || '' : '';
           if (!tplPath) {
             const picked = await vscode.window.showOpenDialog({
               canSelectMany: false,
-              title: msg.mode === 'mni'
-                ? 'Select MNI standard template (e.g. MNI152_T1_2mm.nii.gz)'
-                : 'Select custom template volume',
+              title:
+                msg.mode === 'mni'
+                  ? 'Select MNI standard template (e.g. MNI152_T1_2mm.nii.gz)'
+                  : 'Select custom template volume',
               filters: { 'NIfTI volumes': ['nii', 'gz'] },
             });
             if (!picked || picked.length === 0) {
-              webview.postMessage({ type: 'regStatus', mode: msg.mode, ok: false, cancelled: true, message: 'Template selection cancelled' });
+              webview.postMessage({
+                type: 'regStatus',
+                mode: msg.mode,
+                ok: false,
+                cancelled: true,
+                message: 'Template selection cancelled',
+              });
               return;
             }
             tplPath = picked[0].fsPath;
@@ -686,7 +776,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     signal: AbortSignal,
     format: VolumeFormat,
     fileSize: number,
-    validationToken: string
+    validationToken: string,
   ): Promise<void> {
     const uriKey = uri.toString();
     const isRemote = uri.scheme !== 'file';
@@ -730,7 +820,14 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     if (isRemote) {
       this.parsedRemoteFallbacks.set(loadId, { webview, uri, format, signal });
       const dispatched = await this.startParsedRemoteLoad(
-        webview, webviewId, loadId, uri, format, fileSize, validationToken, signal
+        webview,
+        webviewId,
+        loadId,
+        uri,
+        format,
+        fileSize,
+        validationToken,
+        signal,
       );
       if (dispatched) return;
       this.parsedRemoteFallbacks.delete(loadId);
@@ -746,9 +843,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       if (signal.aborted) return;
       const message = errorMessage(err);
       webview.postMessage({ type: 'loadError', message });
-      vscode.window.showErrorMessage(
-        `NiftiSpy: cannot open ${path.basename(uri.fsPath || uri.path)} — ${message}`
-      );
+      vscode.window.showErrorMessage(`NiftiSpy: cannot open ${path.basename(uri.fsPath || uri.path)} — ${message}`);
     }
   }
 
@@ -766,7 +861,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     format: VolumeFormat,
     fileSize: number,
     validationToken: string,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): Promise<boolean> {
     try {
       const { parsed, tempFiles } = await this.parseVolumeUri(uri, format, false);
@@ -870,7 +965,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private async parseVolumeUri(
     uri: vscode.Uri,
     format: VolumeFormat,
-    memory: boolean
+    memory: boolean,
   ): Promise<{ parsed: ParsedVolume; tempFiles: string[] }> {
     const fsPath = uri.fsPath;
     // file:// and vscode-remote:// paths both exist on the extension host.
@@ -905,7 +1000,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     uriKey: string,
     header: NiiHeader,
     rawData: Uint8Array,
-    _signal: AbortSignal
+    _signal: AbortSignal,
   ): void {
     const slope = header.scl_slope || 1;
     const inter = header.scl_inter || 0;
@@ -954,7 +1049,6 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         sagittal: Math.floor(header.nx / 2),
       },
     });
-
   }
 
   private isWebviewActive(webviewId: string): boolean {
@@ -976,5 +1070,4 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       this.chunkProgressItem.hide();
     }
   }
-
 }

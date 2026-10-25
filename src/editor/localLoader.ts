@@ -54,16 +54,36 @@ export class LocalVolumeLoader {
     });
   }
 
-  private get context(): vscode.ExtensionContext { return this.host.context; }
-  private get volumeCache(): VolumeCache { return this.host.volumeCache; }
-  private get loadQueue(): LoadQueue { return this.host.loadQueue; }
-  private get remoteHttpFallbacks(): Map<string, RemoteHttpFallback> { return this.host.remoteHttpFallbacks; }
-  private get gzipIndexStatusItems(): Map<string, vscode.Disposable> { return this.host.gzipIndexStatusItems; }
-  private get proxy(): LocalFileProxy | null { return this.host.getProxy(); }
-  private set proxy(value: LocalFileProxy | null) { this.host.setProxy(value); }
-  private isWebviewActive(webviewId: string): boolean { return this.host.isWebviewActive(webviewId); }
-  private logPerf(line: string): void { this.host.logPerf(line); }
-  private updateCacheStatusBar(): void { this.host.updateCacheStatusBar(); }
+  private get context(): vscode.ExtensionContext {
+    return this.host.context;
+  }
+  private get volumeCache(): VolumeCache {
+    return this.host.volumeCache;
+  }
+  private get loadQueue(): LoadQueue {
+    return this.host.loadQueue;
+  }
+  private get remoteHttpFallbacks(): Map<string, RemoteHttpFallback> {
+    return this.host.remoteHttpFallbacks;
+  }
+  private get gzipIndexStatusItems(): Map<string, vscode.Disposable> {
+    return this.host.gzipIndexStatusItems;
+  }
+  private get proxy(): LocalFileProxy | null {
+    return this.host.getProxy();
+  }
+  private set proxy(value: LocalFileProxy | null) {
+    this.host.setProxy(value);
+  }
+  private isWebviewActive(webviewId: string): boolean {
+    return this.host.isWebviewActive(webviewId);
+  }
+  private logPerf(line: string): void {
+    this.host.logPerf(line);
+  }
+  private updateCacheStatusBar(): void {
+    this.host.updateCacheStatusBar();
+  }
   private parseNiiHeaderFromBuffer(buf: Uint8Array, separateImg = false): NiiHeader | null {
     return parseNiiHeaderQuick(buf, { separateImg });
   }
@@ -147,7 +167,14 @@ export class LocalVolumeLoader {
           // below if port forwarding is unavailable.
           if (isRemoteSSH) {
             const dispatched = await this.tryRemoteSshHttpLoad(
-              webview, webviewId, loadId, uri, fsPath, fileSize, validationToken, signal
+              webview,
+              webviewId,
+              loadId,
+              uri,
+              fsPath,
+              fileSize,
+              validationToken,
+              signal,
             );
             if (dispatched) return;
             // asExternalUri failed → legacy postMessage paths below.
@@ -210,9 +237,9 @@ export class LocalVolumeLoader {
             //      parallel → oneshot → streaming
             //    All async variants run on libuv worker thread (not blocking JS main).
             const native = getNativeBindings();
-            const SMALL_FILE_THRESHOLD_MB = 10;   // < 10MB → JS gunzipSync (no stream overhead)
-            const PARALLEL_THRESHOLD_MB = 50;     // > 50MB → native parallel (rusty-rapidgzip)
-            const fileSizeMB = fileSize / (1024 * 1024);  // fileSize from stat at L334
+            const SMALL_FILE_THRESHOLD_MB = 10; // < 10MB → JS gunzipSync (no stream overhead)
+            const PARALLEL_THRESHOLD_MB = 50; // > 50MB → native parallel (rusty-rapidgzip)
+            const fileSizeMB = fileSize / (1024 * 1024); // fileSize from stat at L334
 
             // Detect Remote-SSH: when extension host runs on a remote server,
             // postMessage crosses the network. Early preview (z=0 slice during
@@ -226,20 +253,22 @@ export class LocalVolumeLoader {
             //               more than saving 850ms on decompress.
             //   Exception: very large files (>200MB) where the 850ms decompress gap
             //   is significant even vs network transfer time.
-            const REMOTE_PARALLEL_THRESHOLD_MB = 200;  // only use parallel on huge files when remote
+            const REMOTE_PARALLEL_THRESHOLD_MB = 200; // only use parallel on huge files when remote
 
-            let result: { rawData: Uint8Array; header: NiiHeader; stats: { min: number; max: number } | null; timing: Timing } | null = null;
+            let result: {
+              rawData: Uint8Array;
+              header: NiiHeader;
+              stats: { min: number; max: number } | null;
+              timing: Timing;
+            } | null = null;
 
             // Determine the parallel threshold based on environment:
             //   Local: > 50MB → parallel (decompress speed matters)
             //   Remote-SSH: > 200MB → parallel (only huge files justify losing early preview)
-            const effectiveParallelThresholdMB = isRemoteSSH
-              ? REMOTE_PARALLEL_THRESHOLD_MB
-              : PARALLEL_THRESHOLD_MB;
+            const effectiveParallelThresholdMB = isRemoteSSH ? REMOTE_PARALLEL_THRESHOLD_MB : PARALLEL_THRESHOLD_MB;
 
             // 1. Large file + native parallel → rusty-rapidgzip (multi-core)
-            if (fileSize > 0 && fileSizeMB > effectiveParallelThresholdMB
-                && native?.fastDecompressGzipParallelAsync) {
+            if (fileSize > 0 && fileSizeMB > effectiveParallelThresholdMB && native?.fastDecompressGzipParallelAsync) {
               try {
                 result = await this.gzipLoader.parallelLocalGzLoad(webview, fsPath, signal);
               } catch (err) {
@@ -251,8 +280,12 @@ export class LocalVolumeLoader {
             // 2. Medium file + native oneshot → libdeflate (single-core, no stream)
             //    In Remote-SSH, only use oneshot for medium files (< threshold) where
             //    the decompress is fast enough that early preview isn't critical.
-            if (!result && fileSize > 0 && fileSizeMB <= effectiveParallelThresholdMB
-                && (native?.fastDecompressGzipFileAsync || native?.fastDecompressGzipOneshot)) {
+            if (
+              !result &&
+              fileSize > 0 &&
+              fileSizeMB <= effectiveParallelThresholdMB &&
+              (native?.fastDecompressGzipFileAsync || native?.fastDecompressGzipOneshot)
+            ) {
               try {
                 result = await this.gzipLoader.oneshotLocalGzLoad(webview, fsPath, signal);
               } catch (err) {
@@ -284,7 +317,7 @@ export class LocalVolumeLoader {
             if (!result || signal.aborted) return;
             rawData = result.rawData;
             header = result.header;
-            streamStats = result.stats;  // min/max computed during load (full scan, free)
+            streamStats = result.stats; // min/max computed during load (full scan, free)
             streamTiming = result.timing;
           } else {
             // Uncompressed .nii, or Analyze .hdr + companion .img
@@ -322,7 +355,8 @@ export class LocalVolumeLoader {
             const src64 = new Float64Array(rawData.buffer, rawData.byteOffset + header.voxOffset, n64);
             const f32Buf = new ArrayBuffer(n64 * 4);
             const dst32 = new Float32Array(f32Buf);
-            let lo = Infinity, hi = -Infinity;
+            let lo = Infinity,
+              hi = -Infinity;
             for (let i = 0; i < n64; i++) {
               const v = src64[i];
               dst32[i] = v;
@@ -330,13 +364,17 @@ export class LocalVolumeLoader {
               if (v > hi) hi = v;
             }
             if (lo === hi) hi = lo + 1;
-            if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
-            min = lo; max = hi;
+            if (!isFinite(lo) || !isFinite(hi)) {
+              lo = 0;
+              hi = 1;
+            }
+            min = lo;
+            max = hi;
             rawData = new Uint8Array(f32Buf);
-            header.datatype = 16;       // Float32
+            header.datatype = 16; // Float32
             header.bytesPerVoxel = 4;
             header.bitpix = 32;
-            header.voxOffset = 0;       // new buffer has no NIfTI header
+            header.voxOffset = 0; // new buffer has no NIfTI header
           } else if (streamStats) {
             // Stats were already computed during streaming decompression
             min = streamStats.min;
@@ -355,7 +393,8 @@ export class LocalVolumeLoader {
           this.volumeCache.set(uriKey, {
             header,
             voxelData: voxelOnly,
-            min, max,
+            min,
+            max,
             slope: header.scl_slope || 1,
             inter: header.scl_inter || 0,
           });
@@ -417,7 +456,6 @@ export class LocalVolumeLoader {
           const postMsgEnd = performance.now();
           // Update the ext timing with actual sync time for the report
           streamTiming.postMessageSync = +(postMsgEnd - postMsgStart).toFixed(1);
-
         } catch (err) {
           if (!isAbortError(err)) {
             console.error('Local load error:', err);
@@ -449,7 +487,7 @@ export class LocalVolumeLoader {
     fsPath: string,
     fileSize: number,
     validationToken: string,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): Promise<boolean> {
     try {
       if (!this.proxy) {
@@ -469,7 +507,11 @@ export class LocalVolumeLoader {
       const isGzip = fsPath.endsWith('.gz');
 
       this.remoteHttpFallbacks.set(loadId, {
-        webview, fsPath, fileSize, validationToken, signal,
+        webview,
+        fsPath,
+        fileSize,
+        validationToken,
+        signal,
         isGzip,
       });
 
@@ -532,16 +574,26 @@ export class LocalVolumeLoader {
           const unsubscribe = this.proxy.subscribeGzipPreview(entryId, (ortho) => {
             if (signal.aborted) return;
             void webview.postMessage({
-              type: 'previewOrtho', url: external.toString(), validationToken,
-              header: ortho.header, globalMin: ortho.min, globalMax: ortho.max,
-              slope: ortho.slope, inter: ortho.inter, sliceIdx: ortho.sliceIdx,
-              axialSlice: ortho.axial, coronalSlice: ortho.coronal, sagittalSlice: ortho.sagittal,
+              type: 'previewOrtho',
+              url: external.toString(),
+              validationToken,
+              header: ortho.header,
+              globalMin: ortho.min,
+              globalMax: ortho.max,
+              slope: ortho.slope,
+              inter: ortho.inter,
+              sliceIdx: ortho.sliceIdx,
+              axialSlice: ortho.axial,
+              coronalSlice: ortho.coronal,
+              sagittalSlice: ortho.sagittal,
             });
           });
           signal.addEventListener('abort', unsubscribe, { once: true });
           void this.proxy.whenGzipIndexReady(entryId).finally(() => signal.removeEventListener('abort', unsubscribe));
         }
-        this.logPerf(`[remote-ssh-slice] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`);
+        this.logPerf(
+          `[remote-ssh-slice] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`,
+        );
         return true;
       }
 
@@ -564,7 +616,9 @@ export class LocalVolumeLoader {
         this.remoteHttpFallbacks.delete(loadId);
         return false;
       }
-      this.logPerf(`[remote-ssh-http] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`);
+      this.logPerf(
+        `[remote-ssh-http] dispatched ${path.basename(fsPath)} (${(fileSize / 1048576).toFixed(1)}MB) via ${external.toString()}`,
+      );
       return true;
     } catch (err) {
       this.remoteHttpFallbacks.delete(loadId);
@@ -590,7 +644,7 @@ export class LocalVolumeLoader {
     fsPath: string,
     fileSize: number,
     validationToken: string,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): Promise<void> {
     const tStart = performance.now();
     // 1. Single read of the COMPRESSED file — no gunzip on the ext host.
@@ -609,9 +663,9 @@ export class LocalVolumeLoader {
       fileSize,
       validationToken,
       perfExtTiming: {
-        fsRead: +((tReadEnd - tStart).toFixed(1)),
+        fsRead: +(tReadEnd - tStart).toFixed(1),
         postMessageSync: +(performance.now() - postMsgStart).toFixed(1),
-        totalLoad: +((tReadEnd - tStart).toFixed(1)),
+        totalLoad: +(tReadEnd - tStart).toFixed(1),
         isRemoteSSH: true,
         compressedBytes: compressed.byteLength,
         // Sentinel so handlePerfReport can label this path distinctly
@@ -638,10 +692,10 @@ export class LocalVolumeLoader {
     fileSize: number,
     validationToken: string,
     signal: AbortSignal,
-    isGzip: boolean = true
+    isGzip: boolean = true,
   ): Promise<void> {
     const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB per postMessage
-    const MAX_INFLIGHT = 6;             // pipelining window
+    const MAX_INFLIGHT = 6; // pipelining window
     const totalChunks = Math.max(1, Math.ceil(fileSize / CHUNK_SIZE));
     const tStart = performance.now();
 
@@ -652,28 +706,33 @@ export class LocalVolumeLoader {
 
     try {
       for await (const chunk of stream) {
-        if (signal.aborted) { stream.destroy(); return; }
+        if (signal.aborted) {
+          stream.destroy();
+          return;
+        }
 
         // Extract a clean ArrayBuffer (Node Buffer may have byteOffset)
         const ab = chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength);
 
         // Fire without awaiting: FIFO order is preserved by VS Code's
         // message channel, and the webview reorders defensively anyway.
-        inflight.push(webview.postMessage({
-          type: 'chunkedVolume',
-          chunk: ab,
-          index: chunkIndex,
-          total: totalChunks,
-          isGzip,
-          fileName: path.basename(fsPath),
-          fileSize,
-          validationToken,
-          perfExtTiming: {
-            isRemoteSSH: true,
-            path: 'remote-ssh-chunked',
-            compressedBytes: fileSize,
-          },
-        }));
+        inflight.push(
+          webview.postMessage({
+            type: 'chunkedVolume',
+            chunk: ab,
+            index: chunkIndex,
+            total: totalChunks,
+            isGzip,
+            fileName: path.basename(fsPath),
+            fileSize,
+            validationToken,
+            perfExtTiming: {
+              isRemoteSSH: true,
+              path: 'remote-ssh-chunked',
+              compressedBytes: fileSize,
+            },
+          }),
+        );
         chunkIndex++;
 
         // Backpressure: wait for the oldest in-flight message before
@@ -682,12 +741,14 @@ export class LocalVolumeLoader {
           await inflight.shift();
           // Yield to the event loop so other extensions, UI, and command
           // palette can run between batches.
-          await new Promise<void>(r => setImmediate(r));
+          await new Promise<void>((r) => setImmediate(r));
         }
       }
       await Promise.all(inflight);
 
-      this.logPerf(`[remote-ssh-chunked] sent ${chunkIndex}/${totalChunks} chunks for ${path.basename(fsPath)} in ${+(performance.now() - tStart).toFixed(0)}ms`);
+      this.logPerf(
+        `[remote-ssh-chunked] sent ${chunkIndex}/${totalChunks} chunks for ${path.basename(fsPath)} in ${+(performance.now() - tStart).toFixed(0)}ms`,
+      );
     } finally {
       stream.destroy();
     }
@@ -697,7 +758,7 @@ export class LocalVolumeLoader {
     webview: vscode.Webview,
     header: NiiHeader,
     buf: Buffer,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): void {
     try {
       const { nx, ny, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = header;
@@ -712,20 +773,38 @@ export class LocalVolumeLoader {
       const axialSlice = new Float32Array(nx * ny);
       const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
 
-      let min = Infinity, max = -Infinity;
+      let min = Infinity,
+        max = -Infinity;
       for (let i = 0; i < nx * ny; i++) {
         const off = i * bpv;
         let val: number;
         switch (datatype) {
-          case 2: val = sliceBytes[off]; break;
-          case 4: val = view.getInt16(off, le); break;
-          case 8: val = view.getInt32(off, le); break;
-          case 16: val = view.getFloat32(off, le); break;
-          case 64: val = view.getFloat64(off, le); break;
-          case 256: val = (sliceBytes[off] << 24) >> 24; break;
-          case 512: val = view.getUint16(off, le); break;
-          case 768: val = view.getUint32(off, le); break;
-          default: val = 0;
+          case 2:
+            val = sliceBytes[off];
+            break;
+          case 4:
+            val = view.getInt16(off, le);
+            break;
+          case 8:
+            val = view.getInt32(off, le);
+            break;
+          case 16:
+            val = view.getFloat32(off, le);
+            break;
+          case 64:
+            val = view.getFloat64(off, le);
+            break;
+          case 256:
+            val = (sliceBytes[off] << 24) >> 24;
+            break;
+          case 512:
+            val = view.getUint16(off, le);
+            break;
+          case 768:
+            val = view.getUint32(off, le);
+            break;
+          default:
+            val = 0;
         }
         const v = val * slope + inter;
         axialSlice[i] = v;
@@ -738,8 +817,10 @@ export class LocalVolumeLoader {
         webview.postMessage({
           type: 'preview',
           header,
-          globalMin: min, globalMax: max,
-          slope, inter,
+          globalMin: min,
+          globalMax: max,
+          slope,
+          inter,
           sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
           axialSlice,
           coronalSlice: new Float32Array(0),
@@ -759,7 +840,7 @@ export class LocalVolumeLoader {
     webview: vscode.Webview,
     header: NiiHeader,
     rawData: Uint8Array,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): void {
     const { nx, ny, voxOffset, bytesPerVoxel, datatype, scl_slope, scl_inter, littleEndian } = header;
     const sliceBytes = rawData.subarray(voxOffset, voxOffset + nx * ny * bytesPerVoxel);
@@ -770,20 +851,38 @@ export class LocalVolumeLoader {
     const axialSlice = new Float32Array(nx * ny);
     const view = new DataView(sliceBytes.buffer, sliceBytes.byteOffset, sliceBytes.byteLength);
 
-    let min = Infinity, max = -Infinity;
+    let min = Infinity,
+      max = -Infinity;
     for (let i = 0; i < nx * ny; i++) {
       const off = i * bpv;
       let val: number;
       switch (datatype) {
-        case 2: val = sliceBytes[off]; break;
-        case 4: val = view.getInt16(off, le); break;
-        case 8: val = view.getInt32(off, le); break;
-        case 16: val = view.getFloat32(off, le); break;
-        case 64: val = view.getFloat64(off, le); break;
-        case 256: val = (sliceBytes[off] << 24) >> 24; break;
-        case 512: val = view.getUint16(off, le); break;
-        case 768: val = view.getUint32(off, le); break;
-        default: val = 0;
+        case 2:
+          val = sliceBytes[off];
+          break;
+        case 4:
+          val = view.getInt16(off, le);
+          break;
+        case 8:
+          val = view.getInt32(off, le);
+          break;
+        case 16:
+          val = view.getFloat32(off, le);
+          break;
+        case 64:
+          val = view.getFloat64(off, le);
+          break;
+        case 256:
+          val = (sliceBytes[off] << 24) >> 24;
+          break;
+        case 512:
+          val = view.getUint16(off, le);
+          break;
+        case 768:
+          val = view.getUint32(off, le);
+          break;
+        default:
+          val = 0;
       }
       const v = val * slope + inter;
       axialSlice[i] = v;
@@ -796,8 +895,10 @@ export class LocalVolumeLoader {
       webview.postMessage({
         type: 'preview',
         header,
-        globalMin: min, globalMax: max,
-        slope, inter,
+        globalMin: min,
+        globalMax: max,
+        slope,
+        inter,
         sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
         axialSlice,
         coronalSlice: new Float32Array(0),
@@ -813,7 +914,7 @@ export class LocalVolumeLoader {
     webviewId: string,
     loadId: string,
     uri: vscode.Uri,
-    signal: AbortSignal
+    signal: AbortSignal,
   ): void {
     const uriKey = uri.toString();
     const isRemote = uri.scheme !== 'file';
@@ -882,8 +983,10 @@ export class LocalVolumeLoader {
               webview.postMessage({
                 type: 'preview',
                 header: preview.header,
-                globalMin: preview.globalMin, globalMax: preview.globalMax,
-                slope: preview.slope, inter: preview.inter,
+                globalMin: preview.globalMin,
+                globalMax: preview.globalMax,
+                slope: preview.slope,
+                inter: preview.inter,
                 sliceIdx: preview.sliceIdx,
                 axialSlice: preview.slices.axial,
                 coronalSlice: preview.slices.coronal,
@@ -896,8 +999,10 @@ export class LocalVolumeLoader {
             webview.postMessage({
               type: 'preview',
               header: null,
-              globalMin: 0, globalMax: 1,
-              slope: 1, inter: 0,
+              globalMin: 0,
+              globalMax: 1,
+              slope: 1,
+              inter: 0,
               sliceIdx: { axial: 0, coronal: 0, sagittal: 0 },
               axialSlice: new Float32Array(0),
               coronalSlice: new Float32Array(0),
@@ -919,8 +1024,10 @@ export class LocalVolumeLoader {
             webview.postMessage({
               type: 'preview',
               header,
-              globalMin, globalMax,
-              slope, inter,
+              globalMin,
+              globalMax,
+              slope,
+              inter,
               sliceIdx,
               axialSlice: slices.axial,
               coronalSlice: slices.coronal,
@@ -950,7 +1057,8 @@ export class LocalVolumeLoader {
           this.volumeCache.set(uriKey, {
             header,
             voxelData: voxelOnly,
-            min, max,
+            min,
+            max,
             slope: header.scl_slope || 1,
             inter: header.scl_inter || 0,
           });
@@ -973,7 +1081,6 @@ export class LocalVolumeLoader {
               sagittal: Math.floor(header.nx / 2),
             },
           });
-
         } catch (err) {
           if (!isAbortError(err)) {
             console.error('Preview load error:', err);

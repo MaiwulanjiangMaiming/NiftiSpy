@@ -2,15 +2,7 @@ import type { NiiHeader } from './nifti/headerParser';
 
 export interface CachedVolume {
   header: NiiHeader;
-  voxelData:
-    | Int8Array
-    | Uint8Array
-    | Int16Array
-    | Uint16Array
-    | Int32Array
-    | Uint32Array
-    | Float32Array
-    | Float64Array;
+  voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
   min: number;
   max: number;
   slope: number;
@@ -74,10 +66,7 @@ export class VolumeCache {
     return node.entry;
   }
 
-  set(
-    uri: string,
-    volume: Omit<CachedVolume, "timestamp" | "byteSize" | "activeWebviewId">
-  ): void {
+  set(uri: string, volume: Omit<CachedVolume, 'timestamp' | 'byteSize' | 'activeWebviewId'>): void {
     const existing = this.map.get(uri);
     if (existing) {
       this._totalBytes -= existing.entry.byteSize;

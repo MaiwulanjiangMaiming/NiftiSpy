@@ -5,7 +5,8 @@ export function showToast(text: string): void {
   if (!el) {
     el = document.createElement('div');
     el.id = 'ns-toast';
-    el.style.cssText = 'position:fixed;left:50%;bottom:56px;transform:translateX(-50%);' +
+    el.style.cssText =
+      'position:fixed;left:50%;bottom:56px;transform:translateX(-50%);' +
       'background:rgba(40,40,40,0.92);color:#fff;padding:8px 14px;border-radius:6px;' +
       'font-size:12px;z-index:9999;box-shadow:0 2px 8px rgba(0,0,0,0.35);' +
       'pointer-events:none;opacity:0;transition:opacity 0.2s';
@@ -14,7 +15,9 @@ export function showToast(text: string): void {
   el.textContent = text;
   el.style.opacity = '1';
   if (toastTimer) window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => { el.style.opacity = '0'; }, 2400);
+  toastTimer = window.setTimeout(() => {
+    el.style.opacity = '0';
+  }, 2400);
 }
 let tooltipHideTimer: number | null = null;
 
@@ -28,7 +31,10 @@ export function initTooltipSystem() {
     if (!target) return;
     const tip = target.getAttribute('data-tip');
     if (!tip) return;
-    if (tooltipHideTimer) { clearTimeout(tooltipHideTimer); tooltipHideTimer = null; }
+    if (tooltipHideTimer) {
+      clearTimeout(tooltipHideTimer);
+      tooltipHideTimer = null;
+    }
     const pos = target.getAttribute('data-tip-pos') || 'top';
     const rect = target.getBoundingClientRect();
     el.textContent = tip;
@@ -61,4 +67,3 @@ export function initTooltipSystem() {
     }, 80);
   });
 }
-

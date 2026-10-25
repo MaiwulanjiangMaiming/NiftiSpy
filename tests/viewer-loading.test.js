@@ -12,12 +12,15 @@ function image(overrides = {}) {
   };
 }
 
+const codec = sourceRuntime('webview/viewer/previewCodec.ts', ['toFloat32Array', 'sliceHasSignal']);
+
 function viewer(overrides = {}) {
   return sourceRuntime('webview/viewer.ts', [
     'ensureImageData', 'applyImageState', 'showPartialPreviewFromMessage',
-    'setPrimaryImageFromDirectPreview', 'toFloat32Array', 'sliceHasSignal',
+    'setPrimaryImageFromDirectPreview',
     'setCurrentSlice', 'updateProgress', 'displayLoadedImage',
   ], {
+    toFloat32Array: codec.toFloat32Array, sliceHasSignal: codec.sliceHasSignal,
     images: [image()], activeImageIdx: 0, header: null, volumeData: null,
     fullVolumeLoaded: false, fileName: 'remote.nii.gz', fileUrl: 'http://localhost/file/1',
     directUrl: '', dataSlope: 1, dataInter: 0, globalMin: 0, globalMax: 1,

@@ -1,8 +1,18 @@
 import * as path from 'path';
 import * as zlib from 'zlib';
 import {
-  DATATYPE_BYTES, ensureLittleEndian, fileStamp, lpsToRas, makeNiftiHeader, normalize3,
-  readFileBytes, readTextHeader, sformFromDirections, tempFilesFor, toU8, typedToU8,
+  DATATYPE_BYTES,
+  ensureLittleEndian,
+  fileStamp,
+  lpsToRas,
+  makeNiftiHeader,
+  normalize3,
+  readFileBytes,
+  readTextHeader,
+  sformFromDirections,
+  tempFilesFor,
+  toU8,
+  typedToU8,
   writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
@@ -19,7 +29,7 @@ export const nrrdFormat: VolumeFormat = {
     const dimension = parseInt(fields.get('dimension') || '', 10);
     if (!(dimension >= 1 && dimension <= 4)) throw new Error('NRRD dimension must be 1–4');
     const sizes = (fields.get('sizes') || '').trim().split(/\s+/).map(Number);
-    if (sizes.length !== dimension || sizes.some(v => !Number.isSafeInteger(v) || v <= 0)) {
+    if (sizes.length !== dimension || sizes.some((v) => !Number.isSafeInteger(v) || v <= 0)) {
       throw new Error('invalid NRRD sizes');
     }
 
@@ -47,11 +57,20 @@ export const nrrdFormat: VolumeFormat = {
     const geometry = nrrdGeometry(fields, dimension, nrrdSpacing(fields, dimension));
     const spacing = geometry.spacing;
     const sform = geometry.sform;
-    const headerFor = (voxOffset: number, dtype = datatype) => makeNiftiHeader({
-      nx, ny, nz, nt, dx: spacing[0], dy: spacing[1], dz: spacing[2],
-      datatype: dtype, voxOffset, sform,
-      descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
-    });
+    const headerFor = (voxOffset: number, dtype = datatype) =>
+      makeNiftiHeader({
+        nx,
+        ny,
+        nz,
+        nt,
+        dx: spacing[0],
+        dy: spacing[1],
+        dz: spacing[2],
+        datatype: dtype,
+        voxOffset,
+        sform,
+        descrip: `NRRD ${fields.get('type') || ''} (${sizes.join('×')})`,
+      });
 
     if (encoding === 'ascii') {
       const raw = await readSource(dataPath);
@@ -101,9 +120,10 @@ export const nrrdFormat: VolumeFormat = {
     // gzip / big-endian: one full read + inflate/swap, then a temp raw file
     // so /slice stays O(slab) instead of re-inflating the stream per request.
     const source = await readSource(dataPath);
-    const payload = encoding === 'gzip'
-      ? gunzip(source.subarray(baseOffset + dataOffset))
-      : toU8(source.subarray(baseOffset + dataOffset));
+    const payload =
+      encoding === 'gzip'
+        ? gunzip(source.subarray(baseOffset + dataOffset))
+        : toU8(source.subarray(baseOffset + dataOffset));
     if (payload.length < expectedBytes) throw new Error('truncated NRRD voxel data');
     const little = needsSwap
       ? ensureLittleEndian(payload.subarray(0, expectedBytes), bytesPerVoxel)
@@ -131,15 +151,44 @@ function parseFields(text: string): Map<string, string> {
 function nrrdDatatype(type: string): number {
   const t = type.trim().toLowerCase();
   switch (t) {
-    case 'signed char': case 'int8': case 'int8_t': return 256;
-    case 'uchar': case 'unsigned char': case 'uint8': case 'uint8_t': return 2;
-    case 'short': case 'short int': case 'int16': case 'int16_t': return 4;
-    case 'ushort': case 'unsigned short': case 'unsigned short int': case 'uint16': case 'uint16_t': return 512;
-    case 'int': case 'int32': case 'int32_t': return 8;
-    case 'uint': case 'unsigned int': case 'uint32': case 'uint32_t': return 768;
-    case 'float': case 'float32': case 'single': return 16;
-    case 'double': case 'float64': return 64;
-    default: throw new Error(`unsupported NRRD type "${type}"`);
+    case 'signed char':
+    case 'int8':
+    case 'int8_t':
+      return 256;
+    case 'uchar':
+    case 'unsigned char':
+    case 'uint8':
+    case 'uint8_t':
+      return 2;
+    case 'short':
+    case 'short int':
+    case 'int16':
+    case 'int16_t':
+      return 4;
+    case 'ushort':
+    case 'unsigned short':
+    case 'unsigned short int':
+    case 'uint16':
+    case 'uint16_t':
+      return 512;
+    case 'int':
+    case 'int32':
+    case 'int32_t':
+      return 8;
+    case 'uint':
+    case 'unsigned int':
+    case 'uint32':
+    case 'uint32_t':
+      return 768;
+    case 'float':
+    case 'float32':
+    case 'single':
+      return 16;
+    case 'double':
+    case 'float64':
+      return 64;
+    default:
+      throw new Error(`unsupported NRRD type "${type}"`);
   }
 }
 
@@ -179,8 +228,8 @@ function nrrdGeometry(
   const text = fields.get('space directions');
   if (!text) return { spacing };
   const vectors = [...text.matchAll(/\(([^)]*)\)/g)]
-    .map(m => m[1].split(',').map(v => Number(v.trim())))
-    .filter(v => v.length === 3 && v.every(Number.isFinite));
+    .map((m) => m[1].split(',').map((v) => Number(v.trim())))
+    .filter((v) => v.length === 3 && v.every(Number.isFinite));
   if (vectors.length < 3) return { spacing };
 
   const space = (fields.get('space') || '').toLowerCase();
@@ -188,18 +237,18 @@ function nrrdGeometry(
   const ras = space === 'right-anterior-superior' || space === 'ras';
   if (!lps && !ras) return { spacing };
 
-  const norms = vectors.slice(0, 3).map(v => Math.hypot(v[0], v[1], v[2]));
+  const norms = vectors.slice(0, 3).map((v) => Math.hypot(v[0], v[1], v[2]));
   const outSpacing: [number, number, number] = [
     norms[0] > 0 ? norms[0] : spacing[0],
     norms[1] > 0 ? norms[1] : spacing[1],
     norms[2] > 0 ? norms[2] : spacing[2],
   ];
-  const directions = vectors.slice(0, 3).map(v => normalize3(lps ? lpsToRas(v) : v));
+  const directions = vectors.slice(0, 3).map((v) => normalize3(lps ? lpsToRas(v) : v));
 
   let origin: [number, number, number] = [0, 0, 0];
   const originMatch = (fields.get('space origin') || '').match(/\(([^)]*)\)/);
   if (originMatch) {
-    const p = originMatch[1].split(',').map(v => Number(v.trim()));
+    const p = originMatch[1].split(',').map((v) => Number(v.trim()));
     if (p.length === 3 && p.every(Number.isFinite)) {
       origin = lps ? [-p[0], -p[1], p[2]] : [p[0], p[1], p[2]];
     }

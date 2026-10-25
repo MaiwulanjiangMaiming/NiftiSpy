@@ -1,6 +1,4 @@
-import {
-  readFileBytes, readRange, makeNiftiHeader, sformFromDirections, toU8,
-} from './header';
+import { readFileBytes, readRange, makeNiftiHeader, sformFromDirections, toU8 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
 /** MRC / MRC2014 cryo-EM volumes (`.mrc`, `.mrcs`). */
@@ -37,15 +35,32 @@ export const mrcFormat: VolumeFormat = {
     // the three cell axes. Most files use the identity mapping.
     const axisMap = [view.getInt32(64, true), view.getInt32(68, true), view.getInt32(72, true)];
     let sform: number[][] | undefined;
-    if (axisMap.every(v => v >= 1 && v <= 3) && new Set(axisMap).size === 3 &&
-        !(axisMap[0] === 1 && axisMap[1] === 2 && axisMap[2] === 3)) {
-      const directions = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-      axisMap.forEach((axis, column) => { directions[column][axis - 1] = 1; });
+    if (
+      axisMap.every((v) => v >= 1 && v <= 3) &&
+      new Set(axisMap).size === 3 &&
+      !(axisMap[0] === 1 && axisMap[1] === 2 && axisMap[2] === 3)
+    ) {
+      const directions = [
+        [0, 0, 0],
+        [0, 0, 0],
+        [0, 0, 0],
+      ];
+      axisMap.forEach((axis, column) => {
+        directions[column][axis - 1] = 1;
+      });
       sform = sformFromDirections(directions, [dx, dy, dz], [0, 0, 0]);
     }
 
     const header = makeNiftiHeader({
-      nx, ny, nz, dx, dy, dz, datatype, voxOffset, sform,
+      nx,
+      ny,
+      nz,
+      dx,
+      dy,
+      dz,
+      datatype,
+      voxOffset,
+      sform,
       descrip: `MRC mode ${mode} (${nx}×${ny}×${nz})`,
     });
 
@@ -65,10 +80,15 @@ export const mrcFormat: VolumeFormat = {
 
 function mrcDatatype(mode: number): number {
   switch (mode) {
-    case 0: return 256; // signed int8
-    case 1: return 4;   // signed int16
-    case 2: return 16;  // float32
-    case 6: return 512; // unsigned int16
-    default: throw new Error(`unsupported MRC mode ${mode} (complex/float16 not supported)`);
+    case 0:
+      return 256; // signed int8
+    case 1:
+      return 4; // signed int16
+    case 2:
+      return 16; // float32
+    case 6:
+      return 512; // unsigned int16
+    default:
+      throw new Error(`unsupported MRC mode ${mode} (complex/float16 not supported)`);
   }
 }

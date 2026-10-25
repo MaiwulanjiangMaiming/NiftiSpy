@@ -6,14 +6,14 @@ import type { NiiHeader, NiiOrientation } from '../nifti/headerParser';
 
 /** NIfTI datatype → bytes per voxel. */
 export const DATATYPE_BYTES: Record<number, number> = {
-  2: 1,    // uint8
-  4: 2,    // int16
-  8: 4,    // int32
-  16: 4,   // float32
-  64: 8,   // float64
-  256: 1,  // int8
-  512: 2,  // uint16
-  768: 4,  // uint32
+  2: 1, // uint8
+  4: 2, // int16
+  8: 4, // int32
+  16: 4, // float32
+  64: 8, // float64
+  256: 1, // int8
+  512: 2, // uint16
+  768: 4, // uint32
 };
 
 export interface HeaderSpec {
@@ -50,8 +50,15 @@ export function makeNiftiHeader(spec: HeaderSpec): NiiHeader {
   return {
     version: 1,
     ndim: nt > 1 ? 4 : 3,
-    nx, ny, nz, nt, nu: 1,
-    dx, dy, dz, dt: spec.dt || 1,
+    nx,
+    ny,
+    nz,
+    nt,
+    nu: 1,
+    dx,
+    dy,
+    dz,
+    dt: spec.dt || 1,
     datatype: spec.datatype,
     bitpix: bytes * 8,
     voxOffset: spec.voxOffset,
@@ -65,8 +72,12 @@ export function makeNiftiHeader(spec: HeaderSpec): NiiHeader {
     volumeBytes: nx * ny * nz * nt * bytes,
     qform_code: 0,
     sform_code: sform ? 1 : 0,
-    quatern_b: 0, quatern_c: 0, quatern_d: 0,
-    qoffset_x: 0, qoffset_y: 0, qoffset_z: 0,
+    quatern_b: 0,
+    quatern_c: 0,
+    quatern_d: 0,
+    qoffset_x: 0,
+    qoffset_y: 0,
+    qoffset_z: 0,
     srow_x: sform ? sform[0] : [dx, 0, 0, 0],
     srow_y: sform ? sform[1] : [0, dy, 0, 0],
     srow_z: sform ? sform[2] : [0, 0, dz, 0],
@@ -129,8 +140,8 @@ let pruneScheduled = false;
 /** Identity of the source file(s) used as a materialization cache key. */
 export async function fileStamp(paths: string[]): Promise<string | null> {
   try {
-    const stats = await Promise.all(paths.map(p => fs.promises.stat(p)));
-    return stats.map(st => `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino || 0}`).join('|');
+    const stats = await Promise.all(paths.map((p) => fs.promises.stat(p)));
+    return stats.map((st) => `${st.size}:${st.mtimeMs}:${st.ctimeMs}:${st.ino || 0}`).join('|');
   } catch {
     return null;
   }
@@ -226,29 +237,29 @@ async function pruneMaterializedCache(): Promise<void> {
 /** Remove all files produced by writeTempVolume (and their private dirs). */
 export async function removeTempVolumes(files: string[] | undefined): Promise<void> {
   if (!files || files.length === 0) return;
-  await Promise.all(files.map(async file => {
-    try {
-      const dir = path.dirname(file);
-      if (dir === MATERIALIZED_DIR) {
-        // Shared cache: never delete the whole directory.
-        await fs.promises.rm(file, { force: true });
-      } else if (path.basename(dir).startsWith('niftispy-')) {
-        await fs.promises.rm(dir, { recursive: true, force: true });
-      } else {
-        await fs.promises.rm(file, { force: true });
+  await Promise.all(
+    files.map(async (file) => {
+      try {
+        const dir = path.dirname(file);
+        if (dir === MATERIALIZED_DIR) {
+          // Shared cache: never delete the whole directory.
+          await fs.promises.rm(file, { force: true });
+        } else if (path.basename(dir).startsWith('niftispy-')) {
+          await fs.promises.rm(dir, { recursive: true, force: true });
+        } else {
+          await fs.promises.rm(file, { force: true });
+        }
+      } catch {
+        // temp cleanup must never fail the editor
       }
-    } catch {
-      // temp cleanup must never fail the editor
-    }
-  }));
+    }),
+  );
 }
 
 /** In-place byte swap for 2/4/8-byte big-endian data. */
 export function swapBytes(data: Uint8Array, bytes: number): Uint8Array {
   if (bytes < 2) return data;
-  const copy = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength
-    ? data
-    : new Uint8Array(data);
+  const copy = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength ? data : new Uint8Array(data);
   for (let i = 0; i + bytes <= copy.length; i += bytes) {
     for (let a = i, b = i + bytes - 1; a < b; a++, b--) {
       const t = copy[a];
@@ -305,11 +316,7 @@ export function normalize3(v: number[]): number[] {
 }
 
 export function cross3(a: number[], b: number[]): number[] {
-  return [
-    a[1] * b[2] - a[2] * b[1],
-    a[2] * b[0] - a[0] * b[2],
-    a[0] * b[1] - a[1] * b[0],
-  ];
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 }
 
 /** LPS → RAS coordinate/direction conversion. */

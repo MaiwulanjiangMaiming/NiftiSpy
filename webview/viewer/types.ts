@@ -10,10 +10,17 @@ export type TypedArray =
   | Float32Array
   | Float64Array;
 
+export type GpuTypedArray = Exclude<TypedArray, Float64Array>;
+
+/** GPU textures accept every native integer/float type except 64-bit floats. */
+export function toGpuTypedArray(data: TypedArray): GpuTypedArray {
+  return data instanceof Float64Array ? Float32Array.from(data) : data;
+}
+
 export type Axis = 'axial' | 'coronal' | 'sagittal';
 
 export interface VolumeImage {
-  header: NiiHeader;
+  header: NiiHeader | null;
   data: TypedArray | null;
   min: number;
   max: number;

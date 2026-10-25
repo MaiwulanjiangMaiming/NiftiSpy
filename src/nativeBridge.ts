@@ -57,8 +57,20 @@ interface NativeBindings {
   fastDecompressGzipParallelAsync?(path: string): Promise<Uint8Array | Buffer>;
   mmapExtractSliceBatch?(path: string, header: NiiHeader, axis: string, indices: number[]): Float32Array[] | null;
   mmapGetVolumeStats?(path: string, header: NiiHeader): VolumeStats | null;
-  fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array | null;
-  fastApplyWindowLevel?(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Uint8Array | null;
+  fastResampleSlice?(
+    data: Float32Array,
+    srcWidth: number,
+    srcHeight: number,
+    dstWidth: number,
+    dstHeight: number,
+  ): Float32Array | null;
+  fastApplyWindowLevel?(
+    data: Float32Array,
+    windowLevel: number,
+    windowWidth: number,
+    globalMin: number,
+    globalMax: number,
+  ): Uint8Array | null;
 }
 
 interface RawNativeBindings {
@@ -75,8 +87,20 @@ interface RawNativeBindings {
   fastDecompressGzipParallelAsync?(path: string): Promise<Uint8Array | Buffer>;
   mmapExtractSliceBatch?(path: string, headerJson: string, axis: string, indices: number[]): Buffer[] | null;
   mmapGetVolumeStats?(path: string, headerJson: string): RawVolumeStats | null;
-  fastResampleSlice?(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Buffer | null;
-  fastApplyWindowLevel?(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Buffer | null;
+  fastResampleSlice?(
+    data: Float32Array,
+    srcWidth: number,
+    srcHeight: number,
+    dstWidth: number,
+    dstHeight: number,
+  ): Buffer | null;
+  fastApplyWindowLevel?(
+    data: Float32Array,
+    windowLevel: number,
+    windowWidth: number,
+    globalMin: number,
+    globalMax: number,
+  ): Buffer | null;
 }
 
 let cachedBindings: NativeBindings | null | undefined;
@@ -138,7 +162,7 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
     mmapExtractSliceBatch(path: string, header: NiiHeader, axis: string, indices: number[]) {
       const buffers = raw.mmapExtractSliceBatch?.(path, JSON.stringify(header), axis, indices);
       if (!buffers) return null;
-      return buffers.map(b => bufferToFloat32Array(b));
+      return buffers.map((b) => bufferToFloat32Array(b));
     },
     mmapGetVolumeStats(path: string, header: NiiHeader) {
       return raw.mmapGetVolumeStats?.(path, JSON.stringify(header)) ?? null;
@@ -147,7 +171,13 @@ function wrapBindings(raw: RawNativeBindings): NativeBindings {
       const buf = raw.fastResampleSlice?.(data, srcWidth, srcHeight, dstWidth, dstHeight);
       return buf ? bufferToFloat32Array(buf) : null;
     },
-    fastApplyWindowLevel(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number) {
+    fastApplyWindowLevel(
+      data: Float32Array,
+      windowLevel: number,
+      windowWidth: number,
+      globalMin: number,
+      globalMax: number,
+    ) {
       const buf = raw.fastApplyWindowLevel?.(data, windowLevel, windowWidth, globalMin, globalMax);
       if (!buf) return null;
       return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -174,12 +204,10 @@ function loadBindings(): NativeBindings | null {
     //   linux-x64-gnu  →  linux-x64  (in case a binary was built without libc suffix)
     //   win32-x64-msvc →  win32-x64
     //   darwin-arm64   (no libc variant needed)
-    const platformVariants = libc
-      ? [`${platform}-${arch}-${libc}`, `${platform}-${arch}`]
-      : [`${platform}-${arch}`];
+    const platformVariants = libc ? [`${platform}-${arch}-${libc}`, `${platform}-${arch}`] : [`${platform}-${arch}`];
     const candidates = [
-      ...platformVariants.map(v => `../niftispy_native.${v}.node`),
-      '../native/index.node',  // legacy fallback (wasm-pack, no parallel support)
+      ...platformVariants.map((v) => `../niftispy_native.${v}.node`),
+      '../native/index.node', // legacy fallback (wasm-pack, no parallel support)
     ];
     let rawBindings: RawNativeBindings | null = null;
     for (const candidate of candidates) {
@@ -205,82 +233,3 @@ export function getNativeBindings(): NativeBindings | null {
 }
 
 // ── Fallback implementations (pure JS) when native module is unavailable ──
-
-export function fallbackResampleSlice(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array {
-  const out = new Float32Array(dstWidth * dstHeight);
-  const xRatio = srcWidth / dstWidth;
-  const yRatio = srcHeight / dstHeight;
-  for (let y = 0; y < dstHeight; y++) {
-    for (let x = 0; x < dstWidth; x++) {
-      const srcX = x * xRatio;
-      const srcY = y * yRatio;
-      const x0 = Math.min(Math.floor(srcX), srcWidth - 1);
-      const y0 = Math.min(Math.floor(srcY), srcHeight - 1);
-      const x1 = Math.min(x0 + 1, srcWidth - 1);
-      const y1 = Math.min(y0 + 1, srcHeight - 1);
-      const xf = srcX - x0;
-      const yf = srcY - y0;
-      const v00 = data[y0 * srcWidth + x0];
-      const v10 = data[y0 * srcWidth + x1];
-      const v01 = data[y1 * srcWidth + x0];
-      const v11 = data[y1 * srcWidth + x1];
-      const v0 = v00 * (1 - xf) + v10 * xf;
-      const v1 = v01 * (1 - xf) + v11 * xf;
-      out[y * dstWidth + x] = v0 * (1 - yf) + v1 * yf;
-    }
-  }
-  return out;
-}
-
-export function fallbackApplyWindowLevel(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Uint8Array {
-  const n = data.length;
-  const out = new Uint8Array(n);
-  const lo = windowLevel - windowWidth * 0.5;
-  const range = windowWidth || 1;
-  const dataRange = globalMax - globalMin || 1;
-  for (let i = 0; i < n; i++) {
-    const norm = (data[i] - globalMin) / dataRange;
-    const t = Math.max(0, Math.min(1, (norm - lo) / range));
-    out[i] = (t * 255 + 0.5) | 0;
-  }
-  return out;
-}
-
-export function fallbackGetVolumeStats(data: Float32Array): VolumeStats {
-  const n = data.length;
-  let min = Infinity, max = -Infinity;
-  let mean = 0, m2 = 0;
-  let count = 0;
-  const sampleStep = Math.max(1, Math.floor(n / 200000));
-  const samples: number[] = [];
-
-  for (let i = 0; i < n; i += sampleStep) {
-    const v = data[i];
-    if (v < min) min = v;
-    if (v > max) max = v;
-    count++;
-    const delta = v - mean;
-    mean += delta / count;
-    const delta2 = v - mean;
-    m2 += delta * delta2;
-    samples.push(v);
-  }
-
-  if (min === max) max = min + 1;
-  const std = count > 1 ? Math.sqrt(m2 / (count - 1)) : 0;
-
-  const histogram = new Array(256).fill(0) as number[];
-  const range = max - min;
-  for (const v of samples) {
-    const bin = range > 0 ? Math.min(255, Math.floor((v - min) / range * 256)) : 0;
-    histogram[bin]++;
-  }
-
-  samples.sort((a, b) => a - b);
-  const p1 = samples[Math.floor(samples.length * 0.01)] ?? min;
-  const p5 = samples[Math.floor(samples.length * 0.05)] ?? min;
-  const p95 = samples[Math.floor(samples.length * 0.95)] ?? max;
-  const p99 = samples[Math.floor(samples.length * 0.99)] ?? max;
-
-  return { min, max, mean, std, p1, p5, p95, p99, histogram };
-}

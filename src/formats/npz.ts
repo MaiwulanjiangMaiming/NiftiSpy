@@ -17,12 +17,9 @@ export const npzFormat: VolumeFormat = {
 
     // Remote-SSH slice mode: materialize the plain array once, then every
     // /slice request is a random read on the remote disk.
-    const voxelBytes = parsed.header.nx * parsed.header.ny * parsed.header.nz
-      * parsed.header.nt * parsed.header.bytesPerVoxel;
-    const data = parsed.rawData!.subarray(
-      parsed.header.voxOffset,
-      parsed.header.voxOffset + voxelBytes,
-    );
+    const voxelBytes =
+      parsed.header.nx * parsed.header.ny * parsed.header.nz * parsed.header.nt * parsed.header.bytesPerVoxel;
+    const data = parsed.rawData!.subarray(parsed.header.voxOffset, parsed.header.voxOffset + voxelBytes);
     const stamp = await fileStamp([filePath]);
     const dataPath = await writeTempVolume(data, stamp ? `npz:${stamp}` : undefined);
     return {
@@ -39,7 +36,10 @@ function extractNpyMember(archive: Uint8Array, filePath: string): Uint8Array {
   if (eocd < 0) throw new Error('not a valid .npz archive (missing ZIP directory)');
   const entryCount = view.getUint16(eocd + 10, true);
   let offset = view.getUint32(eocd + 16, true);
-  const wanted = path.basename(filePath).replace(/\.npz$/i, '').toLowerCase();
+  const wanted = path
+    .basename(filePath)
+    .replace(/\.npz$/i, '')
+    .toLowerCase();
   const candidates: Array<{ name: string; method: number; compressed: number; raw: number; local: number }> = [];
 
   for (let i = 0; i < entryCount; i++) {
@@ -53,9 +53,10 @@ function extractNpyMember(archive: Uint8Array, filePath: string): Uint8Array {
     const commentLen = view.getUint16(offset + 32, true);
     const local = view.getUint32(offset + 42, true);
     const nameBytes = archive.subarray(offset + 46, offset + 46 + nameLen);
-    const name = (flags & 0x800)
-      ? new TextDecoder().decode(nameBytes)
-      : Buffer.from(nameBytes.buffer, nameBytes.byteOffset, nameBytes.byteLength).toString('latin1');
+    const name =
+      flags & 0x800
+        ? new TextDecoder().decode(nameBytes)
+        : Buffer.from(nameBytes.buffer, nameBytes.byteOffset, nameBytes.byteLength).toString('latin1');
     if (/\.npy$/i.test(name) && !name.startsWith('__MACOSX/')) {
       if (method !== 0 && method !== 8) throw new Error(`unsupported .npz compression method ${method}`);
       if (compressed === 0xffffffff || raw === 0xffffffff) throw new Error('ZIP64 .npz archives are not supported');
@@ -65,7 +66,13 @@ function extractNpyMember(archive: Uint8Array, filePath: string): Uint8Array {
   }
 
   if (candidates.length === 0) throw new Error('no .npy array found inside .npz');
-  const exact = candidates.find(c => path.posix.basename(c.name).replace(/\.npy$/i, '').toLowerCase() === wanted);
+  const exact = candidates.find(
+    (c) =>
+      path.posix
+        .basename(c.name)
+        .replace(/\.npy$/i, '')
+        .toLowerCase() === wanted,
+  );
   const picked = exact || candidates[0];
 
   const localOffset = picked.local;

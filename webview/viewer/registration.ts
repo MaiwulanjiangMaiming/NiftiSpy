@@ -195,7 +195,7 @@ export class RegistrationController {
       // contribute their first timepoint). Shipping decoded values instead of
       // raw bytes keeps endianness handling identical to what is on screen;
       // slope/inter are forwarded so the optimizer sees the shown intensities.
-      const vox3d = h.nx * h.ny * h.nz;
+      const vox3d = h!.nx * h!.ny * h!.nz;
       const floats = new Float32Array(vox3d);
       const lim = Math.min(vox3d, src.length);
       for (let i = 0; i < lim; i++) floats[i] = src[i];
@@ -223,10 +223,10 @@ export class RegistrationController {
           littleEndian: true,
           slope: srcImg.slope || 1,
           inter: srcImg.inter || 0,
-          dims: [h.nx, h.ny, h.nz],
-          srow_x: h.srow_x,
-          srow_y: h.srow_y,
-          srow_z: h.srow_z,
+          dims: [h!.nx, h!.ny, h!.nz],
+          srow_x: h!.srow_x,
+          srow_y: h!.srow_y,
+          srow_z: h!.srow_z,
         },
         template: new Uint8Array(m.bytes ?? 0),
       };
@@ -236,16 +236,16 @@ export class RegistrationController {
         const refImg = this.host.getImages()[this.regRefIdx];
         if (!refImg?.data) throw new Error('Reference volume missing');
         const rh = refImg.header;
-        const rn = rh.nx * rh.ny * rh.nz;
+        const rn = rh!.nx * rh!.ny * rh!.nz;
         const rFloats = new Float32Array(rn);
         const rlim = Math.min(rn, refImg.data.length);
         for (let i = 0; i < rlim; i++) rFloats[i] = refImg.data![i];
         msg.templateVolume = {
           data: rFloats.buffer,
-          dims: [rh.nx, rh.ny, rh.nz],
-          srow_x: rh.srow_x,
-          srow_y: rh.srow_y,
-          srow_z: rh.srow_z,
+          dims: [rh!.nx, rh!.ny, rh!.nz],
+          srow_x: rh!.srow_x,
+          srow_y: rh!.srow_y,
+          srow_z: rh!.srow_z,
         };
         this.showRegStatus('busy', `Aligning ${srcImg.name} → ${refImg.name}…`, 0);
       }

@@ -41,23 +41,36 @@ export function encodePreviewBinary(
   const buf = Buffer.alloc(totalLen);
   let offset = 0;
 
-  buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-  headerBuf.copy(buf, offset); offset += headerBuf.length;
+  buf.writeUInt32LE(headerBuf.length, offset);
+  offset += 4;
+  headerBuf.copy(buf, offset);
+  offset += headerBuf.length;
 
-  buf.writeFloatLE(min, offset); offset += 4;
-  buf.writeFloatLE(max, offset); offset += 4;
-  buf.writeUInt32LE(sliceIdxVal.axial, offset); offset += 4;
-  buf.writeUInt32LE(sliceIdxVal.coronal, offset); offset += 4;
-  buf.writeUInt32LE(sliceIdxVal.sagittal, offset); offset += 4;
+  buf.writeFloatLE(min, offset);
+  offset += 4;
+  buf.writeFloatLE(max, offset);
+  offset += 4;
+  buf.writeUInt32LE(sliceIdxVal.axial, offset);
+  offset += 4;
+  buf.writeUInt32LE(sliceIdxVal.coronal, offset);
+  offset += 4;
+  buf.writeUInt32LE(sliceIdxVal.sagittal, offset);
+  offset += 4;
 
-  buf.writeUInt32LE(axialBuf.length, offset); offset += 4;
-  axialBuf.copy(buf, offset); offset += axialBuf.length;
+  buf.writeUInt32LE(axialBuf.length, offset);
+  offset += 4;
+  axialBuf.copy(buf, offset);
+  offset += axialBuf.length;
 
-  buf.writeUInt32LE(coronalBuf.length, offset); offset += 4;
-  coronalBuf.copy(buf, offset); offset += coronalBuf.length;
+  buf.writeUInt32LE(coronalBuf.length, offset);
+  offset += 4;
+  coronalBuf.copy(buf, offset);
+  offset += coronalBuf.length;
 
-  buf.writeUInt32LE(sagittalBuf.length, offset); offset += 4;
-  sagittalBuf.copy(buf, offset); offset += sagittalBuf.length;
+  buf.writeUInt32LE(sagittalBuf.length, offset);
+  offset += 4;
+  sagittalBuf.copy(buf, offset);
+  offset += sagittalBuf.length;
 
   return buf;
 }

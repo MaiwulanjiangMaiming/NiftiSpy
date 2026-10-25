@@ -9,7 +9,9 @@ export function voxelToWorld(h: NiiHeader, vx: number, vy: number, vz: number): 
   }
   if (h.qform_code !== 0) {
     const a = Math.sqrt(1.0 + h.quatern_b * h.quatern_b + h.quatern_c * h.quatern_c + h.quatern_d * h.quatern_d);
-    const b = h.quatern_b / a, c = h.quatern_c / a, d = h.quatern_d / a;
+    const b = h.quatern_b / a,
+      c = h.quatern_c / a,
+      d = h.quatern_d / a;
     const R = [
       [a * a + b * b - c * c - d * d, 2 * b * c - 2 * a * d, 2 * b * d + 2 * a * c],
       [2 * b * c + 2 * a * d, a * a + c * c - b * b - d * d, 2 * c * d - 2 * a * b],
@@ -31,39 +33,66 @@ export function worldToVoxel(h: NiiHeader, wx: number, wy: number, wz: number): 
       [h.srow_z[0], h.srow_z[1], h.srow_z[2]],
     ];
     const off = [wx - h.srow_x[3], wy - h.srow_y[3], wz - h.srow_z[3]];
-    const det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-              - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-              + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    const det =
+      m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+      m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+      m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
     if (Math.abs(det) > 1e-10) {
       const invDet = 1 / det;
-      const vx = invDet * ((m[1][1] * m[2][2] - m[1][2] * m[2][1]) * off[0] - (m[0][1] * m[2][2] - m[0][2] * m[2][1]) * off[1] + (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * off[2]);
-      const vy = invDet * (-(m[1][0] * m[2][2] - m[1][2] * m[2][0]) * off[0] + (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * off[1] - (m[0][0] * m[1][2] - m[0][2] * m[1][0]) * off[2]);
-      const vz = invDet * ((m[1][0] * m[2][1] - m[1][1] * m[2][0]) * off[0] - (m[0][0] * m[2][1] - m[0][1] * m[2][0]) * off[1] + (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * off[2]);
+      const vx =
+        invDet *
+        ((m[1][1] * m[2][2] - m[1][2] * m[2][1]) * off[0] -
+          (m[0][1] * m[2][2] - m[0][2] * m[2][1]) * off[1] +
+          (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * off[2]);
+      const vy =
+        invDet *
+        (-(m[1][0] * m[2][2] - m[1][2] * m[2][0]) * off[0] +
+          (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * off[1] -
+          (m[0][0] * m[1][2] - m[0][2] * m[1][0]) * off[2]);
+      const vz =
+        invDet *
+        ((m[1][0] * m[2][1] - m[1][1] * m[2][0]) * off[0] -
+          (m[0][0] * m[2][1] - m[0][1] * m[2][0]) * off[1] +
+          (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * off[2]);
       return [vx, vy, vz];
     }
   }
   if (h.qform_code !== 0) {
     const a = Math.sqrt(1.0 + h.quatern_b * h.quatern_b + h.quatern_c * h.quatern_c + h.quatern_d * h.quatern_d);
-    const b = h.quatern_b / a, c = h.quatern_c / a, d = h.quatern_d / a;
+    const b = h.quatern_b / a,
+      c = h.quatern_c / a,
+      d = h.quatern_d / a;
     const R = [
       [a * a + b * b - c * c - d * d, 2 * b * c - 2 * a * d, 2 * b * d + 2 * a * c],
       [2 * b * c + 2 * a * d, a * a + c * c - b * b - d * d, 2 * c * d - 2 * a * b],
       [2 * b * d - 2 * a * c, 2 * c * d + 2 * a * b, a * a + d * d - b * b - c * c],
     ];
-    const qx = (wx - h.qoffset_x);
-    const qy = (wy - h.qoffset_y);
-    const qz = (wz - h.qoffset_z);
-    const det = R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1])
-              - R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0])
-              + R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
+    const qx = wx - h.qoffset_x;
+    const qy = wy - h.qoffset_y;
+    const qz = wz - h.qoffset_z;
+    const det =
+      R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) -
+      R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+      R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0]);
     if (Math.abs(det) > 1e-10) {
       const invDet = 1 / det;
-      const rx = invDet * ((R[1][1] * R[2][2] - R[1][2] * R[2][1]) * qx - (R[0][1] * R[2][2] - R[0][2] * R[2][1]) * qy + (R[0][1] * R[1][2] - R[0][2] * R[1][1]) * qz);
-      const ry = invDet * (-(R[1][0] * R[2][2] - R[1][2] * R[2][0]) * qx + (R[0][0] * R[2][2] - R[0][2] * R[2][0]) * qy - (R[0][0] * R[1][2] - R[0][2] * R[1][0]) * qz);
-      const rz = invDet * ((R[1][0] * R[2][1] - R[1][1] * R[2][0]) * qx - (R[0][0] * R[2][1] - R[0][1] * R[2][0]) * qy + (R[0][0] * R[1][1] - R[0][1] * R[1][0]) * qz);
+      const rx =
+        invDet *
+        ((R[1][1] * R[2][2] - R[1][2] * R[2][1]) * qx -
+          (R[0][1] * R[2][2] - R[0][2] * R[2][1]) * qy +
+          (R[0][1] * R[1][2] - R[0][2] * R[1][1]) * qz);
+      const ry =
+        invDet *
+        (-(R[1][0] * R[2][2] - R[1][2] * R[2][0]) * qx +
+          (R[0][0] * R[2][2] - R[0][2] * R[2][0]) * qy -
+          (R[0][0] * R[1][2] - R[0][2] * R[1][0]) * qz);
+      const rz =
+        invDet *
+        ((R[1][0] * R[2][1] - R[1][1] * R[2][0]) * qx -
+          (R[0][0] * R[2][1] - R[0][1] * R[2][0]) * qy +
+          (R[0][0] * R[1][1] - R[0][1] * R[1][0]) * qz);
       return [rx / h.dx, ry / h.dy, rz / h.dz];
     }
   }
   return [wx / h.dx, wy / h.dy, wz / h.dz];
 }
-

@@ -206,7 +206,7 @@ export class GzipIndex {
 
         loops++;
         if ((loops & 15) === 0) {
-          await new Promise<void>(resolve => setImmediate(resolve));
+          await new Promise<void>((resolve) => setImmediate(resolve));
         }
       }
     } finally {
@@ -225,10 +225,17 @@ export class GzipIndex {
     if (start >= end) return new Uint8Array(0);
     const result = Buffer.alloc(end - start);
     let written = 0;
-    await GzipIndex.scanRange(fsPath, index, start, end, (abs, chunk) => {
-      Buffer.from(chunk).copy(result, abs - start);
-      written = Math.max(written, abs - start + chunk.length);
-    }, signal);
+    await GzipIndex.scanRange(
+      fsPath,
+      index,
+      start,
+      end,
+      (abs, chunk) => {
+        Buffer.from(chunk).copy(result, abs - start);
+        written = Math.max(written, abs - start + chunk.length);
+      },
+      signal,
+    );
     return new Uint8Array(result.buffer, result.byteOffset, written);
   }
 
@@ -240,19 +247,27 @@ export class GzipIndex {
     }
     const buf = Buffer.alloc(total);
     let off = 0;
-    buf.writeUInt32LE(this.gzipHeaderLength, off); off += 4;
-    buf.writeUInt32LE(this.entries.length, off); off += 4;
+    buf.writeUInt32LE(this.gzipHeaderLength, off);
+    off += 4;
+    buf.writeUInt32LE(this.entries.length, off);
+    off += 4;
     for (const entry of this.entries) {
-      buf.writeBigUInt64LE(BigInt(entry.compressedOffset), off); off += 8;
-      buf.writeUInt8(entry.bits & 7, off); off += 1;
-      buf.writeBigUInt64LE(BigInt(entry.decompressedOffset), off); off += 8;
+      buf.writeBigUInt64LE(BigInt(entry.compressedOffset), off);
+      off += 8;
+      buf.writeUInt8(entry.bits & 7, off);
+      off += 1;
+      buf.writeBigUInt64LE(BigInt(entry.decompressedOffset), off);
+      off += 8;
       if (entry.window) {
-        buf.writeUInt8(1, off); off += 1;
-        buf.writeUInt32LE(entry.window.length, off); off += 4;
+        buf.writeUInt8(1, off);
+        off += 1;
+        buf.writeUInt32LE(entry.window.length, off);
+        off += 4;
         Buffer.from(entry.window.buffer, entry.window.byteOffset, entry.window.byteLength).copy(buf, off);
         off += entry.window.length;
       } else {
-        buf.writeUInt8(0, off); off += 1;
+        buf.writeUInt8(0, off);
+        off += 1;
       }
     }
     return buf.subarray(0, off);
@@ -262,16 +277,23 @@ export class GzipIndex {
     if (data.length < 8) throw new Error('Truncated gzip index');
     let off = 0;
     const index = new GzipIndex();
-    index.gzipHeaderLength = data.readUInt32LE(off); off += 4;
-    const count = data.readUInt32LE(off); off += 4;
+    index.gzipHeaderLength = data.readUInt32LE(off);
+    off += 4;
+    const count = data.readUInt32LE(off);
+    off += 4;
     for (let i = 0; i < count; i++) {
-      const compressedOffset = Number(data.readBigUInt64LE(off)); off += 8;
-      const bits = data.readUInt8(off); off += 1;
-      const decompressedOffset = Number(data.readBigUInt64LE(off)); off += 8;
-      const hasWindow = data.readUInt8(off); off += 1;
+      const compressedOffset = Number(data.readBigUInt64LE(off));
+      off += 8;
+      const bits = data.readUInt8(off);
+      off += 1;
+      const decompressedOffset = Number(data.readBigUInt64LE(off));
+      off += 8;
+      const hasWindow = data.readUInt8(off);
+      off += 1;
       let window: Uint8Array | null = null;
       if (hasWindow) {
-        const windowLength = data.readUInt32LE(off); off += 4;
+        const windowLength = data.readUInt32LE(off);
+        off += 4;
         window = Uint8Array.from(data.subarray(off, off + windowLength));
         off += windowLength;
       }
@@ -358,7 +380,7 @@ async function inflateAndIndex(
 
       loops++;
       if ((loops & 15) === 0) {
-        await new Promise<void>(resolve => setImmediate(resolve));
+        await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
   } finally {
@@ -369,11 +391,6 @@ async function inflateAndIndex(
   return index;
 }
 
-export interface IndexCacheMeta {
-  fileSize: number;
-  mtimeMs: number;
-}
-
 export function getIndexCachePath(fsPath: string): string {
   return fsPath + '.niftispy-index';
 }
@@ -381,10 +398,7 @@ export function getIndexCachePath(fsPath: string): string {
 export async function loadCachedIndex(fsPath: string): Promise<GzipIndex | null> {
   const cachePath = getIndexCachePath(fsPath);
   try {
-    const [fileStat, cacheStat] = await Promise.all([
-      fs.promises.stat(fsPath),
-      fs.promises.stat(cachePath),
-    ]);
+    const [fileStat, cacheStat] = await Promise.all([fs.promises.stat(fsPath), fs.promises.stat(cachePath)]);
     if (cacheStat.mtimeMs < fileStat.mtimeMs) return null;
     const data = await fs.promises.readFile(cachePath);
     if (data.length < 20) return null;
@@ -392,10 +406,13 @@ export async function loadCachedIndex(fsPath: string): Promise<GzipIndex | null>
 
     let off = 0;
     off += 4; // magic, already checked
-    const version = data.readUInt16LE(off); off += 2;
+    const version = data.readUInt16LE(off);
+    off += 2;
     if (version !== INDEX_VERSION) return null;
-    const cachedFileSize = Number(data.readBigUInt64LE(off)); off += 8;
-    const cachedMtimeMs = data.readDoubleLE(off); off += 8;
+    const cachedFileSize = Number(data.readBigUInt64LE(off));
+    off += 8;
+    const cachedMtimeMs = data.readDoubleLE(off);
+    off += 8;
     if (cachedFileSize !== fileStat.size || Math.abs(cachedMtimeMs - fileStat.mtimeMs) > 1) {
       return null;
     }
@@ -412,25 +429,17 @@ export async function saveCachedIndex(fsPath: string, index: GzipIndex): Promise
     const indexData = index.serializeIndex();
     const buf = Buffer.alloc(4 + 2 + 8 + 8 + indexData.length);
     let off = 0;
-    INDEX_MAGIC.copy(buf, off); off += 4;
-    buf.writeUInt16LE(INDEX_VERSION, off); off += 2;
-    buf.writeBigUInt64LE(BigInt(stat.size), off); off += 8;
-    buf.writeDoubleLE(stat.mtimeMs, off); off += 8;
+    INDEX_MAGIC.copy(buf, off);
+    off += 4;
+    buf.writeUInt16LE(INDEX_VERSION, off);
+    off += 2;
+    buf.writeBigUInt64LE(BigInt(stat.size), off);
+    off += 8;
+    buf.writeDoubleLE(stat.mtimeMs, off);
+    off += 8;
     indexData.copy(buf, off);
     await fs.promises.writeFile(cachePath, buf);
   } catch {
     // Sidecar write is best-effort; a missing cache just rebuilds next time.
   }
-}
-
-export function extractRangeFromGzipIndex(
-  fsPath: string,
-  index: GzipIndexEntry[],
-  decompStart: number,
-  decompEnd: number,
-  signal?: AbortSignal,
-): Promise<Uint8Array> {
-  const gi = new GzipIndex();
-  gi.entries = index;
-  return GzipIndex.readRange(fsPath, gi, decompStart, decompEnd, signal);
 }

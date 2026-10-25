@@ -294,7 +294,12 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     return this.ready;
   }
 
-  uploadVolume3D(data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array, nx: number, ny: number, nz: number): boolean {
+  uploadVolume3D(
+    data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array,
+    nx: number,
+    ny: number,
+    nz: number,
+  ): boolean {
     if (!this.device || !this.pipeline) return false;
 
     // writeTexture requires bytesPerRow to be a multiple of 256. We upload
@@ -329,13 +334,13 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       { texture },
       (f32.buffer instanceof ArrayBuffer ? f32 : new Float32Array(f32)) as Float32Array<ArrayBuffer>,
       { bytesPerRow, rowsPerImage: ny },
-      { width: nx, height: ny, depthOrArrayLayers: nz }
+      { width: nx, height: ny, depthOrArrayLayers: nz },
     );
 
     const lutView = this.lutTexture ? this.lutTexture.createView() : this.createDefaultLut();
 
     const bindGroup = this.device.createBindGroup({
-      layout: (this.pipeline.getBindGroupLayout(0)),
+      layout: this.pipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: this.sampler! },
         { binding: 1, resource: texture.createView({ dimension: '3d' }) },
@@ -362,7 +367,12 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
-    this.device.queue.writeTexture({ texture: tex }, lutData as Uint8Array<ArrayBuffer>, { bytesPerRow: 256 * 4 }, { width: 256, height: 1 });
+    this.device.queue.writeTexture(
+      { texture: tex },
+      lutData as Uint8Array<ArrayBuffer>,
+      { bytesPerRow: 256 * 4 },
+      { width: 256, height: 1 },
+    );
     this.lutTexture = tex;
     return tex.createView();
   }
@@ -375,14 +385,21 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUBufferUsage.COPY_DST,
     });
-    this.device.queue.writeTexture({ texture: tex }, lutData as Uint8Array<ArrayBuffer>, { bytesPerRow: 256 * 4 }, { width: 256, height: 1 });
+    this.device.queue.writeTexture(
+      { texture: tex },
+      lutData as Uint8Array<ArrayBuffer>,
+      { bytesPerRow: 256 * 4 },
+      { width: 256, height: 1 },
+    );
     this.lutTexture = tex;
   }
 
   renderSlice3D(
     axis: number,
     sliceIndex: number,
-    nx: number, ny: number, nz: number,
+    nx: number,
+    ny: number,
+    nz: number,
     windowLevel: number,
     windowWidth: number,
     colormap: string,
@@ -391,9 +408,18 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     slope: number = 1,
     inter: number = 0,
     dataMin: number = 0,
-    dataRange: number = 1
+    dataRange: number = 1,
   ): boolean {
-    if (!this.device || !this.context || !this.pipeline || !this.volumeState || !this.sliceUniformBuffer || !this.gpuCanvas || !this.canvas) return false;
+    if (
+      !this.device ||
+      !this.context ||
+      !this.pipeline ||
+      !this.volumeState ||
+      !this.sliceUniformBuffer ||
+      !this.gpuCanvas ||
+      !this.canvas
+    )
+      return false;
 
     // Render into the private GPU canvas (sized to the display canvas, whose
     // pixel size is managed by paintSlice/paintSlice3D); the frame is blitted
@@ -430,12 +456,14 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
     const textureView = this.context.getCurrentTexture().createView();
 
     const renderPass = commandEncoder.beginRenderPass({
-      colorAttachments: [{
-        view: textureView,
-        clearValue: { r: 0, g: 0, b: 0, a: 1 },
-        loadOp: 'clear',
-        storeOp: 'store',
-      }],
+      colorAttachments: [
+        {
+          view: textureView,
+          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          loadOp: 'clear',
+          storeOp: 'store',
+        },
+      ],
     });
 
     renderPass.setPipeline(this.pipeline);
@@ -490,7 +518,12 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUBufferUsage.COPY_DST,
     });
-    this.device.queue.writeTexture({ texture: tex }, lutData as Uint8Array<ArrayBuffer>, { bytesPerRow: 256 * 4 }, { width: 256, height: 1 });
+    this.device.queue.writeTexture(
+      { texture: tex },
+      lutData as Uint8Array<ArrayBuffer>,
+      { bytesPerRow: 256 * 4 },
+      { width: 256, height: 1 },
+    );
     this.lutTexture = tex;
     // Rebuild bind group with new LUT
     if (this.volumeState && this.pipeline) {
@@ -507,7 +540,15 @@ fn computeMain(@builtin(global_invocation_id) gid: vec3u) {
   }
 
   async computeHistogram(windowLevel: number, windowWidth: number): Promise<Uint32Array | null> {
-    if (!this.device || !this.histogramPipeline || !this.volumeState || !this.histogramBuffer || !this.histogramReadBuffer || !this.histUniformBuffer) return null;
+    if (
+      !this.device ||
+      !this.histogramPipeline ||
+      !this.volumeState ||
+      !this.histogramBuffer ||
+      !this.histogramReadBuffer ||
+      !this.histUniformBuffer
+    )
+      return null;
 
     const uniformData = new ArrayBuffer(32);
     const view = new DataView(uniformData);

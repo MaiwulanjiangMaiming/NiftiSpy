@@ -115,30 +115,45 @@ export interface CacheStats {
 }
 
 const stats: CacheStats = {
-  l1Hits: 0, l1Misses: 0,
-  l2Hits: 0, l2Misses: 0,
-  l3Hits: 0, l3Misses: 0,
+  l1Hits: 0,
+  l1Misses: 0,
+  l2Hits: 0,
+  l2Misses: 0,
+  l3Hits: 0,
+  l3Misses: 0,
   l4Fetches: 0,
-  l3Size: 0, l3Entries: 0,
+  l3Size: 0,
+  l3Entries: 0,
 };
 
 export function recordCacheHit(level: 'l1' | 'l2' | 'l3'): void {
   switch (level) {
-    case 'l1': stats.l1Hits++; break;
-    case 'l2': stats.l2Hits++; break;
-    case 'l3': stats.l3Hits++; break;
+    case 'l1':
+      stats.l1Hits++;
+      break;
+    case 'l2':
+      stats.l2Hits++;
+      break;
+    case 'l3':
+      stats.l3Hits++;
+      break;
   }
 }
 
 export function recordCacheMiss(level: 'l1' | 'l2' | 'l3'): void {
   switch (level) {
-    case 'l1': stats.l1Misses++; break;
-    case 'l2': stats.l2Misses++; break;
-    case 'l3': stats.l3Misses++; break;
+    case 'l1':
+      stats.l1Misses++;
+      break;
+    case 'l2':
+      stats.l2Misses++;
+      break;
+    case 'l3':
+      stats.l3Misses++;
+      break;
   }
 }
 
 export function recordL4Fetch(): void {
   stats.l4Fetches++;
 }
-

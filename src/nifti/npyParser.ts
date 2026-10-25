@@ -14,7 +14,7 @@ import { makeNiftiHeader } from '../formats/header';
 const NPY_MAGIC = [0x93, 0x4e, 0x55, 0x4d, 0x50, 0x59];
 
 const DTYPE_MAP: Record<string, { datatype: number; bytes: number }> = {
-  b1: { datatype: 2, bytes: 1 },   // bool → uint8
+  b1: { datatype: 2, bytes: 1 }, // bool → uint8
   u1: { datatype: 2, bytes: 1 },
   i1: { datatype: 256, bytes: 1 },
   u2: { datatype: 512, bytes: 2 },
@@ -46,10 +46,6 @@ export interface NpyLayout {
   needsTransform: boolean;
 }
 
-export function isNpyPath(p: string): boolean {
-  return /\.npy$/i.test(p);
-}
-
 /** Parse only the header; `totalSize` lets a partial remote read pass. */
 export function parseNpyLayout(source: Uint8Array, totalSize = source.length): NpyLayout {
   if (source.length < 12) throw new Error('not a NumPy .npy file');
@@ -58,9 +54,8 @@ export function parseNpyLayout(source: Uint8Array, totalSize = source.length): N
   }
   const major = source[6];
   const headerStart = major === 1 ? 10 : 12;
-  const headerLen = major === 1
-    ? source[8] | (source[9] << 8)
-    : source[8] | (source[9] << 8) | (source[10] << 16) | (source[11] << 24);
+  const headerLen =
+    major === 1 ? source[8] | (source[9] << 8) : source[8] | (source[9] << 8) | (source[10] << 16) | (source[11] << 24);
   if (major !== 1 && major !== 2 && major !== 3) {
     throw new Error(`unsupported .npy version ${major}`);
   }
@@ -72,9 +67,13 @@ export function parseNpyLayout(source: Uint8Array, totalSize = source.length): N
   const shapeText = /'shape'\s*:\s*\(([^)]*)\)/.exec(text)?.[1];
   if (!descr || shapeText === undefined) throw new Error('unreadable .npy header');
 
-  const shape = shapeText.split(',').map(v => v.trim()).filter(Boolean).map(Number);
+  const shape = shapeText
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+    .map(Number);
   if (shape.length < 1 || shape.length > 4) throw new Error('only 1D–4D arrays are supported');
-  if (shape.some(v => !Number.isSafeInteger(v) || v < 0)) throw new Error('invalid .npy shape');
+  if (shape.some((v) => !Number.isSafeInteger(v) || v < 0)) throw new Error('invalid .npy shape');
 
   const dtype = /^([<>|=])([biuf])(\d+)$/.exec(descr);
   if (!dtype) throw new Error(`unsupported .npy dtype ${descr}`);
@@ -91,7 +90,15 @@ export function parseNpyLayout(source: Uint8Array, totalSize = source.length): N
   if (voxelCount * bytes > totalSize - voxOffset) throw new Error('truncated .npy data');
 
   return {
-    datatype, bytes, shape, fortran, descr, order, kind, voxOffset, voxelCount,
+    datatype,
+    bytes,
+    shape,
+    fortran,
+    descr,
+    order,
+    kind,
+    voxOffset,
+    voxelCount,
     needsTransform: needsWidening || (order === '>' && bytes > 1),
   };
 }
@@ -103,11 +110,14 @@ export function npyHeaderFromLayout(layout: NpyLayout, voxOffset: number): NiiHe
   const ny = axes[1] || 1;
   const nz = axes[2] || 1;
   const nt = axes[3] || 1;
-  const datatype = layout.datatype === 0
-    ? (layout.kind === 'f' && layout.bytes === 2 ? 16 : 64)
-    : layout.datatype;
+  const datatype = layout.datatype === 0 ? (layout.kind === 'f' && layout.bytes === 2 ? 16 : 64) : layout.datatype;
   return makeNiftiHeader({
-    nx, ny, nz, nt, datatype, voxOffset,
+    nx,
+    ny,
+    nz,
+    nt,
+    datatype,
+    voxOffset,
     descrip: `NumPy ${layout.descr} (${layout.shape.join('×')})${layout.fortran ? ' Fortran' : ''}`,
   });
 }
@@ -115,9 +125,8 @@ export function npyHeaderFromLayout(layout: NpyLayout, voxOffset: number): NiiHe
 export function parseNpyVolume(source: Uint8Array): NpyVolume {
   // Keep the backing buffer exactly the file size so the webview can create
   // zero-copy typed-array views from (rawData.buffer, voxOffset).
-  const file = source.byteOffset === 0 && source.byteLength === source.buffer.byteLength
-    ? source
-    : new Uint8Array(source);
+  const file =
+    source.byteOffset === 0 && source.byteLength === source.buffer.byteLength ? source : new Uint8Array(source);
   const layout = parseNpyLayout(file);
   const { voxOffset, bytes } = layout;
 

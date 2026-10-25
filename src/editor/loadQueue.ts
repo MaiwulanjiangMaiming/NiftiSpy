@@ -20,7 +20,8 @@ export class LoadQueue {
 
   enqueue(job: LoadJob): void {
     // Binary insert — O(log n) instead of O(n log n) sort
-    let lo = 0, hi = this.queue.length;
+    let lo = 0,
+      hi = this.queue.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       if (this.queue[mid].priority > job.priority) lo = mid + 1;
@@ -31,12 +32,13 @@ export class LoadQueue {
   }
 
   promote(webviewId: string): void {
-    const idx = this.queue.findIndex(j => j.webviewId === webviewId);
+    const idx = this.queue.findIndex((j) => j.webviewId === webviewId);
     if (idx >= 0) {
       this.queue[idx].priority = 100;
       // Re-insert in sorted position
       const job = this.queue.splice(idx, 1)[0];
-      let lo = 0, hi = this.queue.length;
+      let lo = 0,
+        hi = this.queue.length;
       while (lo < hi) {
         const mid = (lo + hi) >>> 1;
         if (this.queue[mid].priority > job.priority) lo = mid + 1;
@@ -61,7 +63,7 @@ export class LoadQueue {
       const localOk = this.activeLocal < this.maxLocal;
       if (!remoteOk && !localOk) break;
 
-      const idx = this.queue.findIndex(j => {
+      const idx = this.queue.findIndex((j) => {
         if (j.abortController.signal.aborted) return false;
         return j.isRemote ? remoteOk : localOk;
       });

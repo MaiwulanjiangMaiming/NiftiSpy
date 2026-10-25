@@ -1,15 +1,23 @@
 import * as fs from 'fs';
 import {
-  cross3, ensureLittleEndian, fileStamp, lpsToRas, makeNiftiHeader, normalize3,
-  readFileBytes, readRange, sformFromDirections, tempFilesFor, toU8, writeTempVolume,
+  cross3,
+  ensureLittleEndian,
+  fileStamp,
+  lpsToRas,
+  makeNiftiHeader,
+  normalize3,
+  readFileBytes,
+  readRange,
+  sformFromDirections,
+  tempFilesFor,
+  toU8,
+  writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
 /** Single-file DICOM (uncompressed). Multi-frame files become 3D volumes. */
 
-const LONG_VRS = new Set([
-  'OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'SQ', 'SV', 'UC', 'UN', 'UR', 'UT', 'UV',
-]);
+const LONG_VRS = new Set(['OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'SQ', 'SV', 'UC', 'UN', 'UR', 'UT', 'UV']);
 
 const TAG = {
   transferSyntax: 0x00020010,
@@ -33,10 +41,20 @@ const TAG = {
 };
 
 const NEEDED = new Set<number>([
-  TAG.rows, TAG.columns, TAG.samplesPerPixel, TAG.photometric, TAG.numberOfFrames,
-  TAG.bitsAllocated, TAG.pixelRepresentation, TAG.pixelSpacing, TAG.rescaleIntercept,
-  TAG.rescaleSlope, TAG.sliceThickness, TAG.spacingBetweenSlices,
-  TAG.imagePosition, TAG.imageOrientation,
+  TAG.rows,
+  TAG.columns,
+  TAG.samplesPerPixel,
+  TAG.photometric,
+  TAG.numberOfFrames,
+  TAG.bitsAllocated,
+  TAG.pixelRepresentation,
+  TAG.pixelSpacing,
+  TAG.rescaleIntercept,
+  TAG.rescaleSlope,
+  TAG.sliceThickness,
+  TAG.spacingBetweenSlices,
+  TAG.imagePosition,
+  TAG.imageOrientation,
 ]);
 
 interface Syntax {
@@ -105,9 +123,8 @@ export const dicomFormat: VolumeFormat = {
       else if (bits === 32) datatype = signed ? 8 : 768;
       else throw new Error(`unsupported DICOM BitsAllocated ${bits}`);
     }
-    const bpv = datatype === 2 || datatype === 256 ? 1
-      : datatype === 4 || datatype === 512 ? 2
-        : datatype === 64 ? 8 : 4;
+    const bpv =
+      datatype === 2 || datatype === 256 ? 1 : datatype === 4 || datatype === 512 ? 2 : datatype === 64 ? 8 : 4;
 
     const frameBytes = rows * cols * bpv;
     const available = Math.floor(scan.pixelLength / frameBytes);
@@ -138,18 +155,25 @@ export const dicomFormat: VolumeFormat = {
     if (iop.length >= 6) {
       const row = normalize3(lpsToRas(iop.slice(0, 3)));
       const col = normalize3(lpsToRas(iop.slice(3, 6)));
-      if (row.some(v => v !== 0) && col.some(v => v !== 0)) {
+      if (row.some((v) => v !== 0) && col.some((v) => v !== 0)) {
         const normal = cross3(row, col);
-        const origin: [number, number, number] = ipp.length >= 3
-          ? [-ipp[0], -ipp[1], ipp[2]]
-          : [0, 0, 0];
+        const origin: [number, number, number] = ipp.length >= 3 ? [-ipp[0], -ipp[1], ipp[2]] : [0, 0, 0];
         sform = sformFromDirections([row, col, normal], [dx, dy, dz], origin);
       }
     }
 
     const header = makeNiftiHeader({
-      nx: cols, ny: rows, nz, dx, dy, dz, datatype, voxOffset: scan.pixelOffset,
-      slope, inter, sform,
+      nx: cols,
+      ny: rows,
+      nz,
+      dx,
+      dy,
+      dz,
+      datatype,
+      voxOffset: scan.pixelOffset,
+      slope,
+      inter,
+      sform,
       descrip: `DICOM ${cols}×${rows}×${nz}`,
     });
 
@@ -157,9 +181,7 @@ export const dicomFormat: VolumeFormat = {
       // Keep the whole file so header.voxOffset stays absolute (zero-copy).
       const source = toU8(await readFileBytes(filePath));
       if (syntax.littleEndian) return { header, rawData: source };
-      const swapped = ensureLittleEndian(
-        source.subarray(scan.pixelOffset, scan.pixelOffset + voxelBytes), bpv
-      );
+      const swapped = ensureLittleEndian(source.subarray(scan.pixelOffset, scan.pixelOffset + voxelBytes), bpv);
       header.voxOffset = 0;
       return { header, rawData: swapped };
     }
@@ -184,13 +206,9 @@ function grow(limit: number, fileSize: number): number {
 }
 
 /** File meta information is always explicit VR little endian. */
-function scanMeta(
-  buf: Uint8Array,
-  fileSize: number,
-): { datasetStart: number; syntax: Syntax } | null {
-  const start = buf.length >= 132
-    && buf[128] === 0x44 && buf[129] === 0x49 && buf[130] === 0x43 && buf[131] === 0x4d
-    ? 132 : 0;
+function scanMeta(buf: Uint8Array, fileSize: number): { datasetStart: number; syntax: Syntax } | null {
+  const start =
+    buf.length >= 132 && buf[128] === 0x44 && buf[129] === 0x49 && buf[130] === 0x43 && buf[131] === 0x4d ? 132 : 0;
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   let pos = start;
   let uid = '';
@@ -210,7 +228,7 @@ function scanMeta(
       hdr = 12;
       len = view.getUint32(pos + 8, true);
     }
-    if (len === 0xFFFFFFFF) throw new Error('unsupported DICOM meta encoding');
+    if (len === 0xffffffff) throw new Error('unsupported DICOM meta encoding');
     if (pos + hdr + len > fileSize) throw new Error('truncated DICOM meta information');
     if (((group << 16) | element) === TAG.transferSyntax) {
       if (pos + hdr + len > buf.length) return null;
@@ -227,7 +245,7 @@ function scanMeta(
 function guessSyntax(buf: Uint8Array, pos: number): Syntax {
   if (pos + 8 > buf.length) return { explicit: true, littleEndian: true };
   const vr = [buf[pos + 4], buf[pos + 5]];
-  const explicit = vr.every(b => b >= 0x41 && b <= 0x5a);
+  const explicit = vr.every((b) => b >= 0x41 && b <= 0x5a);
   return { explicit, littleEndian: true };
 }
 
@@ -250,12 +268,7 @@ function syntaxForUid(uid: string): Syntax {
 }
 
 /** Walk elements until PixelData. Returns null when a re-read with more bytes is needed. */
-function scanDataset(
-  buf: Uint8Array,
-  start: number,
-  fileSize: number,
-  syntax: Syntax,
-): Scan | null {
+function scanDataset(buf: Uint8Array, start: number, fileSize: number, syntax: Syntax): Scan | null {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const le = syntax.littleEndian;
   const tags = new Map<number, Uint8Array>();
@@ -270,7 +283,7 @@ function scanDataset(
     const { hdr, len } = header;
     const key = (group << 16) | element;
 
-    if (len === 0xFFFFFFFF) {
+    if (len === 0xffffffff) {
       if (group === 0x7fe0) throw new Error('compressed DICOM is not supported');
       const next = skipUndefinedSequence(buf, pos + hdr, fileSize, syntax);
       if (next === null) return null;
@@ -297,11 +310,7 @@ function scanDataset(
   throw new Error('DICOM has no pixel data');
 }
 
-function elementHeader(
-  buf: Uint8Array,
-  pos: number,
-  syntax: Syntax,
-): { hdr: number; len: number } | null {
+function elementHeader(buf: Uint8Array, pos: number, syntax: Syntax): { hdr: number; len: number } | null {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   if (!syntax.explicit) {
     if (pos + 8 > buf.length) return null;
@@ -317,23 +326,18 @@ function elementHeader(
 }
 
 /** Skip an undefined-length sequence (items + delimiters). */
-function skipUndefinedSequence(
-  buf: Uint8Array,
-  pos: number,
-  fileSize: number,
-  syntax: Syntax,
-): number | null {
+function skipUndefinedSequence(buf: Uint8Array, pos: number, fileSize: number, syntax: Syntax): number | null {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const le = syntax.littleEndian;
   while (pos + 8 <= fileSize) {
     if (pos + 8 > buf.length) return null;
     const group = view.getUint16(pos, le);
     const element = view.getUint16(pos + 2, le);
-    if (group === 0xFFFE) {
+    if (group === 0xfffe) {
       const len = view.getUint32(pos + 4, le);
-      if (element === 0xE0DD) return pos + 8;
-      if (element === 0xE000) {
-        if (len === 0xFFFFFFFF) {
+      if (element === 0xe0dd) return pos + 8;
+      if (element === 0xe000) {
+        if (len === 0xffffffff) {
           const next = skipUndefinedItem(buf, pos + 8, fileSize, syntax);
           if (next === null) return null;
           pos = next;
@@ -342,7 +346,7 @@ function skipUndefinedSequence(
         }
         continue;
       }
-      pos += 8 + (len === 0xFFFFFFFF ? 0 : len);
+      pos += 8 + (len === 0xffffffff ? 0 : len);
       continue;
     }
     const next = skipElement(buf, pos, fileSize, syntax);
@@ -353,23 +357,18 @@ function skipUndefinedSequence(
 }
 
 /** Skip an undefined-length item until its item delimiter. */
-function skipUndefinedItem(
-  buf: Uint8Array,
-  pos: number,
-  fileSize: number,
-  syntax: Syntax,
-): number | null {
+function skipUndefinedItem(buf: Uint8Array, pos: number, fileSize: number, syntax: Syntax): number | null {
   const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
   const le = syntax.littleEndian;
   while (pos + 8 <= fileSize) {
     if (pos + 8 > buf.length) return null;
     const group = view.getUint16(pos, le);
     const element = view.getUint16(pos + 2, le);
-    if (group === 0xFFFE) {
+    if (group === 0xfffe) {
       const len = view.getUint32(pos + 4, le);
-      if (element === 0xE00D || element === 0xE0DD) return pos + 8;
-      if (element === 0xE000) {
-        if (len === 0xFFFFFFFF) {
+      if (element === 0xe00d || element === 0xe0dd) return pos + 8;
+      if (element === 0xe000) {
+        if (len === 0xffffffff) {
           const next = skipUndefinedItem(buf, pos + 8, fileSize, syntax);
           if (next === null) return null;
           pos = next;
@@ -378,7 +377,7 @@ function skipUndefinedItem(
         }
         continue;
       }
-      pos += 8 + (len === 0xFFFFFFFF ? 0 : len);
+      pos += 8 + (len === 0xffffffff ? 0 : len);
       continue;
     }
     const next = skipElement(buf, pos, fileSize, syntax);
@@ -388,15 +387,10 @@ function skipUndefinedItem(
   return null;
 }
 
-function skipElement(
-  buf: Uint8Array,
-  pos: number,
-  fileSize: number,
-  syntax: Syntax,
-): number | null {
+function skipElement(buf: Uint8Array, pos: number, fileSize: number, syntax: Syntax): number | null {
   const header = elementHeader(buf, pos, syntax);
   if (!header) return null;
-  if (header.len === 0xFFFFFFFF) {
+  if (header.len === 0xffffffff) {
     return skipUndefinedSequence(buf, pos + header.hdr, fileSize, syntax);
   }
   const next = pos + header.hdr + header.len;
@@ -411,11 +405,16 @@ function readUS(value: Uint8Array | undefined, le: boolean): number {
 
 function readString(value: Uint8Array | undefined): string {
   if (!value) return '';
-  return String.fromCharCode(...value).replace(/[\0 ]+$/, '').trim();
+  return String.fromCharCode(...value)
+    .replace(/[\0 ]+$/, '')
+    .trim();
 }
 
 function readDS(value: Uint8Array | undefined): number[] {
   const text = readString(value);
   if (!text) return [];
-  return text.split('\\').map(part => parseFloat(part)).filter(v => !Number.isNaN(v));
+  return text
+    .split('\\')
+    .map((part) => parseFloat(part))
+    .filter((v) => !Number.isNaN(v));
 }

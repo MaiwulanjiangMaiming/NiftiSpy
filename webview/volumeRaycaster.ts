@@ -176,7 +176,10 @@ void main() {
     // of render().
     const glCanvas = document.createElement('canvas');
     this.glCanvas = glCanvas;
-    this.gl = glCanvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false }) as WebGL2RenderingContext | null;
+    this.gl = glCanvas.getContext('webgl2', {
+      alpha: true,
+      premultipliedAlpha: false,
+    }) as WebGL2RenderingContext | null;
     if (!this.gl) {
       this.glCanvas = null;
       return false;
@@ -224,7 +227,14 @@ void main() {
     return shader;
   }
 
-  uploadVolume(data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array, nx: number, ny: number, nz: number, slope: number = 1, inter: number = 0): boolean {
+  uploadVolume(
+    data: Float32Array | Int16Array | Uint16Array | Int8Array | Uint8Array | Int32Array | Uint32Array,
+    nx: number,
+    ny: number,
+    nz: number,
+    slope: number = 1,
+    inter: number = 0,
+  ): boolean {
     const gl = this.gl;
     if (!gl) return false;
 
@@ -246,7 +256,7 @@ void main() {
     // uniforms passed to render().
     let f32: Float32Array;
     if (data instanceof Float32Array) {
-      f32 = (slope === 1 && inter === 0) ? data : Float32Array.from(data, v => v * slope + inter);
+      f32 = slope === 1 && inter === 0 ? data : Float32Array.from(data, (v) => v * slope + inter);
     } else {
       f32 = new Float32Array(data.length);
       if (slope === 1 && inter === 0) {
@@ -302,7 +312,8 @@ void main() {
     const points = this.transferFunction;
     if (points.length === 0) return [0, 0, 0, 0];
     if (t <= points[0].position) return [...points[0].color, points[0].opacity];
-    if (t >= points[points.length - 1].position) return [...points[points.length - 1].color, points[points.length - 1].opacity];
+    if (t >= points[points.length - 1].position)
+      return [...points[points.length - 1].color, points[points.length - 1].opacity];
 
     for (let i = 0; i < points.length - 1; i++) {
       if (t >= points[i].position && t <= points[i + 1].position) {
@@ -344,7 +355,7 @@ void main() {
     windowLevel: number,
     windowWidth: number,
     dataMin: number = 0,
-    dataRange: number = 1
+    dataRange: number = 1,
   ): boolean {
     const gl = this.gl;
     if (!gl || !this.program || !this.volumeReady || !this.glCanvas || !this.canvas) return false;
@@ -375,7 +386,12 @@ void main() {
     gl.bindTexture(gl.TEXTURE_2D, this.tfTexture);
     gl.uniform1i(gl.getUniformLocation(this.program, 'u_transferFunc'), 1);
 
-    gl.uniform3f(gl.getUniformLocation(this.program, 'u_volumeSize'), this.volumeSize.nx, this.volumeSize.ny, this.volumeSize.nz);
+    gl.uniform3f(
+      gl.getUniformLocation(this.program, 'u_volumeSize'),
+      this.volumeSize.nx,
+      this.volumeSize.ny,
+      this.volumeSize.nz,
+    );
     gl.uniform1f(gl.getUniformLocation(this.program, 'u_stepSize'), this.config.stepSize);
     gl.uniform1i(gl.getUniformLocation(this.program, 'u_maxSteps'), this.config.maxSteps);
     gl.uniform1f(gl.getUniformLocation(this.program, 'u_windowLevel'), windowLevel);
@@ -425,25 +441,125 @@ void main() {
 
   private invertMatrix(out: Float32Array, m: Float32Array): void {
     const inv = new Float32Array(16);
-    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
-    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
-    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
-    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
-    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
-    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
-    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
-    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
-    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
-    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
-    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
-    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
-    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
-    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
-    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
-    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    inv[0] =
+      m[5] * m[10] * m[15] -
+      m[5] * m[11] * m[14] -
+      m[9] * m[6] * m[15] +
+      m[9] * m[7] * m[14] +
+      m[13] * m[6] * m[11] -
+      m[13] * m[7] * m[10];
+    inv[4] =
+      -m[4] * m[10] * m[15] +
+      m[4] * m[11] * m[14] +
+      m[8] * m[6] * m[15] -
+      m[8] * m[7] * m[14] -
+      m[12] * m[6] * m[11] +
+      m[12] * m[7] * m[10];
+    inv[8] =
+      m[4] * m[9] * m[15] -
+      m[4] * m[11] * m[13] -
+      m[8] * m[5] * m[15] +
+      m[8] * m[7] * m[13] +
+      m[12] * m[5] * m[11] -
+      m[12] * m[7] * m[9];
+    inv[12] =
+      -m[4] * m[9] * m[14] +
+      m[4] * m[10] * m[13] +
+      m[8] * m[5] * m[14] -
+      m[8] * m[6] * m[13] -
+      m[12] * m[5] * m[10] +
+      m[12] * m[6] * m[9];
+    inv[1] =
+      -m[1] * m[10] * m[15] +
+      m[1] * m[11] * m[14] +
+      m[9] * m[2] * m[15] -
+      m[9] * m[3] * m[14] -
+      m[13] * m[2] * m[11] +
+      m[13] * m[3] * m[10];
+    inv[5] =
+      m[0] * m[10] * m[15] -
+      m[0] * m[11] * m[14] -
+      m[8] * m[2] * m[15] +
+      m[8] * m[3] * m[14] +
+      m[12] * m[2] * m[11] -
+      m[12] * m[3] * m[10];
+    inv[9] =
+      -m[0] * m[9] * m[15] +
+      m[0] * m[11] * m[13] +
+      m[8] * m[1] * m[15] -
+      m[8] * m[3] * m[13] -
+      m[12] * m[1] * m[11] +
+      m[12] * m[3] * m[9];
+    inv[13] =
+      m[0] * m[9] * m[14] -
+      m[0] * m[10] * m[13] -
+      m[8] * m[1] * m[14] +
+      m[8] * m[2] * m[13] +
+      m[12] * m[1] * m[10] -
+      m[12] * m[2] * m[9];
+    inv[2] =
+      m[1] * m[6] * m[15] -
+      m[1] * m[7] * m[14] -
+      m[5] * m[2] * m[15] +
+      m[5] * m[3] * m[14] +
+      m[13] * m[2] * m[7] -
+      m[13] * m[3] * m[6];
+    inv[6] =
+      -m[0] * m[6] * m[15] +
+      m[0] * m[7] * m[14] +
+      m[4] * m[2] * m[15] -
+      m[4] * m[3] * m[14] -
+      m[12] * m[2] * m[7] +
+      m[12] * m[3] * m[6];
+    inv[10] =
+      m[0] * m[5] * m[15] -
+      m[0] * m[7] * m[13] -
+      m[4] * m[1] * m[15] +
+      m[4] * m[3] * m[13] +
+      m[12] * m[1] * m[7] -
+      m[12] * m[3] * m[5];
+    inv[14] =
+      -m[0] * m[5] * m[14] +
+      m[0] * m[6] * m[13] +
+      m[4] * m[1] * m[14] -
+      m[4] * m[2] * m[13] -
+      m[12] * m[1] * m[6] +
+      m[12] * m[2] * m[5];
+    inv[3] =
+      -m[1] * m[6] * m[11] +
+      m[1] * m[7] * m[10] +
+      m[5] * m[2] * m[11] -
+      m[5] * m[3] * m[10] -
+      m[9] * m[2] * m[7] +
+      m[9] * m[3] * m[6];
+    inv[7] =
+      m[0] * m[6] * m[11] -
+      m[0] * m[7] * m[10] -
+      m[4] * m[2] * m[11] +
+      m[4] * m[3] * m[10] +
+      m[8] * m[2] * m[7] -
+      m[8] * m[3] * m[6];
+    inv[11] =
+      -m[0] * m[5] * m[11] +
+      m[0] * m[7] * m[9] +
+      m[4] * m[1] * m[11] -
+      m[4] * m[3] * m[9] -
+      m[8] * m[1] * m[7] +
+      m[8] * m[3] * m[5];
+    inv[15] =
+      m[0] * m[5] * m[10] -
+      m[0] * m[6] * m[9] -
+      m[4] * m[1] * m[10] +
+      m[4] * m[2] * m[9] +
+      m[8] * m[1] * m[6] -
+      m[8] * m[2] * m[5];
 
-    let det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
-    if (Math.abs(det) < 1e-10) { out.fill(0); out[0] = out[5] = out[10] = out[15] = 1; return; }
+    let det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+    if (Math.abs(det) < 1e-10) {
+      out.fill(0);
+      out[0] = out[5] = out[10] = out[15] = 1;
+      return;
+    }
     det = 1.0 / det;
     for (let i = 0; i < 16; i++) out[i] = inv[i] * det;
   }
@@ -494,7 +610,7 @@ function arcballProject(x: number, y: number): Float32Array {
   }
   // On hyperbola (outside sphere)
   const s = r * 0.7071067811865476;
-  return new Float32Array([x, y, s * s / d]);
+  return new Float32Array([x, y, (s * s) / d]);
 }
 
 function dot3(a: Float32Array, b: Float32Array): number {
@@ -502,8 +618,12 @@ function dot3(a: Float32Array, b: Float32Array): number {
 }
 
 function cross3(out: Float32Array, a: Float32Array, b: Float32Array): void {
-  const ax = a[0], ay = a[1], az = a[2];
-  const bx = b[0], by = b[1], bz = b[2];
+  const ax = a[0],
+    ay = a[1],
+    az = a[2];
+  const bx = b[0],
+    by = b[1],
+    bz = b[2];
   out[0] = ay * bz - az * by;
   out[1] = az * bx - ax * bz;
   out[2] = ax * by - ay * bx;
@@ -519,7 +639,9 @@ function axisAngleToMatrix(axis: Float32Array, angle: number): Float32Array {
     m[0] = m[5] = m[10] = m[15] = 1;
     return m;
   }
-  const x = axis[0] / len, y = axis[1] / len, z = axis[2] / len;
+  const x = axis[0] / len,
+    y = axis[1] / len,
+    z = axis[2] / len;
   const m = new Float32Array(16);
   m[0] = t * x * x + c;
   m[1] = t * x * y + s * z;

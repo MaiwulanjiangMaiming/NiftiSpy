@@ -11,24 +11,23 @@ import {
   extractSagittalSliceFromRange,
   extractPreviewSlices,
 } from './nifti/sliceExtractor';
-import { computeSliceMinMax, encodePreviewBinary } from './nifti/previewEncoder';
+import { computeSliceMinMax } from './nifti/previewEncoder';
 import { readLocalFilePartial, readHttpPartial } from './io/fileReader';
-import {
-  compressResponse,
-  gunzipAsync,
-  streamingGunzipPreview,
-  streamingHttpGunzipPreview,
-} from './io/compression';
+import { compressResponse, gunzipAsync, streamingGunzipPreview, streamingHttpGunzipPreview } from './io/compression';
 import { GzipIndex } from './io/gzipIndex';
-import {
-  GzipScanSession,
-  type GzipOrthoPreview,
-} from './io/gzipScan';
+import { GzipScanSession, type GzipOrthoPreview } from './io/gzipScan';
 import { isWanRemote } from './remoteEnv';
 import type { FileEntry } from './proxy/types';
 import { handleFile, getHttpRemoteSize, downloadHttpFileInChunks, type HttpStreamContext } from './proxy/httpStream';
 import { handleSlice, handleLOD, type SliceHost } from './proxy/slice';
 import { handlePreviewVolume, type PreviewHost } from './proxy/preview';
+import {
+  handleGzipMeta,
+  handlePreview,
+  handlePreviewBinary,
+  handlePreviewOrtho,
+  type LocalPreviewHost,
+} from './proxy/localPreview';
 
 interface ConnectionStats {
   protocol: 'h2' | 'http/1.1';
@@ -78,21 +77,29 @@ export class LocalFileProxy {
   };
   private readonly sliceHost: SliceHost;
   private readonly previewHost: PreviewHost;
+  private readonly localPreviewHost: LocalPreviewHost;
 
   constructor(volumeCache?: VolumeCache) {
     this.volumeCache = volumeCache || null;
     this.sliceHost = {
-      headerPath: entry => this.headerPath(entry),
-      dataPath: entry => this.dataPath(entry),
+      headerPath: (entry) => this.headerPath(entry),
+      dataPath: (entry) => this.dataPath(entry),
       parseEntryHeader: (entry, bytes) => this.parseEntryHeader(entry, bytes),
       ensureGzipScan: (entry, onProgress) => this.ensureGzipScan(entry, onProgress),
       loadFileData: (entry, signal) => this.loadFileData(entry, signal),
     };
     this.previewHost = {
-      ensureGzipScan: entry => this.ensureGzipScan(entry),
+      ensureGzipScan: (entry) => this.ensureGzipScan(entry),
       parseEntryHeader: (entry, bytes) => this.parseEntryHeader(entry, bytes),
       loadFileData: (entry, signal) => this.loadFileData(entry, signal),
       volumeCache: this.volumeCache,
+    };
+    this.localPreviewHost = {
+      headerPath: (entry) => this.headerPath(entry),
+      dataPath: (entry) => this.dataPath(entry),
+      parseEntryHeader: (entry, bytes) => this.parseEntryHeader(entry, bytes),
+      ensureGzipScan: (entry) => this.ensureGzipScan(entry),
+      loadFileData: (entry, signal) => this.loadFileData(entry, signal),
     };
   }
 
@@ -107,7 +114,9 @@ export class LocalFileProxy {
           // HTTP/1.1 only: browser fetch() cannot speak cleartext HTTP/2
           // (h2c is unsupported in Chromium), so an http2.createServer()
           // would reject every webview request with a protocol error.
-          const createdServer = http.createServer((req, res) => { void this.handleRequest(req, res); });
+          const createdServer = http.createServer((req, res) => {
+            void this.handleRequest(req, res);
+          });
           this.stats.protocol = 'http/1.1';
           // Slice fetches pause while the user reads a plane. Keep the
           // forwarded socket alive instead of paying a new connection setup.
@@ -141,7 +150,9 @@ export class LocalFileProxy {
           continue;
         }
         if (tryPort !== 0 && attempt >= maxRetries) {
-          throw new Error(`NiftiSpy: Failed to start HTTP proxy after ${maxRetries} retries. Port ${configuredPort}–${tryPort} are all in use. Set niftispy.proxyPort to 0 for auto-assign.`);
+          throw new Error(
+            `NiftiSpy: Failed to start HTTP proxy after ${maxRetries} retries. Port ${configuredPort}–${tryPort} are all in use. Set niftispy.proxyPort to 0 for auto-assign.`,
+          );
         }
         throw err;
       }
@@ -186,7 +197,12 @@ export class LocalFileProxy {
     const id = String(this.idCounter++);
     const data = dataUri || uri;
     let sourceStamp: string | undefined;
-    try { const st = fs.statSync(data.fsPath); sourceStamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`; } catch { /* virtual FS: no local stamp */ }
+    try {
+      const st = fs.statSync(data.fsPath);
+      sourceStamp = `${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
+    } catch {
+      /* virtual FS: no local stamp */
+    }
     this.files.set(id, {
       sourceStamp,
       uri,
@@ -244,18 +260,23 @@ export class LocalFileProxy {
     if (entry.gzipScan) return entry.gzipScan;
     const session = GzipScanSession.start(fsPath, undefined, onProgress, {
       directory: vscode.workspace.getConfiguration('niftispy').get<string>('remoteCacheDirectory', '') || undefined,
-      budgetBytes: Math.max(0, vscode.workspace.getConfiguration('niftispy').get<number>('remoteCacheBudgetMB', 4096)) * 1024 * 1024,
+      budgetBytes:
+        Math.max(0, vscode.workspace.getConfiguration('niftispy').get<number>('remoteCacheBudgetMB', 4096)) *
+        1024 *
+        1024,
     });
     entry.gzipScan = session;
-    void session.done.then(idx => {
+    void session.done.then((idx) => {
       if (entry.gzipScan !== session) return;
       if (idx) entry.gzipIndex = idx;
       if (session.unpackPath) entry.unpackPath = session.unpackPath;
     });
-    void session.z0.then(preview => {
-      if (entry.gzipScan !== session) return;
-      if (preview.header) entry.headerCache = preview.header;
-    }).catch(() => {});
+    void session.z0
+      .then((preview) => {
+        if (entry.gzipScan !== session) return;
+        if (preview.header) entry.headerCache = preview.header;
+      })
+      .catch(() => {});
     return session;
   }
 
@@ -270,12 +291,17 @@ export class LocalFileProxy {
       entry.dataCache = undefined;
       entry.headerCache = entry.hostHeader;
       entry.previewBinaryCache = undefined;
-      entry.gzipScan = undefined; entry.gzipIndex = undefined; entry.unpackPath = undefined; entry.size = st.size;
-      entry.sliceCache?.clear(); entry.lodCache?.clear();
+      entry.gzipScan = undefined;
+      entry.gzipIndex = undefined;
+      entry.unpackPath = undefined;
+      entry.size = st.size;
+      entry.sliceCache?.clear();
+      entry.lodCache?.clear();
     }
     entry.sourceStamp = stamp;
     if (entry.unpackPath && !(await fs.promises.stat(entry.unpackPath).catch(() => null))) {
-      entry.unpackPath = undefined; entry.gzipScan = undefined;
+      entry.unpackPath = undefined;
+      entry.gzipScan = undefined;
     }
   }
 
@@ -295,7 +321,8 @@ export class LocalFileProxy {
   private enqueueRequest(priority: number, execute: () => Promise<void>, opts?: { preemptible?: boolean }): void {
     if (priority > REQUEST_PRIORITY.file) this.pauseBackgroundFileLoads();
     // Binary insert into sorted array — O(log n) instead of O(n log n) sort
-    let lo = 0, hi = this.priorityQueue.length;
+    let lo = 0,
+      hi = this.priorityQueue.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
       if (this.priorityQueue[mid].priority > priority) lo = mid + 1;
@@ -309,7 +336,7 @@ export class LocalFileProxy {
     for (const handle of [...this.inflightFileStreams]) {
       if (handle.background) handle.destroy();
     }
-    this.priorityQueue = this.priorityQueue.filter(job => !job.preemptible);
+    this.priorityQueue = this.priorityQueue.filter((job) => !job.preemptible);
   }
 
   private processPriorityQueue(): void {
@@ -345,9 +372,13 @@ export class LocalFileProxy {
     } else {
       try {
         const url = new URL(origin);
-        if (url.protocol === 'https:' &&
-            (url.hostname === 'vscode-cdn.net' || url.hostname.endsWith('.vscode-cdn.net') ||
-             url.hostname === 'vscode-webview.net' || url.hostname.endsWith('.vscode-webview.net'))) {
+        if (
+          url.protocol === 'https:' &&
+          (url.hostname === 'vscode-cdn.net' ||
+            url.hostname.endsWith('.vscode-cdn.net') ||
+            url.hostname === 'vscode-webview.net' ||
+            url.hostname.endsWith('.vscode-webview.net'))
+        ) {
           allowedOrigin = origin;
         }
       } catch {
@@ -358,15 +389,15 @@ export class LocalFileProxy {
     if (allowedOrigin) res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
     if (origin) res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Accept-Encoding, X-NiftiSpy-Priority');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source, X-Width, X-Height, X-Factor, X-NiftiSpy-Slice-Format, X-NiftiSpy-Dtype, X-NiftiSpy-Slope, X-NiftiSpy-Inter, Server-Timing');
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'Content-Range, Content-Length, Accept-Ranges, Content-Encoding, X-Remote-Source, X-Width, X-Height, X-Factor, X-NiftiSpy-Slice-Format, X-NiftiSpy-Dtype, X-NiftiSpy-Slope, X-NiftiSpy-Inter, Server-Timing',
+    );
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Referrer-Policy', 'no-referrer');
   }
 
-  private async handleRequest(
-    req: http.IncomingMessage,
-    res: http.ServerResponse
-  ): Promise<void> {
+  private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const _req = req as http.IncomingMessage;
     const _res = res as http.ServerResponse;
 
@@ -421,7 +452,16 @@ export class LocalFileProxy {
     const sliceMatch = routePath.match(/^\/slice\/(\d+)\/(axial|coronal|sagittal)\/(\d+)$/);
     const lodMatch = routePath.match(/^\/lod\/(\d+)\/(\d+)$/);
     const fileMatch = routePath.match(/^\/file\/(\d+)$/);
-    const match = headerMatch || previewMatch || previewBinMatch || previewVolumeMatch || previewOrthoMatch || metaMatch || sliceMatch || lodMatch || fileMatch;
+    const match =
+      headerMatch ||
+      previewMatch ||
+      previewBinMatch ||
+      previewVolumeMatch ||
+      previewOrthoMatch ||
+      metaMatch ||
+      sliceMatch ||
+      lodMatch ||
+      fileMatch;
     if (!match) {
       _res.writeHead(404);
       _res.end();
@@ -435,65 +475,87 @@ export class LocalFileProxy {
       return;
     }
 
-    const priority = headerMatch ? REQUEST_PRIORITY.header
-      : previewMatch ? REQUEST_PRIORITY.preview
-      : previewBinMatch ? REQUEST_PRIORITY.previewBin
-      : previewVolumeMatch ? REQUEST_PRIORITY.previewVolume
-      : previewOrthoMatch ? REQUEST_PRIORITY.preview
-      : metaMatch ? REQUEST_PRIORITY.header
-      : sliceMatch ? REQUEST_PRIORITY.slice
-      : lodMatch ? REQUEST_PRIORITY.lod
-      : REQUEST_PRIORITY.file;
+    const priority = headerMatch
+      ? REQUEST_PRIORITY.header
+      : previewMatch
+        ? REQUEST_PRIORITY.preview
+        : previewBinMatch
+          ? REQUEST_PRIORITY.previewBin
+          : previewVolumeMatch
+            ? REQUEST_PRIORITY.previewVolume
+            : previewOrthoMatch
+              ? REQUEST_PRIORITY.preview
+              : metaMatch
+                ? REQUEST_PRIORITY.header
+                : sliceMatch
+                  ? REQUEST_PRIORITY.slice
+                  : lodMatch
+                    ? REQUEST_PRIORITY.lod
+                    : REQUEST_PRIORITY.file;
 
-    const backgroundFile = !!fileMatch && String(_req.headers['x-niftispy-priority'] || '').toLowerCase() === 'background';
+    const backgroundFile =
+      !!fileMatch && String(_req.headers['x-niftispy-priority'] || '').toLowerCase() === 'background';
     const queuedAt = performance.now();
-    this.enqueueRequest(priority, async () => {
-      try {
-        _res.setHeader('Server-Timing', `queue;dur=${(performance.now() - queuedAt).toFixed(2)}`);
-        await this.validateEntrySource(entry);
-        if (_res.destroyed) return;
-        if (headerMatch) {
-          await this.handleHeader(entry, _res, _req);
-          return;
-        }
-        if (metaMatch) {
-          this.handleGzipMeta(entry, _res);
-          return;
-        }
-        if (previewMatch) {
-          await this.handlePreview(entry, _res, _req);
-          return;
-        }
-        if (previewBinMatch) {
-          await this.handlePreviewBinary(entry, _res, _req);
-          return;
-        }
-        if (previewOrthoMatch) {
-          await this.handlePreviewOrtho(entry, _res, _req);
-          return;
-        }
-        if (previewVolumeMatch) {
-          const factor = parseFactorFromPath(_req.url || '');
-          await handlePreviewVolume(entry, factor, _res, _req, this.previewHost);
-          return;
-        }
-        if (sliceMatch) {
-          const timeIdx = parseInt(query.get('t') || '0', 10) || 0;
-          await handleSlice(entry, sliceMatch[2], parseInt(sliceMatch[3], 10), _res, _req, this.sliceHost, timeIdx, Math.max(1, Math.min(32, Math.floor(Number(query.get('factor'))) || 1)));
-          return;
-        }
-        if (lodMatch) {
-          await handleLOD(entry, parseInt(lodMatch[2]), _res, _req, this.sliceHost);
-          return;
-        }
+    this.enqueueRequest(
+      priority,
+      async () => {
+        try {
+          _res.setHeader('Server-Timing', `queue;dur=${(performance.now() - queuedAt).toFixed(2)}`);
+          await this.validateEntrySource(entry);
+          if (_res.destroyed) return;
+          if (headerMatch) {
+            await this.handleHeader(entry, _res, _req);
+            return;
+          }
+          if (metaMatch) {
+            handleGzipMeta(entry, _res);
+            return;
+          }
+          if (previewMatch) {
+            await handlePreview(entry, _res, _req, this.localPreviewHost);
+            return;
+          }
+          if (previewBinMatch) {
+            await handlePreviewBinary(entry, _res, _req, this.localPreviewHost);
+            return;
+          }
+          if (previewOrthoMatch) {
+            await handlePreviewOrtho(entry, _res, _req, this.localPreviewHost);
+            return;
+          }
+          if (previewVolumeMatch) {
+            const factor = parseFactorFromPath(_req.url || '');
+            await handlePreviewVolume(entry, factor, _res, _req, this.previewHost);
+            return;
+          }
+          if (sliceMatch) {
+            const timeIdx = parseInt(query.get('t') || '0', 10) || 0;
+            await handleSlice(
+              entry,
+              sliceMatch[2],
+              parseInt(sliceMatch[3], 10),
+              _res,
+              _req,
+              this.sliceHost,
+              timeIdx,
+              Math.max(1, Math.min(32, Math.floor(Number(query.get('factor'))) || 1)),
+            );
+            return;
+          }
+          if (lodMatch) {
+            await handleLOD(entry, parseInt(lodMatch[2]), _res, _req, this.sliceHost);
+            return;
+          }
 
-        await handleFile(entry, _res, _req, this.httpCtx);
-      } catch (err) {
-        console.error('LocalFileProxy error:', err);
-        _res.writeHead(500);
-        _res.end(String(err));
-      }
-    }, { preemptible: backgroundFile });
+          await handleFile(entry, _res, _req, this.httpCtx);
+        } catch (err) {
+          console.error('LocalFileProxy error:', err);
+          _res.writeHead(500);
+          _res.end(String(err));
+        }
+      },
+      { preemptible: backgroundFile },
+    );
   }
 
   private async handleHeader(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
@@ -514,7 +576,7 @@ export class LocalFileProxy {
             compressResponse(Buffer.from(JSON.stringify(entry.headerCache)), req, res, 'application/json');
             return;
           }
-          const idx = entry.gzipIndex || await session.done;
+          const idx = entry.gzipIndex || (await session.done);
           if (idx && fsPath) {
             const headerBytes = await GzipIndex.readRange(fsPath, idx, 0, 544);
             const header = this.parseEntryHeader(entry, headerBytes);
@@ -567,283 +629,10 @@ export class LocalFileProxy {
     }
   }
 
-  private async handlePreview(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    try {
-      if (entry.previewBinaryCache) {
-        compressResponse(entry.previewBinaryCache, req, res, 'application/octet-stream');
-        return;
-      }
-
-      const fsPath = entry.uri.fsPath;
-      const isGzip = fsPath ? fsPath.endsWith('.gz') : entry.uri.toString().endsWith('.gz');
-      const isLocal = !!fsPath;
-
-      if (isLocal && !isGzip) {
-        await this.handlePreviewLocalNii(entry, res, req);
-        return;
-      }
-
-      if (isLocal && isGzip) {
-        await this.handlePreviewLocalGz(entry, res, req);
-        return;
-      }
-
-      await this.handlePreviewRemote(entry, res, req);
-    } catch (err) {
-      res.writeHead(500);
-      res.end(errorMessage(err));
-    }
-  }
-
-  private async handlePreviewLocalNii(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const headerFs = this.headerPath(entry);
-    const dataFs = this.dataPath(entry);
-
-    if (!entry.headerCache) {
-      const headerBytes = await readLocalFilePartial(headerFs, 0, 543);
-      const header = this.parseEntryHeader(entry, headerBytes);
-      if (!header) {
-        res.writeHead(500);
-        res.end('Failed to parse header');
-        return;
-      }
-      entry.headerCache = header;
-    }
-
-    const header = entry.headerCache;
-    const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-    const axMid = Math.floor(nz / 2);
-    const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
-    const sliceEnd = sliceStart + nx * ny * bytesPerVoxel;
-
-    const sliceBytes = await readLocalFilePartial(dataFs, sliceStart, sliceEnd - 1);
-    const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-
-    let min = Infinity, max = -Infinity;
-    for (let i = 0; i < axialSlice.length; i++) {
-      if (axialSlice[i] < min) min = axialSlice[i];
-      if (axialSlice[i] > max) max = axialSlice[i];
-    }
-
-    const emptyCoronal = new Float32Array(nx * nz);
-    const emptySagittal = new Float32Array(ny * nz);
-
-    const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
-    const buf = encodePreviewBinary(header, slices, min, max);
-    entry.previewBinaryCache = buf;
-    compressResponse(buf, req, res, 'application/octet-stream');
-  }
-
-  private handleGzipMeta(entry: FileEntry, res: http.ServerResponse): void {
-    const index = entry.gzipIndex || entry.gzipScan?.index || null;
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      indexReady: !!index,
-      indexEntries: index?.entries.length ?? 0,
-    }));
-  }
-
-  private async handlePreviewOrtho(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const session = this.ensureGzipScan(entry);
-    if (!session) {
-      res.writeHead(404);
-      res.end('Not a local gzip file');
-      return;
-    }
-    const preview = await session.ortho.catch(() => null);
-    if (!preview) {
-      res.writeHead(404);
-      res.end('Orthogonal preview unavailable');
-      return;
-    }
-    const buf = encodePreviewBinary(
-      preview.header,
-      { axial: preview.axial, coronal: preview.coronal, sagittal: preview.sagittal },
-      preview.min,
-      preview.max,
-      preview.sliceIdx,
-    );
-    compressResponse(buf, req, res, 'application/octet-stream');
-  }
-
-  private async handlePreviewLocalGz(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const fsPath = entry.uri.fsPath!;
-    const session = this.ensureGzipScan(entry);
-    const preview = session ? await session.z0.catch(() => null) : null;
-    if (!preview) {
-      const { header, axialSlice } = await streamingGunzipPreview(fsPath);
-      if (!header) {
-        res.writeHead(500);
-        res.end('Failed to parse header');
-        return;
-      }
-      entry.headerCache = header;
-      const { nx, ny, nz } = header;
-      let min = Infinity, max = -Infinity;
-      for (let i = 0; i < axialSlice.length; i++) {
-        if (axialSlice[i] < min) min = axialSlice[i];
-        if (axialSlice[i] > max) max = axialSlice[i];
-      }
-      const slices = {
-        axial: axialSlice,
-        coronal: new Float32Array(nx * nz),
-        sagittal: new Float32Array(ny * nz),
-      };
-      const buf = encodePreviewBinary(header, slices, min, max, {
-        axial: 0,
-        coronal: Math.floor(ny / 2),
-        sagittal: Math.floor(nx / 2),
-      });
-      entry.previewBinaryCache = buf;
-      compressResponse(buf, req, res, 'application/octet-stream');
-      return;
-    }
-
-    entry.headerCache = preview.header;
-    entry.lastAccess = Date.now();
-    const buf = encodePreviewBinary(
-      preview.header,
-      { axial: preview.axial, coronal: preview.coronal, sagittal: preview.sagittal },
-      preview.min,
-      preview.max,
-      preview.sliceIdx,
-    );
-    entry.previewBinaryCache = buf;
-    compressResponse(buf, req, res, 'application/octet-stream');
-  }
-
-  private async handlePreviewRemote(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    const uriStr = entry.uri.toString();
-    const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
-    const isGzip = uriStr.endsWith('.gz');
-
-    if (isHttpRemote) {
-      if (isGzip) {
-        try {
-          const { header, axialSlice } = await streamingHttpGunzipPreview(uriStr);
-          if (!header) throw new Error('No NIfTI header in stream');
-          entry.headerCache = header;
-          const { nx, ny, nz } = header;
-          const emptyCoronal = new Float32Array(nx * nz);
-          const emptySagittal = new Float32Array(ny * nz);
-          const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
-          const { min, max } = computeSliceMinMax(axialSlice);
-          const buf = encodePreviewBinary(header, slices, min, max);
-          entry.previewBinaryCache = buf;
-          compressResponse(buf, req, res, 'application/octet-stream');
-          return;
-        } catch {
-          res.writeHead(500);
-          res.end('Failed to stream remote gzip preview');
-          return;
-        }
-      }
-
-      try {
-        const headerBytes = await readHttpPartial(uriStr, 0, 543);
-        const header = this.parseEntryHeader(entry, headerBytes);
-        if (!header) {
-          res.writeHead(500);
-          res.end('Failed to parse header');
-          return;
-        }
-        entry.headerCache = header;
-
-        const { nx, ny, nz, voxOffset, bytesPerVoxel } = header;
-        const axMid = Math.floor(nz / 2);
-        const sliceStart = voxOffset + axMid * nx * ny * bytesPerVoxel;
-        const sliceEnd = sliceStart + nx * ny * bytesPerVoxel - 1;
-        const sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd);
-        const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
-
-        const emptyCoronal = new Float32Array(nx * nz);
-        const emptySagittal = new Float32Array(ny * nz);
-        const slices = { axial: axialSlice, coronal: emptyCoronal, sagittal: emptySagittal };
-        const { min, max } = computeSliceMinMax(axialSlice);
-        const buf = encodePreviewBinary(header, slices, min, max);
-        entry.previewBinaryCache = buf;
-        compressResponse(buf, req, res, 'application/octet-stream');
-        return;
-      } catch {
-        res.writeHead(500);
-        res.end('Failed to fetch remote file via HTTP Range');
-        return;
-      }
-    }
-
-    if (!entry.size) {
-      const stat = await vscode.workspace.fs.stat(entry.uri);
-      entry.size = Number(stat.size);
-    }
-    const MAX_REMOTE_PREVIEW_SIZE = 200 * 1024 * 1024;
-    if (entry.size && entry.size > MAX_REMOTE_PREVIEW_SIZE) {
-      res.writeHead(503, { 'Content-Type': 'text/plain' });
-      res.end('Remote preview for large files (>200MB) is not supported yet');
-      return;
-    }
-
-    const { rawData, header } = await this.loadFileData(entry);
-    if (!header) {
-      res.writeHead(500);
-      res.end('Failed to parse NIfTI header');
-      return;
-    }
-
-    const slices = extractPreviewSlices(rawData, header);
-    if (!slices) {
-      res.writeHead(500);
-      res.end('Failed to extract preview slices');
-      return;
-    }
-
-    const { min, max } = computeSliceMinMax(slices.axial, slices.coronal, slices.sagittal);
-
-    const buf = encodePreviewBinary(header, slices, min, max);
-    entry.previewBinaryCache = buf;
-    compressResponse(buf, req, res, 'application/octet-stream');
-  }
-
-  private async handlePreviewBinary(entry: FileEntry, res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
-    try {
-      if (entry.previewBinaryCache) {
-        compressResponse(entry.previewBinaryCache, req, res, 'application/octet-stream');
-        return;
-      }
-
-      const fsPath = entry.uri.fsPath;
-      if (fsPath && fsPath.endsWith('.gz')) {
-        await this.handlePreviewLocalGz(entry, res, req);
-        return;
-      }
-
-      const { rawData, header } = await this.loadFileData(entry);
-      if (!header) {
-        res.writeHead(500);
-        res.end('Failed to parse header');
-        return;
-      }
-
-      const slices = extractPreviewSlices(rawData, header);
-      if (!slices) {
-        res.writeHead(500);
-        res.end('Failed to extract slices');
-        return;
-      }
-
-      const { min, max } = computeSliceMinMax(slices.axial, slices.coronal, slices.sagittal);
-      const buf = encodePreviewBinary(header, slices, min, max);
-
-      entry.previewBinaryCache = buf;
-      entry.headerCache = header;
-
-      compressResponse(buf, req, res, 'application/octet-stream');
-    } catch (err) {
-      res.writeHead(500);
-      res.end(errorMessage(err));
-    }
-  }
-
-  public async loadFileData(entry: FileEntry, signal?: AbortSignal): Promise<{ rawData: Uint8Array; header: NiiHeader | null }> {
+  public async loadFileData(
+    entry: FileEntry,
+    signal?: AbortSignal,
+  ): Promise<{ rawData: Uint8Array; header: NiiHeader | null }> {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
     if (entry.dataCache && entry.headerCache) {
@@ -868,7 +657,10 @@ export class LocalFileProxy {
 
         if (entry.separateImg) {
           const headerData = await vscode.workspace.fs.readFile(entry.uri);
-          header = this.parseEntryHeader(entry, new Uint8Array(headerData.buffer, headerData.byteOffset, headerData.byteLength));
+          header = this.parseEntryHeader(
+            entry,
+            new Uint8Array(headerData.buffer, headerData.byteOffset, headerData.byteLength),
+          );
           const fullData = await vscode.workspace.fs.readFile(fileUri);
           rawData = new Uint8Array(fullData.buffer, fullData.byteOffset, fullData.byteLength);
           if (header) entry.headerCache = header;
@@ -953,35 +745,96 @@ export class LocalFileProxy {
             const n = nx * ny * nz;
             const byteOff = rawData.byteOffset + voxOffset;
             const le = littleEndian;
-            const elemSize = datatype === 64 ? 8 : datatype === 8 || datatype === 16 || datatype === 768 ? 4 : datatype === 4 || datatype === 512 ? 2 : 1;
-            const canUseTypedArray = (byteOff % elemSize === 0) && (byteOff + n * elemSize <= rawData.buffer.byteLength) && le;
+            const elemSize =
+              datatype === 64
+                ? 8
+                : datatype === 8 || datatype === 16 || datatype === 768
+                  ? 4
+                  : datatype === 4 || datatype === 512
+                    ? 2
+                    : 1;
+            const canUseTypedArray =
+              byteOff % elemSize === 0 && byteOff + n * elemSize <= rawData.buffer.byteLength && le;
 
-            let voxelData: Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+            let voxelData:
+              | Int8Array
+              | Uint8Array
+              | Int16Array
+              | Uint16Array
+              | Int32Array
+              | Uint32Array
+              | Float32Array
+              | Float64Array;
             switch (datatype) {
-              case 2: voxelData = canUseTypedArray ? new Uint8Array(rawData.buffer, byteOff, n) : new Uint8Array(rawData.slice(voxOffset, voxOffset + n)); break;
-              case 4: voxelData = canUseTypedArray ? new Int16Array(rawData.buffer, byteOff, n) : new Int16Array(n); break;
-              case 8: voxelData = canUseTypedArray ? new Int32Array(rawData.buffer, byteOff, n) : new Int32Array(n); break;
-              case 16: voxelData = canUseTypedArray ? new Float32Array(rawData.buffer, byteOff, n) : new Float32Array(n); break;
-              case 64: voxelData = canUseTypedArray ? new Float64Array(rawData.buffer, byteOff, n) : new Float64Array(n); break;
-              case 256: voxelData = canUseTypedArray ? new Int8Array(rawData.buffer, byteOff, n) : new Int8Array(n); break;
-              case 512: voxelData = canUseTypedArray ? new Uint16Array(rawData.buffer, byteOff, n) : new Uint16Array(n); break;
-              case 768: voxelData = canUseTypedArray ? new Uint32Array(rawData.buffer, byteOff, n) : new Uint32Array(n); break;
-              default: voxelData = new Float32Array(n); break;
+              case 2:
+                voxelData = canUseTypedArray
+                  ? new Uint8Array(rawData.buffer, byteOff, n)
+                  : new Uint8Array(rawData.slice(voxOffset, voxOffset + n));
+                break;
+              case 4:
+                voxelData = canUseTypedArray ? new Int16Array(rawData.buffer, byteOff, n) : new Int16Array(n);
+                break;
+              case 8:
+                voxelData = canUseTypedArray ? new Int32Array(rawData.buffer, byteOff, n) : new Int32Array(n);
+                break;
+              case 16:
+                voxelData = canUseTypedArray ? new Float32Array(rawData.buffer, byteOff, n) : new Float32Array(n);
+                break;
+              case 64:
+                voxelData = canUseTypedArray ? new Float64Array(rawData.buffer, byteOff, n) : new Float64Array(n);
+                break;
+              case 256:
+                voxelData = canUseTypedArray ? new Int8Array(rawData.buffer, byteOff, n) : new Int8Array(n);
+                break;
+              case 512:
+                voxelData = canUseTypedArray ? new Uint16Array(rawData.buffer, byteOff, n) : new Uint16Array(n);
+                break;
+              case 768:
+                voxelData = canUseTypedArray ? new Uint32Array(rawData.buffer, byteOff, n) : new Uint32Array(n);
+                break;
+              default:
+                voxelData = new Float32Array(n);
+                break;
             }
 
             if (!canUseTypedArray && datatype !== 2 && datatype !== 256) {
               const view = new DataView(rawData.buffer, byteOff, n * elemSize);
               switch (datatype) {
-                case 4: { const a = voxelData as Int16Array; for (let i = 0; i < n; i++) a[i] = view.getInt16(i * 2, le); break; }
-                case 8: { const a = voxelData as Int32Array; for (let i = 0; i < n; i++) a[i] = view.getInt32(i * 4, le); break; }
-                case 16: { const a = voxelData as Float32Array; for (let i = 0; i < n; i++) a[i] = view.getFloat32(i * 4, le); break; }
-                case 64: { const a = voxelData as Float64Array; for (let i = 0; i < n; i++) a[i] = view.getFloat64(i * 8, le); break; }
-                case 512: { const a = voxelData as Uint16Array; for (let i = 0; i < n; i++) a[i] = view.getUint16(i * 2, le); break; }
-                case 768: { const a = voxelData as Uint32Array; for (let i = 0; i < n; i++) a[i] = view.getUint32(i * 4, le); break; }
+                case 4: {
+                  const a = voxelData as Int16Array;
+                  for (let i = 0; i < n; i++) a[i] = view.getInt16(i * 2, le);
+                  break;
+                }
+                case 8: {
+                  const a = voxelData as Int32Array;
+                  for (let i = 0; i < n; i++) a[i] = view.getInt32(i * 4, le);
+                  break;
+                }
+                case 16: {
+                  const a = voxelData as Float32Array;
+                  for (let i = 0; i < n; i++) a[i] = view.getFloat32(i * 4, le);
+                  break;
+                }
+                case 64: {
+                  const a = voxelData as Float64Array;
+                  for (let i = 0; i < n; i++) a[i] = view.getFloat64(i * 8, le);
+                  break;
+                }
+                case 512: {
+                  const a = voxelData as Uint16Array;
+                  for (let i = 0; i < n; i++) a[i] = view.getUint16(i * 2, le);
+                  break;
+                }
+                case 768: {
+                  const a = voxelData as Uint32Array;
+                  for (let i = 0; i < n; i++) a[i] = view.getUint32(i * 4, le);
+                  break;
+                }
               }
             }
 
-            let min = Infinity, max = -Infinity;
+            let min = Infinity,
+              max = -Infinity;
             const sampleStep = Math.max(1, Math.floor(n / 50000));
             const slope = scl_slope || 1;
             const inter = scl_inter || 0;
@@ -1005,7 +858,10 @@ export class LocalFileProxy {
     return entry.pendingLoad;
   }
 
-  async extractPreviewForWebview(entryId: string, signal?: AbortSignal): Promise<{
+  async extractPreviewForWebview(
+    entryId: string,
+    signal?: AbortSignal,
+  ): Promise<{
     header: NiiHeader;
     slices: { axial: Float32Array; coronal: Float32Array; sagittal: Float32Array };
     globalMin: number;
@@ -1042,15 +898,19 @@ export class LocalFileProxy {
 
         // Extract all three preview slices in parallel for local .nii files
         const [axialSlice, coronalSlice, sagittalSlice] = await Promise.all([
-          readLocalFilePartial(fsPath!, sliceStart, sliceEnd - 1)
-            .then(bytes => extractAxialSliceFromRange(bytes, header)),
+          readLocalFilePartial(fsPath!, sliceStart, sliceEnd - 1).then((bytes) =>
+            extractAxialSliceFromRange(bytes, header),
+          ),
           extractCoronalSliceFromRange(fsPath!, header, coMid)
-            .then(s => s || new Float32Array(nx * nz)).catch(() => new Float32Array(nx * nz)),
+            .then((s) => s || new Float32Array(nx * nz))
+            .catch(() => new Float32Array(nx * nz)),
           extractSagittalSliceFromRange(fsPath!, header, saMid)
-            .then(s => s || new Float32Array(ny * nz)).catch(() => new Float32Array(ny * nz)),
+            .then((s) => s || new Float32Array(ny * nz))
+            .catch(() => new Float32Array(ny * nz)),
         ]);
 
-        let min = Infinity, max = -Infinity;
+        let min = Infinity,
+          max = -Infinity;
         for (const s of [axialSlice, coronalSlice, sagittalSlice]) {
           for (let i = 0; i < s.length; i++) {
             if (s[i] < min) min = s[i];
@@ -1061,9 +921,11 @@ export class LocalFileProxy {
         return {
           header,
           slices: { axial: axialSlice, coronal: coronalSlice, sagittal: sagittalSlice },
-          globalMin: min, globalMax: max,
+          globalMin: min,
+          globalMax: max,
           sliceIdx: { axial: axMid, coronal: coMid, sagittal: saMid },
-          slope: header.scl_slope || 1, inter: header.scl_inter || 0,
+          slope: header.scl_slope || 1,
+          inter: header.scl_inter || 0,
           partialPreview: true,
         };
       }
@@ -1077,16 +939,19 @@ export class LocalFileProxy {
           return {
             header: preview.header,
             slices: { axial: preview.axial, coronal: preview.coronal, sagittal: preview.sagittal },
-            globalMin: preview.min, globalMax: preview.max,
+            globalMin: preview.min,
+            globalMax: preview.max,
             sliceIdx: preview.sliceIdx,
-            slope: preview.slope, inter: preview.inter,
+            slope: preview.slope,
+            inter: preview.inter,
             partialPreview: true,
           };
         }
         const { header, axialSlice } = await streamingGunzipPreview(fsPath!, signal);
         if (!header) return null;
         const { nx, ny, nz } = header;
-        let min = Infinity, max = -Infinity;
+        let min = Infinity,
+          max = -Infinity;
         for (let i = 0; i < axialSlice.length; i++) {
           if (axialSlice[i] < min) min = axialSlice[i];
           if (axialSlice[i] > max) max = axialSlice[i];
@@ -1094,10 +959,12 @@ export class LocalFileProxy {
         return {
           header,
           slices: { axial: axialSlice, coronal: new Float32Array(nx * nz), sagittal: new Float32Array(ny * nz) },
-          globalMin: min, globalMax: max,
+          globalMin: min,
+          globalMax: max,
           // streamingGunzipPreview now returns z=0 slice for instant preview
           sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
-          slope: header.scl_slope || 1, inter: header.scl_inter || 0,
+          slope: header.scl_slope || 1,
+          inter: header.scl_inter || 0,
           partialPreview: true,
         };
       }
@@ -1110,7 +977,8 @@ export class LocalFileProxy {
             const { header, axialSlice } = await streamingHttpGunzipPreview(uriStr, signal);
             if (!header) return null;
             const { nx, ny, nz } = header;
-            let min = Infinity, max = -Infinity;
+            let min = Infinity,
+              max = -Infinity;
             for (let i = 0; i < axialSlice.length; i++) {
               if (axialSlice[i] < min) min = axialSlice[i];
               if (axialSlice[i] > max) max = axialSlice[i];
@@ -1118,10 +986,12 @@ export class LocalFileProxy {
             return {
               header,
               slices: { axial: axialSlice, coronal: new Float32Array(nx * nz), sagittal: new Float32Array(ny * nz) },
-              globalMin: min, globalMax: max,
+              globalMin: min,
+              globalMax: max,
               // streamingHttpGunzipPreview now returns z=0 slice for instant preview
               sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
-              slope: header.scl_slope || 1, inter: header.scl_inter || 0,
+              slope: header.scl_slope || 1,
+              inter: header.scl_inter || 0,
               partialPreview: true,
             };
           } catch {
@@ -1141,7 +1011,8 @@ export class LocalFileProxy {
             const sliceBytes = await readHttpPartial(uriStr, sliceStart, sliceEnd);
             const axialSlice = extractAxialSliceFromRange(sliceBytes, header);
 
-            let min = Infinity, max = -Infinity;
+            let min = Infinity,
+              max = -Infinity;
             for (let i = 0; i < axialSlice.length; i++) {
               if (axialSlice[i] < min) min = axialSlice[i];
               if (axialSlice[i] > max) max = axialSlice[i];
@@ -1150,9 +1021,11 @@ export class LocalFileProxy {
             return {
               header,
               slices: { axial: axialSlice, coronal: new Float32Array(nx * nz), sagittal: new Float32Array(ny * nz) },
-              globalMin: min, globalMax: max,
+              globalMin: min,
+              globalMax: max,
               sliceIdx: { axial: 0, coronal: Math.floor(ny / 2), sagittal: Math.floor(nx / 2) },
-              slope: header.scl_slope || 1, inter: header.scl_inter || 0,
+              slope: header.scl_slope || 1,
+              inter: header.scl_inter || 0,
               partialPreview: true,
             };
           } catch {
@@ -1173,9 +1046,15 @@ export class LocalFileProxy {
       return {
         header,
         slices,
-        globalMin: min, globalMax: max,
-        sliceIdx: { axial: Math.floor(header.nz / 2), coronal: Math.floor(header.ny / 2), sagittal: Math.floor(header.nx / 2) },
-        slope: header.scl_slope || 1, inter: header.scl_inter || 0,
+        globalMin: min,
+        globalMax: max,
+        sliceIdx: {
+          axial: Math.floor(header.nz / 2),
+          coronal: Math.floor(header.ny / 2),
+          sagittal: Math.floor(header.nx / 2),
+        },
+        slope: header.scl_slope || 1,
+        inter: header.scl_inter || 0,
       };
     } catch (err) {
       if (isAbortError(err)) return null;

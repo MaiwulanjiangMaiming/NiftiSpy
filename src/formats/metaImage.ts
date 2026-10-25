@@ -1,8 +1,15 @@
 import * as path from 'path';
 import * as zlib from 'zlib';
 import {
-  DATATYPE_BYTES, ensureLittleEndian, fileStamp, makeNiftiHeader, readFileBytes,
-  readTextHeader, tempFilesFor, toU8, writeTempVolume,
+  DATATYPE_BYTES,
+  ensureLittleEndian,
+  fileStamp,
+  makeNiftiHeader,
+  readFileBytes,
+  readTextHeader,
+  tempFilesFor,
+  toU8,
+  writeTempVolume,
 } from './header';
 import type { ParseOptions, ParsedVolume, VolumeFormat } from './types';
 
@@ -12,14 +19,11 @@ export const metaImageFormat: VolumeFormat = {
   label: 'MetaImage',
   extensions: ['.mha', '.mhd'],
   async parse(filePath: string, opts: ParseOptions): Promise<ParsedVolume> {
-    const { text, dataStart } = await readTextHeader(
-      filePath,
-      /(?:^|\r?\n)ElementDataFile\s*=\s*[^\r\n]*(?:\r?\n|$)/i,
-    );
+    const { text, dataStart } = await readTextHeader(filePath, /(?:^|\r?\n)ElementDataFile\s*=\s*[^\r\n]*(?:\r?\n|$)/i);
     const fields = parseFields(text);
 
     const dims = (fields.get('dimsize') || '').trim().split(/\s+/).map(Number);
-    if (dims.length < 2 || dims.length > 4 || dims.some(v => !Number.isSafeInteger(v) || v <= 0)) {
+    if (dims.length < 2 || dims.length > 4 || dims.some((v) => !Number.isSafeInteger(v) || v <= 0)) {
       throw new Error('invalid MetaImage DimSize');
     }
     const channels = parseInt(fields.get('elementnumberofchannels') || '1', 10) || 1;
@@ -54,19 +58,29 @@ export const metaImageFormat: VolumeFormat = {
     let sform: number[][] | undefined;
     if (matrix.length === 9 && matrix.every(Number.isFinite)) {
       const signs = [-1, -1, 1];
-      const origin = [0, 1, 2].map(i => Number.isFinite(offset[i]) ? offset[i] : 0);
-      sform = [0, 1, 2].map(row => [
-        (signs[row] * matrix[row * 3] * dx) || 0,
-        (signs[row] * matrix[row * 3 + 1] * dy) || 0,
-        (signs[row] * matrix[row * 3 + 2] * dz) || 0,
-        (signs[row] * origin[row]) || 0,
+      const origin = [0, 1, 2].map((i) => (Number.isFinite(offset[i]) ? offset[i] : 0));
+      sform = [0, 1, 2].map((row) => [
+        signs[row] * matrix[row * 3] * dx || 0,
+        signs[row] * matrix[row * 3 + 1] * dy || 0,
+        signs[row] * matrix[row * 3 + 2] * dz || 0,
+        signs[row] * origin[row] || 0,
       ]);
     }
 
-    const headerFor = (voxOffset: number) => makeNiftiHeader({
-      nx, ny, nz, nt, dx, dy, dz, datatype, voxOffset, sform,
-      descrip: `MetaImage ${fields.get('elementtype') || ''} (${dims.join('×')})`,
-    });
+    const headerFor = (voxOffset: number) =>
+      makeNiftiHeader({
+        nx,
+        ny,
+        nz,
+        nt,
+        dx,
+        dy,
+        dz,
+        datatype,
+        voxOffset,
+        sform,
+        descrip: `MetaImage ${fields.get('elementtype') || ''} (${dims.join('×')})`,
+      });
 
     if (!compressed && !needsSwap) {
       if (opts.memory) {
@@ -110,16 +124,29 @@ function parseFields(text: string): Map<string, string> {
 
 function metaDatatype(type: string): number {
   switch (type.trim().toUpperCase()) {
-    case 'MET_UCHAR': return 2;
-    case 'MET_CHAR': return 256;
-    case 'MET_USHORT': return 512;
-    case 'MET_SHORT': return 4;
-    case 'MET_UINT': return 768;
-    case 'MET_INT': return 8;
-    case 'MET_ULONG': case 'MET_ULONG_LONG': return 768;
-    case 'MET_LONG': case 'MET_LONG_LONG': return 8;
-    case 'MET_FLOAT': return 16;
-    case 'MET_DOUBLE': return 64;
-    default: throw new Error(`unsupported MetaImage ElementType "${type}"`);
+    case 'MET_UCHAR':
+      return 2;
+    case 'MET_CHAR':
+      return 256;
+    case 'MET_USHORT':
+      return 512;
+    case 'MET_SHORT':
+      return 4;
+    case 'MET_UINT':
+      return 768;
+    case 'MET_INT':
+      return 8;
+    case 'MET_ULONG':
+    case 'MET_ULONG_LONG':
+      return 768;
+    case 'MET_LONG':
+    case 'MET_LONG_LONG':
+      return 8;
+    case 'MET_FLOAT':
+      return 16;
+    case 'MET_DOUBLE':
+      return 64;
+    default:
+      throw new Error(`unsupported MetaImage ElementType "${type}"`);
   }
 }

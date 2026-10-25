@@ -43,5 +43,5 @@ export interface VolumeFormat {
 
 export function formatMatches(format: VolumeFormat, filePath: string): boolean {
   const lower = filePath.toLowerCase();
-  return format.extensions.some(ext => lower.endsWith(ext));
+  return format.extensions.some((ext) => lower.endsWith(ext));
 }

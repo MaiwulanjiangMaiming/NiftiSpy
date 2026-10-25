@@ -35,18 +35,31 @@ export interface SliceDeps {
 
 const VOLUME_BUFFER_HEADER_BYTES = 8;
 
-function createVolumeView(buffer: SharedArrayBuffer, datatype: number, length: number): Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array {
+function createVolumeView(
+  buffer: SharedArrayBuffer,
+  datatype: number,
+  length: number,
+): Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array {
   const byteOffset = VOLUME_BUFFER_HEADER_BYTES;
   switch (datatype) {
-    case 2: return new Uint8Array(buffer, byteOffset, length);
-    case 4: return new Int16Array(buffer, byteOffset, length);
-    case 8: return new Int32Array(buffer, byteOffset, length);
-    case 16: return new Float32Array(buffer, byteOffset, length);
-    case 64: return new Float64Array(buffer, byteOffset, length);
-    case 256: return new Int8Array(buffer, byteOffset, length);
-    case 512: return new Uint16Array(buffer, byteOffset, length);
-    case 768: return new Uint32Array(buffer, byteOffset, length);
-    default: return new Float32Array(buffer, byteOffset, length);
+    case 2:
+      return new Uint8Array(buffer, byteOffset, length);
+    case 4:
+      return new Int16Array(buffer, byteOffset, length);
+    case 8:
+      return new Int32Array(buffer, byteOffset, length);
+    case 16:
+      return new Float32Array(buffer, byteOffset, length);
+    case 64:
+      return new Float64Array(buffer, byteOffset, length);
+    case 256:
+      return new Int8Array(buffer, byteOffset, length);
+    case 512:
+      return new Uint16Array(buffer, byteOffset, length);
+    case 768:
+      return new Uint32Array(buffer, byteOffset, length);
+    default:
+      return new Float32Array(buffer, byteOffset, length);
   }
 }
 
@@ -62,7 +75,14 @@ export class SliceService {
 
   constructor(private readonly deps: SliceDeps) {}
 
-  private getSliceCacheKey(url: string, axis: SliceAxis, index: number, factor: number, timeIdx = 0, identity = this.deps.getFileHash()): string {
+  private getSliceCacheKey(
+    url: string,
+    axis: SliceAxis,
+    index: number,
+    factor: number,
+    timeIdx = 0,
+    identity = this.deps.getFileHash(),
+  ): string {
     return `${identity}|${url}|${axis}|${index}|${factor}|t${timeIdx}`;
   }
 
@@ -75,7 +95,15 @@ export class SliceService {
     return cached;
   }
 
-  private setCachedSlice(url: string, axis: SliceAxis, index: number, factor: number, slice: CachedSlice, timeIdx = 0, identity = this.deps.getFileHash()): void {
+  private setCachedSlice(
+    url: string,
+    axis: SliceAxis,
+    index: number,
+    factor: number,
+    slice: CachedSlice,
+    timeIdx = 0,
+    identity = this.deps.getFileHash(),
+  ): void {
     const key = this.getSliceCacheKey(url, axis, index, factor, timeIdx, identity);
     this.sliceCache.delete(key);
     this.sliceCache.set(key, slice);
@@ -93,7 +121,14 @@ export class SliceService {
     return sliceUrl.toString();
   }
 
-  async fetchSlice(url: string, axis: SliceAxis, index: number, factor: number, signal?: AbortSignal, timeIdx = 0): Promise<CachedSlice> {
+  async fetchSlice(
+    url: string,
+    axis: SliceAxis,
+    index: number,
+    factor: number,
+    signal?: AbortSignal,
+    timeIdx = 0,
+  ): Promise<CachedSlice> {
     const cached = this.getCachedSlice(url, axis, index, factor, timeIdx);
     if (cached) return cached;
     const cacheKey = this.getSliceCacheKey(url, axis, index, factor, timeIdx);
@@ -135,7 +170,12 @@ export class SliceService {
       const startedAt = performance.now();
       recordL4Fetch();
       if (signal?.aborted) throw this.deps.abortError();
-      const resp = await this.deps.fetchWithRetry(this.buildSliceUrl(url, axis, index, factor, timeIdx), undefined, this.deps.maxRetries, signal);
+      const resp = await this.deps.fetchWithRetry(
+        this.buildSliceUrl(url, axis, index, factor, timeIdx),
+        undefined,
+        this.deps.maxRetries,
+        signal,
+      );
       if (!resp.ok) {
         throw new Error(`Slice fetch failed: ${resp.status}`);
       }
@@ -158,7 +198,8 @@ export class SliceService {
         if (!decoded) throw new Error('Invalid raw slice dimensions or payload');
         data = decoded;
       } else {
-        if (!width || !height || buffer.byteLength !== width * height * 4) throw new Error('Invalid slice dimensions or payload');
+        if (!width || !height || buffer.byteLength !== width * height * 4)
+          throw new Error('Invalid slice dimensions or payload');
         data = new Float32Array(buffer);
       }
       const persisted = encodeSliceFrame(data, width, height, factor);
@@ -177,7 +218,9 @@ export class SliceService {
           const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
           db.put(dbKey, persisted).catch(() => {});
           db.evictLRU().catch(() => {});
-        } catch { /* An unavailable disk cache must not fail a successful slice fetch. */ }
+        } catch {
+          /* An unavailable disk cache must not fail a successful slice fetch. */
+        }
       }
 
       // Also store in legacy cache for backward compatibility
@@ -188,7 +231,12 @@ export class SliceService {
         type: 'bandwidthSample',
         bytes: Number(resp.headers.get('Content-Length')) || buffer.byteLength,
         durationMs: Math.max(1, decodeAt - headersAt),
-        timing: { ttfbMs: headersAt - startedAt, transferMs: decodeAt - headersAt, decodeMs: performance.now() - decodeAt, server: resp.headers.get('Server-Timing') },
+        timing: {
+          ttfbMs: headersAt - startedAt,
+          transferMs: decodeAt - headersAt,
+          decodeMs: performance.now() - decodeAt,
+          server: resp.headers.get('Server-Timing'),
+        },
       });
       return slice;
     })().finally(() => {
@@ -221,14 +269,16 @@ export class SliceService {
       let w: number, h: number;
 
       if (message.axis === 'axial') {
-        w = nx; h = ny;
+        w = nx;
+        h = ny;
         sliceData = new Float32Array(nx * ny);
         const base = idx * ny * nx;
         for (let i = 0; i < nx * ny; i++) {
           sliceData[i] = data[base + i] * slope + inter;
         }
       } else if (message.axis === 'coronal') {
-        w = nx; h = nz;
+        w = nx;
+        h = nz;
         sliceData = new Float32Array(nx * nz);
         for (let z = 0; z < nz; z++) {
           const base = z * ny * nx + idx * nx;
@@ -237,7 +287,8 @@ export class SliceService {
           }
         }
       } else {
-        w = ny; h = nz;
+        w = ny;
+        h = nz;
         sliceData = new Float32Array(ny * nz);
         for (let z = 0; z < nz; z++) {
           const base = z * ny * nx;
@@ -247,16 +298,19 @@ export class SliceService {
         }
       }
 
-      this.deps.postMessage({
-        id: message.id,
-        type: 'slice',
-        axis: message.axis,
-        index: message.index,
-        factor,
-        width: w,
-        height: h,
-        data: sliceData,
-      }, [sliceData.buffer]);
+      this.deps.postMessage(
+        {
+          id: message.id,
+          type: 'slice',
+          axis: message.axis,
+          index: message.index,
+          factor,
+          width: w,
+          height: h,
+          data: sliceData,
+        },
+        [sliceData.buffer],
+      );
       return;
     }
 
@@ -266,16 +320,19 @@ export class SliceService {
     const payload = slice.data;
     const cacheKey = this.getSliceCacheKey(message.url, message.axis, message.index, factor, timeIdx);
     this.sliceCache.delete(cacheKey);
-    this.deps.postMessage({
-      id: message.id,
-      type: 'slice',
-      axis: message.axis,
-      index: message.index,
-      factor,
-      width: slice.width,
-      height: slice.height,
-      data: payload,
-    }, [payload.buffer]);
+    this.deps.postMessage(
+      {
+        id: message.id,
+        type: 'slice',
+        axis: message.axis,
+        index: message.index,
+        factor,
+        width: slice.width,
+        height: slice.height,
+        data: payload,
+      },
+      [payload.buffer],
+    );
 
     const prefetch = Math.max(0, message.prefetch || 0);
     const maxIndex = Math.max(0, message.maxIndex || 0);

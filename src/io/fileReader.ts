@@ -8,11 +8,11 @@ import * as https from 'https';
 // too slow because every request opens a new TCP+TLS connection.
 export const httpAgent = new http.Agent({
   keepAlive: true,
-  keepAliveMsecs: 5000,  // send keep-alive probe every 5s
+  keepAliveMsecs: 5000, // send keep-alive probe every 5s
   maxSockets: 64,
   maxFreeSockets: 32,
   timeout: 60000,
-  scheduling: 'lifo',  // reuse most recent socket (warm cache)
+  scheduling: 'lifo', // reuse most recent socket (warm cache)
 });
 export const httpsAgent = new https.Agent({
   keepAlive: true,
@@ -28,18 +28,23 @@ export function getAgentForUrl(url: string): http.Agent | https.Agent {
   return url.startsWith('https:') ? httpsAgent : httpAgent;
 }
 
-const HTTP_TIMEOUT_MS = 30_000;  // 30s request timeout — prevent infinite hangs
+const HTTP_TIMEOUT_MS = 30_000; // 30s request timeout — prevent infinite hangs
 
 export function readLocalFilePartial(fsPath: string, start: number, end: number): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     const stream = fs.createReadStream(fsPath, { start, end, highWaterMark: 4 * 1024 * 1024 });
-    stream.on('data', (chunk) => { if (Buffer.isBuffer(chunk)) chunks.push(chunk); });
+    stream.on('data', (chunk) => {
+      if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+    });
     stream.on('end', () => {
       const total = chunks.reduce((s, c) => s + c.length, 0);
       const result = Buffer.alloc(total);
       let offset = 0;
-      for (const chunk of chunks) { chunk.copy(result, offset); offset += chunk.length; }
+      for (const chunk of chunks) {
+        chunk.copy(result, offset);
+        offset += chunk.length;
+      }
       resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
     });
     stream.on('error', reject);
@@ -69,7 +74,10 @@ export function readHttpPartial(urlStr: string, start: number, end: number, sign
           const total = chunks.reduce((s, c) => s + c.length, 0);
           const result = Buffer.alloc(total);
           let off = 0;
-          for (const chunk of chunks) { chunk.copy(result, off); off += chunk.length; }
+          for (const chunk of chunks) {
+            chunk.copy(result, off);
+            off += chunk.length;
+          }
           resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
         });
       } else {
@@ -82,7 +90,10 @@ export function readHttpPartial(urlStr: string, start: number, end: number, sign
       req.destroy(new Error(`HTTP request timeout after ${HTTP_TIMEOUT_MS}ms`));
     });
     if (signal) {
-      const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
+      const onAbort = () => {
+        req.destroy();
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
       signal.addEventListener('abort', onAbort, { once: true });
     }
     req.end();
@@ -147,7 +158,10 @@ export function readHttpPartialInto(
       req.destroy(new Error(`HTTP request timeout after ${HTTP_TIMEOUT_MS}ms`));
     });
     if (signal) {
-      const onAbort = () => { req.destroy(); reject(new DOMException('Aborted', 'AbortError')); };
+      const onAbort = () => {
+        req.destroy();
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
       signal.addEventListener('abort', onAbort, { once: true });
     }
     req.end();

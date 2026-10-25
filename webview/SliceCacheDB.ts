@@ -337,10 +337,10 @@ const VOL_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 import type { NiiHeader } from '../src/nifti/headerParser';
 
 export interface CachedVolumeEntry {
-  key: string;             // image URL
-  header: NiiHeader;       // structured-cloneable plain object
-  voxelData: ArrayBuffer;  // raw voxel buffer
-  datatype: number;        // NIfTI datatype code (to reconstruct typed array)
+  key: string; // image URL
+  header: NiiHeader; // structured-cloneable plain object
+  voxelData: ArrayBuffer; // raw voxel buffer
+  datatype: number; // NIfTI datatype code (to reconstruct typed array)
   min: number;
   max: number;
   slope: number;
@@ -478,18 +478,27 @@ export function getVolumeCacheDB(): VolumeCacheDB {
  */
 export function makeTypedArrayFromBuffer(
   buffer: ArrayBuffer,
-  datatype: number
+  datatype: number,
 ): Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array {
   switch (datatype) {
-    case 2: return new Uint8Array(buffer);
-    case 4: return new Int16Array(buffer);
-    case 8: return new Int32Array(buffer);
-    case 16: return new Float32Array(buffer);
-    case 64: return new Float64Array(buffer);
-    case 256: return new Int8Array(buffer);
-    case 512: return new Uint16Array(buffer);
-    case 768: return new Uint32Array(buffer);
-    default: return new Float32Array(buffer);
+    case 2:
+      return new Uint8Array(buffer);
+    case 4:
+      return new Int16Array(buffer);
+    case 8:
+      return new Int32Array(buffer);
+    case 16:
+      return new Float32Array(buffer);
+    case 64:
+      return new Float64Array(buffer);
+    case 256:
+      return new Int8Array(buffer);
+    case 512:
+      return new Uint16Array(buffer);
+    case 768:
+      return new Uint32Array(buffer);
+    default:
+      return new Float32Array(buffer);
   }
 }
 
@@ -513,13 +522,7 @@ export function deriveFileHash(fileName: string, fileSize: number): string {
 /**
  * Versioned, dimensioned slice identity including timepoint and downsample factor.
  */
-export function makeSliceCacheKey(
-  fileHash: string,
-  axis: string,
-  sliceIndex: number,
-  timeIdx = 0,
-  factor = 1,
-): string {
+export function makeSliceCacheKey(fileHash: string, axis: string, sliceIndex: number, timeIdx = 0, factor = 1): string {
   return `${fileHash}_v2_${axis}_${sliceIndex}_t${timeIdx}_f${factor}`;
 }
 

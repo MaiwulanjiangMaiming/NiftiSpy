@@ -10,21 +10,29 @@ import { getAgentForUrl } from './fileReader';
 
 export function shouldCompress(req: http.IncomingMessage): boolean {
   const acceptEncoding = req.headers['accept-encoding'] || '';
-  if (!acceptEncoding.split(',').some(part => /^\s*gzip\s*(?:;\s*q=(?!0(?:\.0*)?\s*$)[0-9.]+)?\s*$/i.test(part))) return false;
+  if (!acceptEncoding.split(',').some((part) => /^\s*gzip\s*(?:;\s*q=(?!0(?:\.0*)?\s*$)[0-9.]+)?\s*$/i.test(part)))
+    return false;
   // A localhost port forwarded by Remote-SSH still crosses the network.
   const host = req.headers['host'] || '';
   if (!isWanRemote() && /^(127\.0\.0\.1|localhost|\[::1\])(?::|$)/i.test(host)) return false;
   return true;
 }
 
-export function compressResponse(data: Buffer, req: http.IncomingMessage, res: http.ServerResponse, contentType: string, extraHeaders?: Record<string, string>): void {
+export function compressResponse(
+  data: Buffer,
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  contentType: string,
+  extraHeaders?: Record<string, string>,
+): void {
   const headers: Record<string, string> = {
     'Content-Type': contentType,
     ...extraHeaders,
   };
 
   const queuedTiming = res.getHeader('Server-Timing');
-  if (queuedTiming && extraHeaders?.['Server-Timing']) headers['Server-Timing'] = `${queuedTiming}, ${extraHeaders['Server-Timing']}`;
+  if (queuedTiming && extraHeaders?.['Server-Timing'])
+    headers['Server-Timing'] = `${queuedTiming}, ${extraHeaders['Server-Timing']}`;
   const priorVary = res.getHeader('Vary');
   res.setHeader('Vary', priorVary ? `${String(priorVary)}, Accept-Encoding` : 'Accept-Encoding');
   const encodeStartedAt = performance.now();
@@ -33,7 +41,8 @@ export function compressResponse(data: Buffer, req: http.IncomingMessage, res: h
     const body = compressed && compressed.length < data.length ? compressed : data;
     if (body !== data) headers['Content-Encoding'] = 'gzip';
     headers['Content-Length'] = String(body.length);
-    if (headers['Server-Timing']) headers['Server-Timing'] += `, encode;dur=${(performance.now() - encodeStartedAt).toFixed(2)}`;
+    if (headers['Server-Timing'])
+      headers['Server-Timing'] += `, encode;dur=${(performance.now() - encodeStartedAt).toFixed(2)}`;
     res.writeHead(200, headers);
     res.end(body);
   };
@@ -46,23 +55,37 @@ export function compressResponse(data: Buffer, req: http.IncomingMessage, res: h
 
 export function gunzipAsync(data: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
   return new Promise((resolve, reject) => {
-    if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
     zlib.gunzip(Buffer.from(data.buffer, data.byteOffset, data.byteLength), (err, result) => {
-      if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
       if (err) reject(err);
       else resolve(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
     });
   });
 }
 
-export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Promise<{ header: NiiHeader | null; axialSlice: Float32Array; coronalSlice?: Float32Array; sagittalSlice?: Float32Array }> {
+export function streamingGunzipPreview(
+  fsPath: string,
+  signal?: AbortSignal,
+): Promise<{
+  header: NiiHeader | null;
+  axialSlice: Float32Array;
+  coronalSlice?: Float32Array;
+  sagittalSlice?: Float32Array;
+}> {
   return new Promise((resolve, reject) => {
     const gunzip = zlib.createGunzip();
     const chunks: Buffer[] = [];
     let totalSize = 0;
     let resolved = false;
     let header: NiiHeader | null = null;
-    let firstSliceNeeded = Infinity;   // z=0 slice — instant preview
+    let firstSliceNeeded = Infinity; // z=0 slice — instant preview
 
     const fileStream = fs.createReadStream(fsPath);
     fileStream.pipe(gunzip);
@@ -81,7 +104,10 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
 
     gunzip.on('data', (chunk: Buffer) => {
       if (resolved) return;
-      if (signal?.aborted) { gunzip.destroy(); return; }
+      if (signal?.aborted) {
+        gunzip.destroy();
+        return;
+      }
       chunks.push(chunk);
       totalSize += chunk.length;
 
@@ -163,7 +189,10 @@ export function streamingGunzipPreview(fsPath: string, signal?: AbortSignal): Pr
   });
 }
 
-export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal): Promise<{ header: NiiHeader | null; axialSlice: Float32Array }> {
+export function streamingHttpGunzipPreview(
+  urlStr: string,
+  signal?: AbortSignal,
+): Promise<{ header: NiiHeader | null; axialSlice: Float32Array }> {
   return new Promise((resolve, reject) => {
     const url = new URL(urlStr);
     const mod = url.protocol === 'https:' ? https : http;
@@ -172,14 +201,14 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
     let totalSize = 0;
     let resolved = false;
     let header: NiiHeader | null = null;
-    let firstSliceNeeded = Infinity;   // z=0 slice — instant preview
+    let firstSliceNeeded = Infinity; // z=0 slice — instant preview
 
     const options: http.RequestOptions = {
       hostname: url.hostname,
       port: url.port || (url.protocol === 'https:' ? 443 : 80),
       path: url.pathname + url.search,
       method: 'GET',
-      agent: getAgentForUrl(urlStr),  // reuse keep-alive connections
+      agent: getAgentForUrl(urlStr), // reuse keep-alive connections
     };
 
     const req = mod.request(options, (res) => {
@@ -201,7 +230,11 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
 
       gunzip.on('data', (chunk: Buffer) => {
         if (resolved) return;
-        if (signal?.aborted) { gunzip.destroy(); req.destroy(); return; }
+        if (signal?.aborted) {
+          gunzip.destroy();
+          req.destroy();
+          return;
+        }
         chunks.push(chunk);
         totalSize += chunk.length;
 
@@ -257,10 +290,20 @@ export function streamingHttpGunzipPreview(urlStr: string, signal?: AbortSignal)
         }
       });
 
-      gunzip.on('error', (err: Error) => { if (!resolved) { resolved = true; reject(err); } });
+      gunzip.on('error', (err: Error) => {
+        if (!resolved) {
+          resolved = true;
+          reject(err);
+        }
+      });
     });
 
-    req.on('error', (err: Error) => { if (!resolved) { resolved = true; reject(err); } });
+    req.on('error', (err: Error) => {
+      if (!resolved) {
+        resolved = true;
+        reject(err);
+      }
+    });
     req.end();
   });
 }
@@ -299,16 +342,31 @@ export function streamingGunzipPreviewVolume(
     let resolved = false;
     let header: NiiHeader | null = null;
     let output: Float32Array | null = null;
-    let outNx = 0, outNy = 0, outNz = 0;
+    let outNx = 0,
+      outNy = 0,
+      outNz = 0;
     let nextNeededZ = 0;
-    let min = Infinity, max = -Infinity;
+    let min = Infinity,
+      max = -Infinity;
     let sourceStream: stream.Readable | null = null;
     let req: http.ClientRequest | null = null;
 
     const cleanup = (): void => {
-      try { gunzip.destroy(); } catch { /* best-effort cleanup */ }
-      try { (sourceStream as { destroy?: () => void })?.destroy?.(); } catch { /* best-effort cleanup */ }
-      try { req?.destroy(); } catch { /* best-effort cleanup */ }
+      try {
+        gunzip.destroy();
+      } catch {
+        /* best-effort cleanup */
+      }
+      try {
+        (sourceStream as { destroy?: () => void })?.destroy?.();
+      } catch {
+        /* best-effort cleanup */
+      }
+      try {
+        req?.destroy();
+      } catch {
+        /* best-effort cleanup */
+      }
     };
 
     const onAbort = (): void => {
@@ -323,7 +381,8 @@ export function streamingGunzipPreviewVolume(
     const tryExtractSlices = (): void => {
       if (!header || !output) return;
       const h = header;
-      const nx: number = h.nx, ny: number = h.ny;
+      const nx: number = h.nx,
+        ny: number = h.ny;
       const voxOffset: number = h.voxOffset;
       const bpv: number = Math.max(1, h.bytesPerVoxel);
       const datatype: number = h.datatype;
@@ -334,7 +393,7 @@ export function streamingGunzipPreviewVolume(
 
       // Quick guard: do we have enough decompressed data for the next
       // needed slice?  This avoids O(n) Buffer.concat on every chunk.
-      const nextSliceEnd = voxOffset + (nextNeededZ * f) * sliceByteSize + sliceByteSize;
+      const nextSliceEnd = voxOffset + nextNeededZ * f * sliceByteSize + sliceByteSize;
       if (totalSize < nextSliceEnd) return;
 
       const buf = Buffer.concat(chunks);
@@ -358,15 +417,32 @@ export function streamingGunzipPreviewVolume(
             const off = (rowBase + srcX) * bpv;
             let val: number;
             switch (datatype) {
-              case 2: val = sliceBytes[off]; break;
-              case 4: val = view.getInt16(off, le); break;
-              case 8: val = view.getInt32(off, le); break;
-              case 16: val = view.getFloat32(off, le); break;
-              case 64: val = view.getFloat64(off, le); break;
-              case 256: val = (sliceBytes[off] << 24) >> 24; break;
-              case 512: val = view.getUint16(off, le); break;
-              case 768: val = view.getUint32(off, le); break;
-              default: val = 0;
+              case 2:
+                val = sliceBytes[off];
+                break;
+              case 4:
+                val = view.getInt16(off, le);
+                break;
+              case 8:
+                val = view.getInt32(off, le);
+                break;
+              case 16:
+                val = view.getFloat32(off, le);
+                break;
+              case 64:
+                val = view.getFloat64(off, le);
+                break;
+              case 256:
+                val = (sliceBytes[off] << 24) >> 24;
+                break;
+              case 512:
+                val = view.getUint16(off, le);
+                break;
+              case 768:
+                val = view.getUint32(off, le);
+                break;
+              default:
+                val = 0;
             }
             const scaled = val * slope + inter;
             output[outRowBase + outX] = scaled;
@@ -388,7 +464,10 @@ export function streamingGunzipPreviewVolume(
 
     gunzip.on('data', (chunk: Buffer) => {
       if (resolved) return;
-      if (signal?.aborted) { cleanup(); return; }
+      if (signal?.aborted) {
+        cleanup();
+        return;
+      }
       chunks.push(chunk);
       totalSize += chunk.length;
 
@@ -477,4 +556,3 @@ export function streamingGunzipPreviewVolume(
     }
   });
 }
-

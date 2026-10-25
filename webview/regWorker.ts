@@ -18,7 +18,7 @@ import { gunzipSync } from 'fflate';
 import { parseNiiHeader, type NiiHeader } from './nii-parser';
 
 interface MovingVolumeMsg {
-  data: ArrayBuffer;             // raw voxel bytes, NIfTI order (x fastest)
+  data: ArrayBuffer; // raw voxel bytes, NIfTI order (x fastest)
   datatype: number;
   littleEndian: boolean;
   slope: number;
@@ -30,7 +30,7 @@ interface MovingVolumeMsg {
 }
 
 interface TemplateVolumeMsg {
-  data: ArrayBuffer;             // decoded float32 voxels, NIfTI order (x fastest)
+  data: ArrayBuffer; // decoded float32 voxels, NIfTI order (x fastest)
   dims: [number, number, number];
   srow_x: number[];
   srow_y: number[];
@@ -42,11 +42,11 @@ interface InitRegMsg {
   mode: 'mni' | 'custom';
   tplName: string;
   moving: MovingVolumeMsg;
-  template?: Uint8Array;         // raw NIfTI bytes (file-based template)
+  template?: Uint8Array; // raw NIfTI bytes (file-based template)
   templateVolume?: TemplateVolumeMsg; // pre-decoded reference (compare Align flow)
 }
 
-type RowMajor = Float64Array;    // 16 entries, row-major 4x4
+type RowMajor = Float64Array; // 16 entries, row-major 4x4
 
 // ── Linear algebra helpers ────────────────────────────────────────────────
 
@@ -64,41 +64,67 @@ function mulRow(a: RowMajor, b: RowMajor): RowMajor {
 
 function translation(x: number, y: number, z: number): RowMajor {
   const m = new Float64Array(16);
-  m[0] = 1; m[5] = 1; m[10] = 1; m[15] = 1;
-  m[12] = x; m[13] = y; m[14] = z;
+  m[0] = 1;
+  m[5] = 1;
+  m[10] = 1;
+  m[15] = 1;
+  m[12] = x;
+  m[13] = y;
+  m[14] = z;
   return m;
 }
 
 function rotX(a: number): RowMajor {
-  const c = Math.cos(a), s = Math.sin(a);
+  const c = Math.cos(a),
+    s = Math.sin(a);
   const m = new Float64Array(16);
-  m[0] = 1; m[5] = c; m[6] = -s; m[9] = s; m[10] = c; m[15] = 1;
+  m[0] = 1;
+  m[5] = c;
+  m[6] = -s;
+  m[9] = s;
+  m[10] = c;
+  m[15] = 1;
   return m;
 }
 
 function rotY(a: number): RowMajor {
-  const c = Math.cos(a), s = Math.sin(a);
+  const c = Math.cos(a),
+    s = Math.sin(a);
   const m = new Float64Array(16);
-  m[0] = c; m[2] = s; m[5] = 1; m[8] = -s; m[10] = c; m[15] = 1;
+  m[0] = c;
+  m[2] = s;
+  m[5] = 1;
+  m[8] = -s;
+  m[10] = c;
+  m[15] = 1;
   return m;
 }
 
 function rotZ(a: number): RowMajor {
-  const c = Math.cos(a), s = Math.sin(a);
+  const c = Math.cos(a),
+    s = Math.sin(a);
   const m = new Float64Array(16);
-  m[0] = c; m[1] = -s; m[4] = s; m[5] = c; m[10] = 1; m[15] = 1;
+  m[0] = c;
+  m[1] = -s;
+  m[4] = s;
+  m[5] = c;
+  m[10] = 1;
+  m[15] = 1;
   return m;
 }
 
 function invertAffine(m: RowMajor): RowMajor {
   const inv = new Float64Array(16);
-  const a00 = m[0], a01 = m[1], a02 = m[2];
-  const a10 = m[4], a11 = m[5], a12 = m[6];
-  const a20 = m[8], a21 = m[9], a22 = m[10];
-  const det =
-    a00 * (a11 * a22 - a12 * a21) -
-    a01 * (a10 * a22 - a12 * a20) +
-    a02 * (a10 * a21 - a11 * a20);
+  const a00 = m[0],
+    a01 = m[1],
+    a02 = m[2];
+  const a10 = m[4],
+    a11 = m[5],
+    a12 = m[6];
+  const a20 = m[8],
+    a21 = m[9],
+    a22 = m[10];
+  const det = a00 * (a11 * a22 - a12 * a21) - a01 * (a10 * a22 - a12 * a20) + a02 * (a10 * a21 - a11 * a20);
   if (!isFinite(det) || Math.abs(det) < 1e-12) return inv;
   const idet = 1 / det;
   inv[0] = (a11 * a22 - a12 * a21) * idet;
@@ -127,9 +153,18 @@ function applyAffine(m: RowMajor, x: number, y: number, z: number, out: Float64A
 
 function srowToMat(r: number[], g: number[], b: number[]): RowMajor {
   const m = new Float64Array(16);
-  m[0] = r[0]; m[1] = r[1]; m[2] = r[2]; m[3] = r[3];
-  m[4] = g[0]; m[5] = g[1]; m[6] = g[2]; m[7] = g[3];
-  m[8] = b[0]; m[9] = b[1]; m[10] = b[2]; m[11] = b[3];
+  m[0] = r[0];
+  m[1] = r[1];
+  m[2] = r[2];
+  m[3] = r[3];
+  m[4] = g[0];
+  m[5] = g[1];
+  m[6] = g[2];
+  m[7] = g[3];
+  m[8] = b[0];
+  m[9] = b[1];
+  m[10] = b[2];
+  m[11] = b[3];
   m[15] = 1;
   return m;
 }
@@ -138,8 +173,13 @@ function srowToMat(r: number[], g: number[], b: number[]): RowMajor {
 
 /** Decode raw NIfTI voxels into Float32 with scl_slope/scl_inter applied. */
 function decodeVoxels(
-  bytes: Uint8Array, datatype: number, le: boolean, offset: number,
-  n: number, slope: number, inter: number
+  bytes: Uint8Array,
+  datatype: number,
+  le: boolean,
+  offset: number,
+  n: number,
+  slope: number,
+  inter: number,
 ): Float32Array {
   const out = new Float32Array(n);
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -147,15 +187,33 @@ function decodeVoxels(
   for (let i = 0; i < n; i++) {
     let v = 0;
     switch (datatype) {
-      case 2: v = view.getUint8(base + i); break;
-      case 4: v = view.getInt16(base + i * 2, le); break;
-      case 8: v = view.getInt32(base + i * 4, le); break;
-      case 16: v = view.getFloat32(base + i * 4, le); break;
-      case 64: v = view.getFloat64(base + i * 8, le); break;
-      case 256: v = view.getInt8(base + i); break;
-      case 512: v = view.getUint16(base + i * 2, le); break;
-      case 768: v = view.getUint32(base + i * 4, le); break;
-      default: v = view.getFloat32(base + i * 4, le); break;
+      case 2:
+        v = view.getUint8(base + i);
+        break;
+      case 4:
+        v = view.getInt16(base + i * 2, le);
+        break;
+      case 8:
+        v = view.getInt32(base + i * 4, le);
+        break;
+      case 16:
+        v = view.getFloat32(base + i * 4, le);
+        break;
+      case 64:
+        v = view.getFloat64(base + i * 8, le);
+        break;
+      case 256:
+        v = view.getInt8(base + i);
+        break;
+      case 512:
+        v = view.getUint16(base + i * 2, le);
+        break;
+      case 768:
+        v = view.getUint32(base + i * 4, le);
+        break;
+      default:
+        v = view.getFloat32(base + i * 4, le);
+        break;
     }
     out[i] = v * slope + inter;
   }
@@ -170,34 +228,44 @@ function decodeVoxels(
  * Returns dims + data (layout x-fastest, same convention as NIfTI storage).
  */
 function downsampleVolume(
-  src: Float32Array, nx: number, ny: number, nz: number,
-  spacing: [number, number, number], targetMm: number
+  src: Float32Array,
+  nx: number,
+  ny: number,
+  nz: number,
+  spacing: [number, number, number],
+  targetMm: number,
 ): { dims: [number, number, number]; data: Float32Array } {
   const fovs = [nx * spacing[0], ny * spacing[1], nz * spacing[2]];
-  const dims: [number, number, number] = [
-    nx, ny, nz,
-  ];
+  const dims: [number, number, number] = [nx, ny, nz];
   for (let i = 0; i < 3; i++) {
     dims[i] = Math.max(2, Math.min(dims[i], Math.round(fovs[i] / targetMm)));
   }
-  const dn = dims[0], dny = dims[1], dnz = dims[2];
+  const dn = dims[0],
+    dny = dims[1],
+    dnz = dims[2];
   const out = new Float32Array(dn * dny * dnz);
 
   const starts = (dim: number, steps: number): Int32Array => {
     const arr = new Int32Array(steps + 1);
-    for (let o = 0; o <= steps; o++) arr[o] = Math.min(dim, Math.floor(o * dim / steps));
+    for (let o = 0; o <= steps; o++) arr[o] = Math.min(dim, Math.floor((o * dim) / steps));
     return arr;
   };
-  const sx0 = starts(nx, dn), sy0 = starts(ny, dny), sz0 = starts(nz, dnz);
+  const sx0 = starts(nx, dn),
+    sy0 = starts(ny, dny),
+    sz0 = starts(nz, dnz);
 
   for (let z = 0; z < dnz; z++) {
-    const zk0 = sz0[z], zk1 = Math.max(zk0 + 1, sz0[z + 1]);
+    const zk0 = sz0[z],
+      zk1 = Math.max(zk0 + 1, sz0[z + 1]);
     for (let y = 0; y < dny; y++) {
-      const yk0 = sy0[y], yk1 = Math.max(yk0 + 1, sy0[y + 1]);
+      const yk0 = sy0[y],
+        yk1 = Math.max(yk0 + 1, sy0[y + 1]);
       const rowBaseOut = (z * dny + y) * dn;
       for (let x = 0; x < dn; x++) {
-        const xk0 = sx0[x], xk1 = Math.max(xk0 + 1, sx0[x + 1]);
-        let acc = 0, count = 0;
+        const xk0 = sx0[x],
+          xk1 = Math.max(xk0 + 1, sx0[x + 1]);
+        let acc = 0,
+          count = 0;
         for (let zz = zk0; zz < zk1; zz++) {
           const plane = zz * nx * ny;
           for (let yy = yk0; yy < yk1; yy++) {
@@ -215,7 +283,10 @@ function downsampleVolume(
   return { dims: [dn, dny, dnz], data: out };
 }
 
-interface VolStats { lo: number; hi: number; }
+interface VolStats {
+  lo: number;
+  hi: number;
+}
 
 /** Robust 1%/99.7% range from strided sampling. */
 function robustRange(v: Float32Array): VolStats {
@@ -238,17 +309,23 @@ function normalizeInto(v: Float32Array, st: VolStats): void {
 /** Background-suppressed intensity centroid in continuous voxel coords. */
 function weightedCentroid(v: Float32Array, dims: [number, number, number]): [number, number, number] {
   const [nx, ny, nz] = dims;
-  let wsum = 0, cx = 0, cy = 0, cz = 0;
+  let wsum = 0,
+    cx = 0,
+    cy = 0,
+    cz = 0;
   const n = v.length;
   const step = Math.max(1, Math.floor(n / 200000));
   for (let idx = 0; idx < n; idx += step) {
     const val = v[idx];
-    if (val < 0.08) continue;                        // suppress air / noise floor
+    if (val < 0.08) continue; // suppress air / noise floor
     const w = (val - 0.08) * (val - 0.08) + 1e-3;
     const i = idx % nx;
     const j = ((idx - i) / nx) % ny;
     const k = Math.floor(idx / (nx * ny));
-    wsum += w; cx += i * w; cy += j * w; cz += k * w;
+    wsum += w;
+    cx += i * w;
+    cy += j * w;
+    cz += k * w;
   }
   if (!(wsum > 0)) return [(nx - 1) / 2, (ny - 1) / 2, (nz - 1) / 2];
   return [cx / wsum, cy / wsum, cz / wsum];
@@ -258,20 +335,20 @@ function weightedCentroid(v: Float32Array, dims: [number, number, number]): [num
 
 interface MovMip {
   dims: [number, number, number];
-  data: Float32Array;               // normalized
-  f: [number, number, number];      // mip->full continuous mapping factor
+  data: Float32Array; // normalized
+  f: [number, number, number]; // mip->full continuous mapping factor
 }
 
 interface TplLevel {
   dims: [number, number, number];
-  data: Float32Array;               // normalized
-  f: [number, number, number];      // level voxel -> full-res template voxel factor
+  data: Float32Array; // normalized
+  f: [number, number, number]; // level voxel -> full-res template voxel factor
   movMip: MovMip;
 }
 
 interface RegContext {
-  A_tpl: RowMajor;                  // template voxel -> world
-  invA_mov: RowMajor;               // world -> moving voxel
+  A_tpl: RowMajor; // template voxel -> world
+  invA_mov: RowMajor; // world -> moving voxel
   O_movWorld: [number, number, number];
   O_tplWorld: [number, number, number];
   levels: TplLevel[];
@@ -291,8 +368,13 @@ function clampScales(ctx: RegContext, p: Float64Array): Float64Array {
   for (let i = 0; i < 9; i++) q[i] = p[i];
   for (let i = 6; i < 9; i++) {
     const [lo, hi] = ctx.scaleLim[i - 6];
-    if (p[i] < lo) { q[i] = lo; clamped = true; }
-    else if (p[i] > hi) { q[i] = hi; clamped = true; }
+    if (p[i] < lo) {
+      q[i] = lo;
+      clamped = true;
+    } else if (p[i] > hi) {
+      q[i] = hi;
+      clamped = true;
+    }
   }
   return clamped ? q : p;
 }
@@ -301,22 +383,25 @@ function clampScales(ctx: RegContext, p: Float64Array): Float64Array {
 function forwardMatrix(p: Float64Array, O_m: [number, number, number], O_t: [number, number, number]): RowMajor {
   const R = mulRow(mulRow(rotX(p[3]), rotY(p[4])), rotZ(p[5]));
   const S = new Float64Array(16);
-  S[0] = Math.exp(p[6]); S[5] = Math.exp(p[7]); S[10] = Math.exp(p[8]); S[15] = 1;
+  S[0] = Math.exp(p[6]);
+  S[5] = Math.exp(p[7]);
+  S[10] = Math.exp(p[8]);
+  S[15] = 1;
   return mulRow(
-    mulRow(mulRow(
-      translation(O_t[0] + p[0], O_t[1] + p[1], O_t[2] + p[2]),
-      R), S),
-    translation(-O_m[0], -O_m[1], -O_m[2])
+    mulRow(mulRow(translation(O_t[0] + p[0], O_t[1] + p[1], O_t[2] + p[2]), R), S),
+    translation(-O_m[0], -O_m[1], -O_m[2]),
   );
 }
 
 /** Trilinear sample; NaN when fully outside. */
-function trilinear(
-  data: Float32Array, nx: number, ny: number, nz: number, x: number, y: number, z: number
-): number {
-  const ix = Math.floor(x), iy = Math.floor(y), iz = Math.floor(z);
+function trilinear(data: Float32Array, nx: number, ny: number, nz: number, x: number, y: number, z: number): number {
+  const ix = Math.floor(x),
+    iy = Math.floor(y),
+    iz = Math.floor(z);
   if (ix < 0 || ix > nx - 1 || iy < 0 || iy > ny - 1 || iz < 0 || iz > nz - 1) return NaN;
-  const fx = x - ix, fy = y - iy, fz = z - iz;
+  const fx = x - ix,
+    fy = y - iy,
+    fz = z - iz;
   const jx = ix === nx - 1 ? ix : ix + 1;
   const jy = iy === ny - 1 ? iy : iy + 1;
   const jz = iz === nz - 1 ? iz : iz + 1;
@@ -344,26 +429,44 @@ const histColSum = new Uint32Array(MI_BINS);
 
 const worldScratch = new Float64Array(3);
 
-interface PairAgg { r: number; mi: number; overlap: number; coverage: number; }
+interface PairAgg {
+  r: number;
+  mi: number;
+  overlap: number;
+  coverage: number;
+}
 
 /** One similarity evaluation over a coarse level grid. */
 function evaluateAtLevel(
-  ctx: RegContext, lvl: TplLevel, params: Float64Array,
-  O_m: [number, number, number], O_t: [number, number, number]
+  ctx: RegContext,
+  lvl: TplLevel,
+  params: Float64Array,
+  O_m: [number, number, number],
+  O_t: [number, number, number],
 ): { cost: number; agg: PairAgg } {
   ctx.evalCount++;
   const F = forwardMatrix(clampScales(ctx, params), O_m, O_t);
-  const G = invertAffine(F);                 // template-world -> moving-world
+  const G = invertAffine(F); // template-world -> moving-world
   const A = ctx.A_tpl;
   const Ai = ctx.invA_mov;
 
-  const tD = lvl.dims, tData = lvl.data, tf = lvl.f;
-  const mD = lvl.movMip.dims, mData = lvl.movMip.data, mf = lvl.movMip.f;
+  const tD = lvl.dims,
+    tData = lvl.data,
+    tf = lvl.f;
+  const mD = lvl.movMip.dims,
+    mData = lvl.movMip.data,
+    mf = lvl.movMip.f;
   const totalGrid = tD[0] * tD[1] * tD[2];
 
-  let sn = 0, sm = 0, snn = 0, smm = 0, snm = 0, cnt = 0;
+  let sn = 0,
+    sm = 0,
+    snn = 0,
+    smm = 0,
+    snm = 0,
+    cnt = 0;
   let valid = 0;
-  const hist = histScratch; hist.fill(0);
+  const hist = histScratch;
+  hist.fill(0);
 
   for (let kz = 0; kz < tD[2]; kz++) {
     const vz = (kz + 0.5) * tf[2] - 0.5;
@@ -387,21 +490,28 @@ function evaluateAtLevel(
         // the mip-center map: full-res voxel v sits between mips whose
         // centers are (j+0.5)*f-0.5, hence j = (v+0.5)/f - 0.5. (A multiplicative
         // map here threw most samples out of bounds and froze the optimizer.)
-        const mxp = trilinear(mData, mD[0], mD[1], mD[2],
+        const mxp = trilinear(
+          mData,
+          mD[0],
+          mD[1],
+          mD[2],
           (vxm_full + 0.5) / mf[0] - 0.5,
           (vym_full + 0.5) / mf[1] - 0.5,
-          (vzm_full + 0.5) / mf[2] - 0.5);
+          (vzm_full + 0.5) / mf[2] - 0.5,
+        );
         if (!isFinite(mxp)) continue;
         valid++;
 
-        const tv = tData[rowBaseT + kx];   // already level-native + normalized
-        if (tv < 0.02 || mxp < 0.02) continue;   // joint background rejection
+        const tv = tData[rowBaseT + kx]; // already level-native + normalized
+        if (tv < 0.02 || mxp < 0.02) continue; // joint background rejection
         cnt++;
-        sn += tv; sm += mxp;
-        snn += tv * tv; smm += mxp * mxp;
+        sn += tv;
+        sm += mxp;
+        snn += tv * tv;
+        smm += mxp * mxp;
         snm += tv * mxp;
-        const tb = Math.min(MI_BINS - 1, tv * MI_BINS | 0);
-        const mb = Math.min(MI_BINS - 1, mxp * MI_BINS | 0);
+        const tb = Math.min(MI_BINS - 1, (tv * MI_BINS) | 0);
+        const mb = Math.min(MI_BINS - 1, (mxp * MI_BINS) | 0);
         hist[tb * MI_BINS + mb]++;
       }
     }
@@ -418,12 +528,16 @@ function evaluateAtLevel(
   const den2 = (cnt * snn - sn * sn) * (cnt * smm - sm * sm);
   agg.r = den2 > 1e-12 ? num / Math.sqrt(den2) : 0;
 
-  let miSum = 0, total = 0;
-  histRowSum.fill(0); histColSum.fill(0);
+  let miSum = 0,
+    total = 0;
+  histRowSum.fill(0);
+  histColSum.fill(0);
   for (let a = 0; a < MI_BINS; a++) {
     for (let b = 0; b < MI_BINS; b++) {
       const h = hist[a * MI_BINS + b];
-      histRowSum[a] += h; histColSum[b] += h; total += h;
+      histRowSum[a] += h;
+      histColSum[b] += h;
+      total += h;
     }
   }
   const eps = 1e-12;
@@ -448,7 +562,11 @@ function evaluateAtLevel(
 
 // ── Pattern-search optimizer ──────────────────────────────────────────────
 
-interface OptimizeResult { params: Float64Array; cost: number; exhausted: boolean; }
+interface OptimizeResult {
+  params: Float64Array;
+  cost: number;
+  exhausted: boolean;
+}
 
 /**
  * Cyclic coordinate pattern search: try +/-step along every parameter,
@@ -456,10 +574,14 @@ interface OptimizeResult { params: Float64Array; cost: number; exhausted: boolea
  * nothing. Budget-capped by evaluation count and wall-clock.
  */
 function patternSearch(
-  ctx: RegContext, lvl: TplLevel,
-  startParams: Float64Array, steps: Float64Array,
-  O_m: [number, number, number], O_t: [number, number, number],
-  budgetLeftMs: number, report: (frac: number) => void
+  ctx: RegContext,
+  lvl: TplLevel,
+  startParams: Float64Array,
+  steps: Float64Array,
+  O_m: [number, number, number],
+  O_t: [number, number, number],
+  budgetLeftMs: number,
+  report: (frac: number) => void,
 ): OptimizeResult {
   const cur = startParams.slice();
   let curCost = evaluateAtLevel(ctx, lvl, cur, O_m, O_t).cost;
@@ -469,15 +591,21 @@ function patternSearch(
     let improved = false;
     for (let d = 0; d < dirs; d++) {
       const saved = cur[d];
-      let bestVal = saved, bestCost = curCost;
+      let bestVal = saved,
+        bestCost = curCost;
       for (const sign of [1, -1]) {
         cur[d] = saved + sign * steps[d];
         const c = evaluateAtLevel(ctx, lvl, cur, O_m, O_t).cost;
-        if (c < bestCost - 1e-6) { bestCost = c; bestVal = cur[d]; }
+        if (c < bestCost - 1e-6) {
+          bestCost = c;
+          bestVal = cur[d];
+        }
       }
       cur[d] = bestVal;
-      if (bestCost < curCost - 1e-6) { curCost = bestCost; improved = true; }
-      else cur[d] = saved;
+      if (bestCost < curCost - 1e-6) {
+        curCost = bestCost;
+        improved = true;
+      } else cur[d] = saved;
       if (ctx.evalCount > ctx.evalBudget) {
         report(Math.min(1, (Date.now() - tStart) / Math.max(1, budgetLeftMs)));
         return { params: cur, cost: curCost, exhausted: true };
@@ -507,8 +635,7 @@ function makeLcg(seed: number): () => number {
 async function runRegistration(msg: InitRegMsg): Promise<void> {
   const tAll = performance.now();
   const mv = msg.moving;
-  const postProgress = (pct: number, phase: string) =>
-    self.postMessage({ type: 'regProgress', pct, phase });
+  const postProgress = (pct: number, phase: string) => self.postMessage({ type: 'regProgress', pct, phase });
 
   postProgress(0.02, 'Decoding volumes');
 
@@ -531,7 +658,8 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
       tplBytes = gunzipSync(tplBytes);
     }
     const ab: ArrayBuffer = tplBytes.buffer.slice(
-      tplBytes.byteOffset, tplBytes.byteOffset + tplBytes.byteLength
+      tplBytes.byteOffset,
+      tplBytes.byteOffset + tplBytes.byteLength,
     ) as ArrayBuffer;
     try {
       hdr = parseNiiHeader(ab, false);
@@ -543,27 +671,44 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
       throw new Error(`Template size ${hdr.nx}x${hdr.ny}x${hdr.nz} out of supported range`);
     }
     tplDataFull = decodeVoxels(
-      new Uint8Array(ab), hdr.datatype, hdr.littleEndian, hdr.voxOffset, tn,
-      hdr.scl_slope || 1, hdr.scl_inter || 0
+      new Uint8Array(ab),
+      hdr.datatype,
+      hdr.littleEndian,
+      hdr.voxOffset,
+      tn,
+      hdr.scl_slope || 1,
+      hdr.scl_inter || 0,
     );
   }
   const tn = hdr.nx * hdr.ny * hdr.nz;
 
   // Actual intensity range of the template — shipped to the host so the
   // template can be added to the image list alongside the result.
-  let tplMin = Infinity, tplMax = -Infinity;
+  let tplMin = Infinity,
+    tplMax = -Infinity;
   for (let i = 0; i < tn; i++) {
     const v = tplDataFull[i];
     if (v < tplMin) tplMin = v;
     if (v > tplMax) tplMax = v;
   }
-  if (!isFinite(tplMin)) { tplMin = 0; tplMax = 1; }
+  if (!isFinite(tplMin)) {
+    tplMin = 0;
+    tplMax = 1;
+  }
   if (tplMin === tplMax) tplMax = tplMin + 1;
 
   // 2) Moving voxels -> float ----------------------------------------------
   const mn = mv.dims[0] * mv.dims[1] * mv.dims[2];
   if (mn < 64) throw new Error('Current image is too small to register');
-  const movFull = decodeVoxels(new Uint8Array(mv.data), mv.datatype, mv.littleEndian, 0, mn, mv.slope || 1, mv.inter || 0);
+  const movFull = decodeVoxels(
+    new Uint8Array(mv.data),
+    mv.datatype,
+    mv.littleEndian,
+    0,
+    mn,
+    mv.slope || 1,
+    mv.inter || 0,
+  );
 
   postProgress(0.05, 'Building pyramids');
 
@@ -573,7 +718,7 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
   // voxel size (mm, ITK-style) instead of a voxel count, so non-isotropic
   // inputs keep sane sampling along the thin-slice axis.
   const schedule = [
-    { targetMm: 8, mm: 12, deg: 13, sc: 0.20 },
+    { targetMm: 8, mm: 12, deg: 13, sc: 0.2 },
     { targetMm: 5, mm: 5, deg: 5, sc: 0.09 },
     { targetMm: 3.5, mm: 2.5, deg: 2.2, sc: 0.04 },
   ];
@@ -594,36 +739,37 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
     const tds = downsampleVolume(tplDataFull, hdr.nx, hdr.ny, hdr.nz, tplSpacing, sch.targetMm);
     const tst = robustRange(tds.data);
     normalizeInto(tds.data, tst);
-    return {
-      dims: tds.dims,
-      data: tds.data,
-      f: [hdr.nx / tds.dims[0], hdr.ny / tds.dims[1], hdr.nz / tds.dims[2]] as [number, number, number],
-      movMip: null as unknown as MovMip,
-    };
-  });
-
-  schedule.forEach((sch, li) => {
     // Same physical target size on the moving side keeps the two mips at
     // comparable sampling density regardless of each volume's anisotropy.
     const mds = downsampleVolume(movFull, mv.dims[0], mv.dims[1], mv.dims[2], movSpacing, sch.targetMm);
     const mst = robustRange(mds.data);
     normalizeInto(mds.data, mst);
-    levels[li].movMip = {
-      dims: mds.dims,
-      data: mds.data,
-      f: [mv.dims[0] / mds.dims[0], mv.dims[1] / mds.dims[1], mv.dims[2] / mds.dims[2]],
+    return {
+      dims: tds.dims,
+      data: tds.data,
+      f: [hdr.nx / tds.dims[0], hdr.ny / tds.dims[1], hdr.nz / tds.dims[2]] as [number, number, number],
+      movMip: {
+        dims: mds.dims,
+        data: mds.data,
+        f: [mv.dims[0] / mds.dims[0], mv.dims[1] / mds.dims[1], mv.dims[2] / mds.dims[2]],
+      },
     };
   });
 
   const ctx: RegContext = {
-    A_tpl, invA_mov,
+    A_tpl,
+    invA_mov,
     O_movWorld: [0, 0, 0],
     O_tplWorld: [0, 0, 0],
     levels,
     costMode: 'ncc',
     evalCount: 0,
     evalBudget: 24000,
-    scaleLim: [[-Infinity, Infinity], [-Infinity, Infinity], [-Infinity, Infinity]],
+    scaleLim: [
+      [-Infinity, Infinity],
+      [-Infinity, Infinity],
+      [-Infinity, Infinity],
+    ],
   };
 
   // 4) Initial alignment: COM-to-COM + world-extent-ratio scales ------------
@@ -671,13 +817,19 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
 
   // 6) Coarse multi-start then refine through the pyramid -------------------
   postProgress(0.1, 'Coarse alignment');
-  const rng = makeLcg((0xA53F9D1 ^ mn) >>> 0);
+  const rng = makeLcg((0xa53f9d1 ^ mn) >>> 0);
   const jitterSets: Float64Array[] = [initP.slice()];
   for (let s = 0; s < 4; s++) {
     const jp = initP.slice();
-    jp[0] += (rng() - 0.5) * 24; jp[1] += (rng() - 0.5) * 24; jp[2] += (rng() - 0.5) * 18;
-    jp[3] += (rng() - 0.5) * 0.45; jp[4] += (rng() - 0.5) * 0.45; jp[5] += (rng() - 0.5) * 0.35;
-    jp[6] += (rng() - 0.5) * 0.24; jp[7] += (rng() - 0.5) * 0.24; jp[8] += (rng() - 0.5) * 0.18;
+    jp[0] += (rng() - 0.5) * 24;
+    jp[1] += (rng() - 0.5) * 24;
+    jp[2] += (rng() - 0.5) * 18;
+    jp[3] += (rng() - 0.5) * 0.45;
+    jp[4] += (rng() - 0.5) * 0.45;
+    jp[5] += (rng() - 0.5) * 0.35;
+    jp[6] += (rng() - 0.5) * 0.24;
+    jp[7] += (rng() - 0.5) * 0.24;
+    jp[8] += (rng() - 0.5) * 0.18;
     jitterSets.push(jp);
   }
 
@@ -694,29 +846,37 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
     for (let si = 0; si < starts.length; si++) {
       const sch = schedule[li];
       const steps = new Float64Array([
-        sch.mm, sch.mm, sch.mm,
-        sch.deg * Math.PI / 180, sch.deg * Math.PI / 180, sch.deg * Math.PI / 180,
-        sch.sc, sch.sc, sch.sc,
+        sch.mm,
+        sch.mm,
+        sch.mm,
+        (sch.deg * Math.PI) / 180,
+        (sch.deg * Math.PI) / 180,
+        (sch.deg * Math.PI) / 180,
+        sch.sc,
+        sch.sc,
+        sch.sc,
       ]);
-      const res = patternSearch(ctx, lvl, starts[si], steps, wm, wt, li === 0 ? 5000 : 12000,
-        (frac) => {
-          // Progress within this restart attempt; mapped into its share of the
-          // current level's weight across restarts.
-          self.postMessage({
-            type: 'regProgress',
-            pct: Math.min(0.95, cum + levelWeights[li] * ((si + frac) / starts.length)),
-            phase: li === 0 ? 'Coarse alignment' : li === 1 ? 'Refining' : 'Fine tuning',
-            mode: ctx.costMode,
-          });
+      const res = patternSearch(ctx, lvl, starts[si], steps, wm, wt, li === 0 ? 5000 : 12000, (frac) => {
+        // Progress within this restart attempt; mapped into its share of the
+        // current level's weight across restarts.
+        self.postMessage({
+          type: 'regProgress',
+          pct: Math.min(0.95, cum + levelWeights[li] * ((si + frac) / starts.length)),
+          phase: li === 0 ? 'Coarse alignment' : li === 1 ? 'Refining' : 'Fine tuning',
+          mode: ctx.costMode,
         });
-      if (res.cost < lvBestC) { lvBestC = res.cost; lvBestP = res.params; }
+      });
+      if (res.cost < lvBestC) {
+        lvBestC = res.cost;
+        lvBestP = res.params;
+      }
       if (res.exhausted) break;
     }
     bestParams = lvBestP;
     bestCost = lvBestC;
     cum += levelWeights[li];
     postProgress(Math.min(0.92, cum), li === 2 ? 'Converged' : 'Aligned');
-    if (performance.now() - tAll > 55000) break;   // hard wall-clock guard
+    if (performance.now() - tAll > 55000) break; // hard wall-clock guard
   }
 
   // 7) Emit the transform only (ITK-SNAP style) -----------------------------
@@ -728,30 +888,50 @@ async function runRegistration(msg: InitRegMsg): Promise<void> {
   // the clamped scales, so apply the same clamp before reporting.
   bestParams = clampScales(ctx, bestParams);
   const F = forwardMatrix(bestParams, wm, wt);
-  const G = invertAffine(F);                // template-world -> moving-world
-  const M = mulRow(invA_mov, G);            // template-world -> moving voxel
+  const G = invertAffine(F); // template-world -> moving-world
+  const M = mulRow(invA_mov, G); // template-world -> moving voxel
 
   const dur = Math.round(performance.now() - tAll);
-  self.postMessage({
-    type: 'regResult',
-    mode: msg.mode,
-    alignM: Array.from(M),
-    // Template grid geometry — used by the host for the template image entry.
-    nx: hdr.nx, ny: hdr.ny, nz: hdr.nz,
-    dx: hdr.dx, dy: hdr.dy, dz: hdr.dz,
-    srow_x: hdr.srow_x, srow_y: hdr.srow_y, srow_z: hdr.srow_z,
-    orientation: hdr.orientation,
-    tplName: msg.tplName,
-    cost: bestCost, costMode: ctx.costMode,
-    durationMs: dur, evals: ctx.evalCount,
-    tplData: tplDataFull.buffer,
-    tplMin, tplMax,
-    summary: {
-      trans: [+bestParams[0].toFixed(1), +bestParams[1].toFixed(1), +bestParams[2].toFixed(1)],
-      rotDeg: [+(bestParams[3] * 180 / Math.PI).toFixed(1), +(bestParams[4] * 180 / Math.PI).toFixed(1), +(bestParams[5] * 180 / Math.PI).toFixed(1)],
-      scale: [+Math.exp(bestParams[6]).toFixed(3), +Math.exp(bestParams[7]).toFixed(3), +Math.exp(bestParams[8]).toFixed(3)],
+  self.postMessage(
+    {
+      type: 'regResult',
+      mode: msg.mode,
+      alignM: Array.from(M),
+      // Template grid geometry — used by the host for the template image entry.
+      nx: hdr.nx,
+      ny: hdr.ny,
+      nz: hdr.nz,
+      dx: hdr.dx,
+      dy: hdr.dy,
+      dz: hdr.dz,
+      srow_x: hdr.srow_x,
+      srow_y: hdr.srow_y,
+      srow_z: hdr.srow_z,
+      orientation: hdr.orientation,
+      tplName: msg.tplName,
+      cost: bestCost,
+      costMode: ctx.costMode,
+      durationMs: dur,
+      evals: ctx.evalCount,
+      tplData: tplDataFull.buffer,
+      tplMin,
+      tplMax,
+      summary: {
+        trans: [+bestParams[0].toFixed(1), +bestParams[1].toFixed(1), +bestParams[2].toFixed(1)],
+        rotDeg: [
+          +((bestParams[3] * 180) / Math.PI).toFixed(1),
+          +((bestParams[4] * 180) / Math.PI).toFixed(1),
+          +((bestParams[5] * 180) / Math.PI).toFixed(1),
+        ],
+        scale: [
+          +Math.exp(bestParams[6]).toFixed(3),
+          +Math.exp(bestParams[7]).toFixed(3),
+          +Math.exp(bestParams[8]).toFixed(3),
+        ],
+      },
     },
-  }, [tplDataFull.buffer]);
+    [tplDataFull.buffer],
+  );
 }
 
 // Small utilities used by the pipeline ---------------------------------------
@@ -765,24 +945,40 @@ function synthHeaderFromVolume(tv: TemplateVolumeMsg): NiiHeader {
   const tn = tv.dims[0] * tv.dims[1] * tv.dims[2];
   return {
     version: 1,
-    ndim: 3, nt: 1, nu: 1,
-    nx: tv.dims[0], ny: tv.dims[1], nz: tv.dims[2],
+    ndim: 3,
+    nt: 1,
+    nu: 1,
+    nx: tv.dims[0],
+    ny: tv.dims[1],
+    nz: tv.dims[2],
     dx: pixdimFromSrowLen(tv.srow_x),
     dy: pixdimFromSrowLen(tv.srow_y),
     dz: pixdimFromSrowLen(tv.srow_z),
-    dt: 0, datatype: 16, bitpix: 32,
+    dt: 0,
+    datatype: 16,
+    bitpix: 32,
     voxOffset: 0,
-    scl_slope: 1, scl_inter: 0,
-    littleEndian: true, isGzip: false,
+    scl_slope: 1,
+    scl_inter: 0,
+    littleEndian: true,
+    isGzip: false,
     bytesPerVoxel: 4,
     totalVoxels3D: tn,
     sliceSizeXY: tv.dims[0] * tv.dims[1],
     volumeBytes: tn * 4,
-    qform_code: 0, sform_code: 2,
-    quatern_b: 0, quatern_c: 0, quatern_d: 0,
-    qoffset_x: tv.srow_x[3], qoffset_y: tv.srow_y[3], qoffset_z: tv.srow_z[3],
-    srow_x: [...tv.srow_x], srow_y: [...tv.srow_y], srow_z: [...tv.srow_z],
-    descrip: '', xyzt_units: 10,
+    qform_code: 0,
+    sform_code: 2,
+    quatern_b: 0,
+    quatern_c: 0,
+    quatern_d: 0,
+    qoffset_x: tv.srow_x[3],
+    qoffset_y: tv.srow_y[3],
+    qoffset_z: tv.srow_z[3],
+    srow_x: [...tv.srow_x],
+    srow_y: [...tv.srow_y],
+    srow_z: [...tv.srow_z],
+    descrip: '',
+    xyzt_units: 10,
     orientation: 'unknown',
   };
 }

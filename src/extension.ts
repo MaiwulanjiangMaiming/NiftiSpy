@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { NiiEditorProvider } from './NiiEditorProvider';
 import { VolumeCache } from './VolumeCache';
-import { ZarrVolumeProvider } from './nifti/volumeProvider';
+import { ZarrVolumeProvider } from './nifti/zarrProvider';
 
 const HEADER_PREFIX_BYTES = 64 * 1024;
 
@@ -71,8 +71,14 @@ async function findRawHeader(uri: vscode.Uri): Promise<vscode.Uri | undefined> {
 
   const rawStem = rawName.toLowerCase().replace(/\.raw$/, '');
   candidates.sort((a, b) => {
-    const aStem = path.basename(a.path).toLowerCase().replace(/\.(nhdr|mhd|nrrd|mha)$/, '');
-    const bStem = path.basename(b.path).toLowerCase().replace(/\.(nhdr|mhd|nrrd|mha)$/, '');
+    const aStem = path
+      .basename(a.path)
+      .toLowerCase()
+      .replace(/\.(nhdr|mhd|nrrd|mha)$/, '');
+    const bStem = path
+      .basename(b.path)
+      .toLowerCase()
+      .replace(/\.(nhdr|mhd|nrrd|mha)$/, '');
     return Number(bStem === rawStem) - Number(aStem === rawStem);
   });
 
@@ -84,9 +90,12 @@ async function findRawHeader(uri: vscode.Uri): Promise<vscode.Uri | undefined> {
 }
 
 function rawEditorHtml(title: string, message: string): string {
-  const safeTitle = title.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
-  const safeMessage = message.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
-  return /* html */`<!DOCTYPE html>
+  const safeTitle = title.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!);
+  const safeMessage = message.replace(
+    /[&<>"]/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!,
+  );
+  return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -107,7 +116,15 @@ export async function activate(context: vscode.ExtensionContext) {
   // Migrate old niiFastView.* settings to niftispy.*
   const oldConfig = vscode.workspace.getConfiguration('niiFastView');
   const newConfig = vscode.workspace.getConfiguration('niftispy');
-  const migrationKeys = ['proxyPort', 'defaultColormap', 'enableLOD', 'previewMode', 'renderBackend', 'fullVolumePolicy', 'nativeAcceleration'];
+  const migrationKeys = [
+    'proxyPort',
+    'defaultColormap',
+    'enableLOD',
+    'previewMode',
+    'renderBackend',
+    'fullVolumePolicy',
+    'nativeAcceleration',
+  ];
   for (const key of migrationKeys) {
     const oldVal = oldConfig.inspect(key);
     if (oldVal?.globalValue !== undefined) {
@@ -128,36 +145,36 @@ export async function activate(context: vscode.ExtensionContext) {
   const provider = new NiiEditorProvider(context, volumeCache);
 
   // Register keyboard shortcut commands
-  const postToActiveWebview = (msg: Record<string, unknown>) => {
-    const active = (provider as unknown as { activeWebviews?: Map<string, { panel: vscode.WebviewPanel }> }).activeWebviews;
-    for (const [, entry] of active ?? []) {
-      if (entry.panel.active) {
-        entry.panel.webview.postMessage(msg);
-        break;
-      }
-    }
-  };
+  const postToActiveWebview = (msg: Record<string, unknown>) => provider.postToActiveWebview(msg);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('niftispy.scrollSliceUp', () => postToActiveWebview({ type: 'keyboard', action: 'scrollSliceUp' })),
-    vscode.commands.registerCommand('niftispy.scrollSliceDown', () => postToActiveWebview({ type: 'keyboard', action: 'scrollSliceDown' })),
-    vscode.commands.registerCommand('niftispy.setViewAxial', () => postToActiveWebview({ type: 'keyboard', action: 'setViewAxial' })),
-    vscode.commands.registerCommand('niftispy.setViewCoronal', () => postToActiveWebview({ type: 'keyboard', action: 'setViewCoronal' })),
-    vscode.commands.registerCommand('niftispy.setViewSagittal', () => postToActiveWebview({ type: 'keyboard', action: 'setViewSagittal' })),
-    vscode.commands.registerCommand('niftispy.resetView', () => postToActiveWebview({ type: 'keyboard', action: 'resetView' })),
+    vscode.commands.registerCommand('niftispy.scrollSliceUp', () =>
+      postToActiveWebview({ type: 'keyboard', action: 'scrollSliceUp' }),
+    ),
+    vscode.commands.registerCommand('niftispy.scrollSliceDown', () =>
+      postToActiveWebview({ type: 'keyboard', action: 'scrollSliceDown' }),
+    ),
+    vscode.commands.registerCommand('niftispy.setViewAxial', () =>
+      postToActiveWebview({ type: 'keyboard', action: 'setViewAxial' }),
+    ),
+    vscode.commands.registerCommand('niftispy.setViewCoronal', () =>
+      postToActiveWebview({ type: 'keyboard', action: 'setViewCoronal' }),
+    ),
+    vscode.commands.registerCommand('niftispy.setViewSagittal', () =>
+      postToActiveWebview({ type: 'keyboard', action: 'setViewSagittal' }),
+    ),
+    vscode.commands.registerCommand('niftispy.resetView', () =>
+      postToActiveWebview({ type: 'keyboard', action: 'resetView' }),
+    ),
     vscode.commands.registerCommand('niftispy.toggleDebugMode', () => provider.toggleDebugMode()),
   );
 
   // Register NIfTI editor
   context.subscriptions.push(
-    vscode.window.registerCustomEditorProvider(
-      'niftispy.nifti',
-      provider,
-      {
-        webviewOptions: { retainContextWhenHidden: true },
-        supportsMultipleEditorsPerDocument: false,
-      }
-    )
+    vscode.window.registerCustomEditorProvider('niftispy.nifti', provider, {
+      webviewOptions: { retainContextWhenHidden: true },
+      supportsMultipleEditorsPerDocument: false,
+    }),
   );
 
   // Register Zarr editor
@@ -165,10 +182,18 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerCustomEditorProvider(
       'niftispy.zarr',
       {
-        async openCustomDocument(uri: vscode.Uri, _openContext: vscode.CustomDocumentOpenContext, _token: vscode.CancellationToken): Promise<vscode.CustomDocument> {
+        async openCustomDocument(
+          uri: vscode.Uri,
+          _openContext: vscode.CustomDocumentOpenContext,
+          _token: vscode.CancellationToken,
+        ): Promise<vscode.CustomDocument> {
           return { uri, dispose: () => {} };
         },
-        async resolveCustomEditor(document: vscode.CustomDocument, webviewPanel: vscode.WebviewPanel, _token: vscode.CancellationToken): Promise<void> {
+        async resolveCustomEditor(
+          document: vscode.CustomDocument,
+          webviewPanel: vscode.WebviewPanel,
+          _token: vscode.CancellationToken,
+        ): Promise<void> {
           const uri = document.uri;
           const webview = webviewPanel.webview;
           const zarrPath = uri.fsPath || uri.toString();
@@ -192,7 +217,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
           const version = context.extension.packageJSON.version;
 
-          webview.html = /* html */`<!DOCTYPE html>
+          webview.html = /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -222,8 +247,8 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
       {
         webviewOptions: { retainContextWhenHidden: true },
         supportsMultipleEditorsPerDocument: false,
-      }
-    )
+      },
+    ),
   );
 
   // Register the .raw helper. A raw payload cannot describe itself, so this
@@ -235,10 +260,7 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
         async openCustomDocument(uri: vscode.Uri): Promise<vscode.CustomDocument> {
           return { uri, dispose: () => {} };
         },
-        async resolveCustomEditor(
-          document: vscode.CustomDocument,
-          webviewPanel: vscode.WebviewPanel,
-        ): Promise<void> {
+        async resolveCustomEditor(document: vscode.CustomDocument, webviewPanel: vscode.WebviewPanel): Promise<void> {
           const webview = webviewPanel.webview;
           webview.options = { enableScripts: false };
           const rawName = path.basename(document.uri.fsPath || document.uri.path);
@@ -248,16 +270,13 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
             webview.html = rawEditorHtml(
               'Raw volume payload',
               `${rawName} has no companion .nhdr, .mhd, .nrrd or .mha header that references it, so its dimensions and data type are unknown. ` +
-              'Create a header next to it, or open the existing header file instead.',
+                'Create a header next to it, or open the existing header file instead.',
             );
             return;
           }
 
           const headerName = path.basename(header.fsPath || header.path);
-          webview.html = rawEditorHtml(
-            'Opening volume',
-            `Using header ${headerName} for ${rawName}…`,
-          );
+          webview.html = rawEditorHtml('Opening volume', `Using header ${headerName} for ${rawName}…`);
           try {
             await vscode.commands.executeCommand('vscode.openWith', header, 'niftispy.nifti');
             webviewPanel.dispose();
@@ -269,8 +288,8 @@ h1{color:#e94560;margin-bottom:16px;font-size:24px}
       {
         webviewOptions: { retainContextWhenHidden: true },
         supportsMultipleEditorsPerDocument: false,
-      }
-    )
+      },
+    ),
   );
 }
 

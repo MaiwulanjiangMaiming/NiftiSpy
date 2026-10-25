@@ -7,9 +7,18 @@
  */
 
 export type NiiOrientation =
-  | 'RAS' | 'LAS' | 'LPS' | 'RPS'
-  | 'RSA' | 'LSA' | 'LIA' | 'RIA'
-  | 'AIR' | 'PIR' | 'RIP' | 'LIP'
+  | 'RAS'
+  | 'LAS'
+  | 'LPS'
+  | 'RPS'
+  | 'RSA'
+  | 'LSA'
+  | 'LIA'
+  | 'RIA'
+  | 'AIR'
+  | 'PIR'
+  | 'RIP'
+  | 'LIP'
   | 'unknown';
 
 export interface NiiHeader {
@@ -55,31 +64,49 @@ export interface NiiHeader {
 }
 
 export type NiiDataType =
-  | 'uint8' | 'int16' | 'int32' | 'float32'
-  | 'float64' | 'int8' | 'uint16' | 'uint32' | 'int64' | 'uint64'
-  | 'rgb24' | 'rgba32';
+  | 'uint8'
+  | 'int16'
+  | 'int32'
+  | 'float32'
+  | 'float64'
+  | 'int8'
+  | 'uint16'
+  | 'uint32'
+  | 'int64'
+  | 'uint64'
+  | 'rgb24'
+  | 'rgba32';
 
 export const DATATYPE_MAP: Record<number, { type: NiiDataType; bytes: number }> = {
-  1:    { type: 'uint8',   bytes: 1 },
-  2:    { type: 'uint8',   bytes: 1 },
-  4:    { type: 'int16',   bytes: 2 },
-  8:    { type: 'int32',   bytes: 4 },
-  16:   { type: 'float32', bytes: 4 },
-  64:   { type: 'float64', bytes: 8 },
-  128:  { type: 'rgb24',   bytes: 3 },
-  256:  { type: 'int8',    bytes: 1 },
-  512:  { type: 'uint16',  bytes: 2 },
-  768:  { type: 'uint32',  bytes: 4 },
-  1024: { type: 'int64',   bytes: 8 },
-  1280: { type: 'uint64',  bytes: 8 },
-  4096: { type: 'rgba32',  bytes: 4 },
+  1: { type: 'uint8', bytes: 1 },
+  2: { type: 'uint8', bytes: 1 },
+  4: { type: 'int16', bytes: 2 },
+  8: { type: 'int32', bytes: 4 },
+  16: { type: 'float32', bytes: 4 },
+  64: { type: 'float64', bytes: 8 },
+  128: { type: 'rgb24', bytes: 3 },
+  256: { type: 'int8', bytes: 1 },
+  512: { type: 'uint16', bytes: 2 },
+  768: { type: 'uint32', bytes: 4 },
+  1024: { type: 'int64', bytes: 8 },
+  1280: { type: 'uint64', bytes: 8 },
+  4096: { type: 'rgba32', bytes: 4 },
 };
 
 export const DATATYPE_NAMES: Record<number, string> = {
-  1: 'binary', 2: 'uint8', 4: 'int16', 8: 'int32',
-  16: 'float32', 64: 'float64', 128: 'RGB24',
-  256: 'int8', 512: 'uint16', 768: 'uint32',
-  1024: 'int64', 1280: 'uint64', 4096: 'RGBA32',
+  1: 'binary',
+  2: 'uint8',
+  4: 'int16',
+  8: 'int32',
+  16: 'float32',
+  64: 'float64',
+  128: 'RGB24',
+  256: 'int8',
+  512: 'uint16',
+  768: 'uint32',
+  1024: 'int64',
+  1280: 'uint64',
+  4096: 'RGBA32',
 };
 
 export interface ParseNiiHeaderOptions {
@@ -117,16 +144,27 @@ function detectOrientation(srow_x: number[], srow_y: number[], srow_z: number[])
     for (let off = 0; off < 3; off++) {
       const j = (i + off) % 3;
       if (Math.abs(dir_i[j]) === maxabs_i) {
-        rai_out = rai_out.substring(0, i) +
-          (dir_i[j] > 0 ? rai_start[j] : rai_end[j]) +
-          rai_out.substring(i + 1);
+        rai_out = rai_out.substring(0, i) + (dir_i[j] > 0 ? rai_start[j] : rai_end[j]) + rai_out.substring(i + 1);
         break;
       }
     }
   }
 
-  const knownOrientations: NiiOrientation[] = ['RAS', 'LAS', 'LPS', 'RPS', 'RSA', 'LSA', 'LIA', 'RIA', 'AIR', 'PIR', 'RIP', 'LIP'];
-  return knownOrientations.includes(rai_out as NiiOrientation) ? rai_out as NiiOrientation : 'unknown';
+  const knownOrientations: NiiOrientation[] = [
+    'RAS',
+    'LAS',
+    'LPS',
+    'RPS',
+    'RSA',
+    'LSA',
+    'LIA',
+    'RIA',
+    'AIR',
+    'PIR',
+    'RIP',
+    'LIP',
+  ];
+  return knownOrientations.includes(rai_out as NiiOrientation) ? (rai_out as NiiOrientation) : 'unknown';
 }
 
 function readDescrip(buf: Uint8Array): string {
@@ -174,9 +212,24 @@ function parseNifti1(buf: Uint8Array, view: DataView, le: boolean, opts: ParseNi
   const qoffset_y = view.getFloat32(272, le);
   const qoffset_z = view.getFloat32(276, le);
 
-  const srow_x = [view.getFloat32(280, le), view.getFloat32(284, le), view.getFloat32(288, le), view.getFloat32(292, le)];
-  const srow_y = [view.getFloat32(296, le), view.getFloat32(300, le), view.getFloat32(304, le), view.getFloat32(308, le)];
-  const srow_z = [view.getFloat32(312, le), view.getFloat32(316, le), view.getFloat32(320, le), view.getFloat32(324, le)];
+  const srow_x = [
+    view.getFloat32(280, le),
+    view.getFloat32(284, le),
+    view.getFloat32(288, le),
+    view.getFloat32(292, le),
+  ];
+  const srow_y = [
+    view.getFloat32(296, le),
+    view.getFloat32(300, le),
+    view.getFloat32(304, le),
+    view.getFloat32(308, le),
+  ];
+  const srow_z = [
+    view.getFloat32(312, le),
+    view.getFloat32(316, le),
+    view.getFloat32(320, le),
+    view.getFloat32(324, le),
+  ];
 
   const xyzt_units = view.getUint8(123);
   const descrip = readDescrip(buf);
@@ -184,18 +237,22 @@ function parseNifti1(buf: Uint8Array, view: DataView, le: boolean, opts: ParseNi
   const totalVoxels3D = nx * ny * nz;
   const sliceSizeXY = nx * ny;
 
-  const orientation = sform_code !== 0
-    ? detectOrientation(srow_x, srow_y, srow_z)
-    : 'RAS';
+  const orientation = sform_code !== 0 ? detectOrientation(srow_x, srow_y, srow_z) : 'RAS';
 
   return {
     version: 1,
-    ndim, nx, ny, nz, nt, nu,
+    ndim,
+    nx,
+    ny,
+    nz,
+    nt,
+    nu,
     dx: Math.abs(pixdim[1]) || 1,
     dy: Math.abs(pixdim[2]) || 1,
     dz: Math.abs(pixdim[3]) || 1,
     dt: Math.abs(pixdim[4]) || 0,
-    datatype, bitpix,
+    datatype,
+    bitpix,
     voxOffset: opts.separateImg ? 0 : Math.max(352, rawVoxOffset),
     scl_slope: scl_slope || 1,
     scl_inter: scl_inter || 0,
@@ -205,10 +262,17 @@ function parseNifti1(buf: Uint8Array, view: DataView, le: boolean, opts: ParseNi
     totalVoxels3D,
     sliceSizeXY,
     volumeBytes: totalVoxels3D * bytesPerVoxel,
-    qform_code, sform_code,
-    quatern_b, quatern_c, quatern_d,
-    qoffset_x, qoffset_y, qoffset_z,
-    srow_x, srow_y, srow_z,
+    qform_code,
+    sform_code,
+    quatern_b,
+    quatern_c,
+    quatern_d,
+    qoffset_x,
+    qoffset_y,
+    qoffset_z,
+    srow_x,
+    srow_y,
+    srow_z,
     descrip,
     xyzt_units,
     orientation,
@@ -250,27 +314,46 @@ function parseNifti2(view: DataView, le: boolean, opts: ParseNiiHeaderOptions): 
   const qoffset_y = view.getFloat32(216, le);
   const qoffset_z = view.getFloat32(220, le);
 
-  const srow_x = [view.getFloat64(224, le), view.getFloat64(232, le), view.getFloat64(240, le), view.getFloat64(248, le)];
-  const srow_y = [view.getFloat64(256, le), view.getFloat64(264, le), view.getFloat64(272, le), view.getFloat64(280, le)];
-  const srow_z = [view.getFloat64(288, le), view.getFloat64(296, le), view.getFloat64(304, le), view.getFloat64(312, le)];
+  const srow_x = [
+    view.getFloat64(224, le),
+    view.getFloat64(232, le),
+    view.getFloat64(240, le),
+    view.getFloat64(248, le),
+  ];
+  const srow_y = [
+    view.getFloat64(256, le),
+    view.getFloat64(264, le),
+    view.getFloat64(272, le),
+    view.getFloat64(280, le),
+  ];
+  const srow_z = [
+    view.getFloat64(288, le),
+    view.getFloat64(296, le),
+    view.getFloat64(304, le),
+    view.getFloat64(312, le),
+  ];
 
   const xyzt_units = view.getInt32(496, le);
   const bytesPerVoxel = datatypeBytes(datatype, bitpix);
   const totalVoxels3D = nx * ny * nz;
   const sliceSizeXY = nx * ny;
 
-  const orientation = sform_code !== 0
-    ? detectOrientation(srow_x, srow_y, srow_z)
-    : 'RAS';
+  const orientation = sform_code !== 0 ? detectOrientation(srow_x, srow_y, srow_z) : 'RAS';
 
   return {
     version: 2,
-    ndim, nx, ny, nz, nt, nu,
+    ndim,
+    nx,
+    ny,
+    nz,
+    nt,
+    nu,
     dx: Math.abs(dx) || 1,
     dy: Math.abs(dy) || 1,
     dz: Math.abs(dz) || 1,
     dt: Math.abs(dt) || 0,
-    datatype, bitpix,
+    datatype,
+    bitpix,
     voxOffset: opts.separateImg ? 0 : Math.max(544, rawVoxOffset),
     scl_slope: scl_slope || 1,
     scl_inter: scl_inter || 0,
@@ -280,10 +363,17 @@ function parseNifti2(view: DataView, le: boolean, opts: ParseNiiHeaderOptions): 
     totalVoxels3D,
     sliceSizeXY,
     volumeBytes: totalVoxels3D * bytesPerVoxel,
-    qform_code, sform_code,
-    quatern_b, quatern_c, quatern_d,
-    qoffset_x, qoffset_y, qoffset_z,
-    srow_x, srow_y, srow_z,
+    qform_code,
+    sform_code,
+    quatern_b,
+    quatern_c,
+    quatern_d,
+    qoffset_x,
+    qoffset_y,
+    qoffset_z,
+    srow_x,
+    srow_y,
+    srow_z,
     descrip: '',
     xyzt_units,
     orientation,

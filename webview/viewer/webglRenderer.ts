@@ -1,7 +1,15 @@
 import { computeChunkBands } from './chunkBands';
 
 export type ColormapFn = (t: number) => [number, number, number];
-export type TypedArray = Int8Array | Uint8Array | Int16Array | Uint16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+export type TypedArray =
+  | Int8Array
+  | Uint8Array
+  | Int16Array
+  | Uint16Array
+  | Int32Array
+  | Uint32Array
+  | Float32Array
+  | Float64Array;
 
 /** Host state the renderer reads live (range changes with the loaded volume). */
 export interface RendererDeps {
@@ -332,9 +340,18 @@ void main() {
     return shader;
   }
 
-  renderSlice(canvas: HTMLCanvasElement, sliceData: Float32Array, w: number, h: number,
-    lo: number, range: number, cmapName: string, flipX: boolean = false, flipY: boolean = false,
-    dst?: { x: number; y: number; w: number; h: number }): boolean {
+  renderSlice(
+    canvas: HTMLCanvasElement,
+    sliceData: Float32Array,
+    w: number,
+    h: number,
+    lo: number,
+    range: number,
+    cmapName: string,
+    flipX: boolean = false,
+    flipY: boolean = false,
+    dst?: { x: number; y: number; w: number; h: number },
+  ): boolean {
     if (!this.ready || !this.gl || !this.program || !this.supportsFloatTexture || !this.glCanvas) return false;
     const gl = this.gl;
     const { min: globalMin, max: globalMax } = this.deps.getDataRange();
@@ -349,7 +366,7 @@ void main() {
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
-    const filter = (this.isWebGL2 && !this.floatLinear) ? gl.NEAREST : gl.LINEAR;
+    const filter = this.isWebGL2 && !this.floatLinear ? gl.NEAREST : gl.LINEAR;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -401,7 +418,7 @@ void main() {
       // is normalized — pass the volume range for the shader's normalize
       // step (mirrors renderSlice3D and the CPU painter).
       gl.uniform1f(uDataMin, globalMin);
-      gl.uniform1f(uDataRange, (globalMax - globalMin) || 1);
+      gl.uniform1f(uDataRange, globalMax - globalMin || 1);
     } else {
       const uLo = gl.getUniformLocation(this.program, 'u_lo');
       const uHi = gl.getUniformLocation(this.program, 'u_hi');
@@ -427,14 +444,16 @@ void main() {
     gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.texCoordBuffer);
-    const tx0 = flipX ? 1 : 0, tx1 = flipX ? 0 : 1;
+    const tx0 = flipX ? 1 : 0,
+      tx1 = flipX ? 0 : 1;
     // ty polarity is INVERTED vs a naive screen-space mapping: the CPU
     // painter's default (flipY=false) draws with a negative Y scale, putting
     // image row 0 at the canvas BOTTOM. ty0/ty1 = 0/1 anchors texcoord y=0
     // (row 0) at the bottom vertices, matching that; flipY=true mirrors it.
     // The previous (flipY ? 0 : 1) polarity rendered every 2D frame
     // vertically flipped relative to the CPU path.
-    const ty0 = flipY ? 1 : 0, ty1 = flipY ? 0 : 1;
+    const ty0 = flipY ? 1 : 0,
+      ty1 = flipY ? 0 : 1;
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([tx0, ty0, tx1, ty0, tx0, ty1, tx1, ty1]), gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(aTex);
     gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, 0, 0);
@@ -462,8 +481,10 @@ void main() {
   // every slice sampled as 0, painting a uniform wash. Integer volumes now
   // use matching sized integer formats sampled via isampler3D/usampler3D
   // (see fragmentShader3DSource).
-  private mapVolumeFormat(data: TypedArray, gl2: WebGL2RenderingContext):
-    { internalFormat: number; glType: number; kind: 'float' | 'int' | 'uint' } | null {
+  private mapVolumeFormat(
+    data: TypedArray,
+    gl2: WebGL2RenderingContext,
+  ): { internalFormat: number; glType: number; kind: 'float' | 'int' | 'uint' } | null {
     if (data instanceof Uint8Array) return { internalFormat: gl2.R8UI, glType: gl2.UNSIGNED_BYTE, kind: 'uint' };
     if (data instanceof Int8Array) return { internalFormat: gl2.R8I, glType: gl2.BYTE, kind: 'int' };
     if (data instanceof Uint16Array) return { internalFormat: gl2.R16UI, glType: gl2.UNSIGNED_SHORT, kind: 'uint' };
@@ -487,7 +508,7 @@ void main() {
     const bytesPerVoxel = data.BYTES_PER_ELEMENT;
     // Integer textures cannot be LINEAR-filtered; keep LINEAR for float
     // volumes when the extension allows it.
-    const filter = (kind === 'float' && this.floatLinear) ? gl2.LINEAR : gl2.NEAREST;
+    const filter = kind === 'float' && this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
 
     const estimatedBytes = nx * ny * nz * bytesPerVoxel;
     const maxTextureSize = gl2.getParameter(gl2.MAX_TEXTURE_SIZE);
@@ -570,7 +591,7 @@ void main() {
     this.chunkNz = nz;
 
     // Integer textures cannot be LINEAR-filtered.
-    const filter = (kind === 'float' && this.floatLinear) ? gl2.LINEAR : gl2.NEAREST;
+    const filter = kind === 'float' && this.floatLinear ? gl2.LINEAR : gl2.NEAREST;
     gl2.pixelStorei(gl2.UNPACK_ALIGNMENT, 1);
 
     for (let c = 0; c < numChunks; c++) {
@@ -593,7 +614,9 @@ void main() {
         gl2.texImage3D(gl2.TEXTURE_3D, 0, internalFormat, nx, ny, chunkDepth, 0, gl2.RED, glType, chunkData);
       } catch {
         // Clean up already created chunk textures
-        for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
+        for (const t of this.texture3DChunks) {
+          gl2.deleteTexture(t);
+        }
         this.texture3DChunks = [];
         this.chunkCount = 0;
         gl2.deleteTexture(tex);
@@ -601,7 +624,9 @@ void main() {
       }
 
       if (gl2.getError() !== gl2.NO_ERROR) {
-        for (const t of this.texture3DChunks) { gl2.deleteTexture(t); }
+        for (const t of this.texture3DChunks) {
+          gl2.deleteTexture(t);
+        }
         this.texture3DChunks = [];
         this.chunkCount = 0;
         gl2.deleteTexture(tex);
@@ -627,17 +652,31 @@ void main() {
     }
   }
 
-  renderSlice3D(canvas: HTMLCanvasElement, axis: number, sliceIndex: number,
-    nx: number, ny: number, nz: number, lo: number, range: number,
-    cmapName: string, flipX: boolean = false, flipY: boolean = false,
-    slope: number = 1, inter: number = 0,
-    dst?: { x: number; y: number; w: number; h: number }): boolean {
+  renderSlice3D(
+    canvas: HTMLCanvasElement,
+    axis: number,
+    sliceIndex: number,
+    nx: number,
+    ny: number,
+    nz: number,
+    lo: number,
+    range: number,
+    cmapName: string,
+    flipX: boolean = false,
+    flipY: boolean = false,
+    slope: number = 1,
+    inter: number = 0,
+    dst?: { x: number; y: number; w: number; h: number },
+  ): boolean {
     if (!this.volume3DReady || !this.program3D || !this.isWebGL2 || !this.glCanvas) return false;
     // Pick the program matching the uploaded volume's sampler type
     // (sampler3D / isampler3D / usampler3D — see mapVolumeFormat).
-    const program = this.volume3DKind === 'int' ? this.program3DInt
-      : this.volume3DKind === 'uint' ? this.program3DUint
-        : this.program3D;
+    const program =
+      this.volume3DKind === 'int'
+        ? this.program3DInt
+        : this.volume3DKind === 'uint'
+          ? this.program3DUint
+          : this.program3D;
     if (!program) return false;
     const gl2 = this.gl as WebGL2RenderingContext;
     const { min: globalMin, max: globalMax } = this.deps.getDataRange();
@@ -695,7 +734,7 @@ void main() {
     // the volume's (slope/inter-applied) min/max before windowing — same
     // math as the CPU painter.
     gl2.uniform1f(this.u3d_dataMin, globalMin);
-    gl2.uniform1f(this.u3d_dataRange, (globalMax - globalMin) || 1);
+    gl2.uniform1f(this.u3d_dataRange, globalMax - globalMin || 1);
 
     const aPos = gl2.getAttribLocation(program, 'a_position');
     const aTex = gl2.getAttribLocation(program, 'a_texCoord');
@@ -755,8 +794,14 @@ void main() {
         const bandY = base.y + base.h * (1 - band.ty1);
         const bandH = base.h * (band.ty1 - band.ty0);
         if (bandH <= 0) continue;
-        drawChunk(texture, band.zStart, band.chunkDepth,
-          ndcQuad(canvas, { x: base.x, y: bandY, w: base.w, h: bandH }), band.ty0, band.ty1);
+        drawChunk(
+          texture,
+          band.zStart,
+          band.chunkDepth,
+          ndcQuad(canvas, { x: base.x, y: bandY, w: base.w, h: bandH }),
+          band.ty0,
+          band.ty1,
+        );
       }
     }
     if (gl2.getError() !== gl2.NO_ERROR) return false;
@@ -788,7 +833,9 @@ void main() {
     gl2.texImage2D(gl2.TEXTURE_2D, 0, gl2.RGBA, 256, 1, 0, gl2.RGBA, gl2.UNSIGNED_BYTE, lutData);
   }
 
-  isVolume3DReady(): boolean { return this.volume3DReady; }
+  isVolume3DReady(): boolean {
+    return this.volume3DReady;
+  }
 
   clearVolume3D(): void {
     if (this.texture3D && this.gl) {
@@ -890,4 +937,3 @@ void main() {
     }
   }
 }
-

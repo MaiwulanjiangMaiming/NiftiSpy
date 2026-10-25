@@ -1,8 +1,10 @@
 import type { NiiHeader } from '../nii-parser';
 
-export function getAnatomicalAxisDir(srow: number[]): { axis: number, dir: number } {
+export function getAnatomicalAxisDir(srow: number[]): { axis: number; dir: number } {
   // Find which anatomical axis this direction vector is aligned with
-  const abs0 = Math.abs(srow[0]), abs1 = Math.abs(srow[1]), abs2 = Math.abs(srow[2]);
+  const abs0 = Math.abs(srow[0]),
+    abs1 = Math.abs(srow[1]),
+    abs2 = Math.abs(srow[2]);
   let domIdx = 0;
   if (abs1 > abs0) domIdx = 1;
   if (abs2 > abs0 && abs2 > abs1) domIdx = 2;
@@ -64,24 +66,14 @@ export function computeOrientationFromQform(
   const qa = Math.sqrt(Math.max(0, 1.0 - qb * qb - qc * qc - qd * qd));
 
   // Quaternion rotation matrix
-  const srow_x = [
-    qa * qa + qb * qb - qc * qc - qd * qd,
-    2 * (qb * qc - qa * qd),
-    2 * (qb * qd + qa * qc),
-  ];
-  const srow_y = [
-    2 * (qb * qc + qa * qd),
-    qa * qa - qb * qb + qc * qc - qd * qd,
-    2 * (qc * qd - qa * qb),
-  ];
-  const srow_z = [
-    2 * (qb * qd - qa * qc),
-    2 * (qc * qd + qa * qb),
-    qa * qa - qb * qb - qc * qc + qd * qd,
-  ];
+  const srow_x = [qa * qa + qb * qb - qc * qc - qd * qd, 2 * (qb * qc - qa * qd), 2 * (qb * qd + qa * qc)];
+  const srow_y = [2 * (qb * qc + qa * qd), qa * qa - qb * qb + qc * qc - qd * qd, 2 * (qc * qd - qa * qb)];
+  const srow_z = [2 * (qb * qd - qa * qc), 2 * (qc * qd + qa * qb), qa * qa - qb * qb - qc * qc + qd * qd];
 
   // Apply voxel sizes
-  const dx = h.dx || 1, dy = h.dy || 1, dz = h.dz || 1;
+  const dx = h.dx || 1,
+    dy = h.dy || 1,
+    dz = h.dz || 1;
   const scaled_x = srow_x.map((v, i) => v * [dx, dy, dz][i]);
   const scaled_y = srow_y.map((v, i) => v * [dx, dy, dz][i]);
   const scaled_z = srow_z.map((v, i) => v * [dx, dy, dz][i]);
@@ -101,7 +93,6 @@ export function computeFlipsForHeader(h: NiiHeader) {
   return {
     axial: { flipX: xDir.dir > 0, flipY: yDir.dir < 0 },
     coronal: { flipX: xDir.dir > 0, flipY: zDir.dir < 0 },
-    sagittal: { flipX: yDir.dir > 0, flipY: zDir.dir < 0 }
+    sagittal: { flipX: yDir.dir > 0, flipY: zDir.dir < 0 },
   };
 }
-

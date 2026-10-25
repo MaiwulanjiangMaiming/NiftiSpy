@@ -35,16 +35,26 @@ export function sendPreviewVolumeBuffer(
   const voxelBuf = Buffer.from(volume.buffer, volume.byteOffset, volume.byteLength);
   const buf = Buffer.alloc(4 + headerBuf.length + 4 * 8 + voxelBuf.length);
   let offset = 0;
-  buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-  headerBuf.copy(buf, offset); offset += headerBuf.length;
-  buf.writeUInt32LE(factor, offset); offset += 4;
-  buf.writeUInt32LE(outNx, offset); offset += 4;
-  buf.writeUInt32LE(outNy, offset); offset += 4;
-  buf.writeUInt32LE(outNz, offset); offset += 4;
-  buf.writeFloatLE(min, offset); offset += 4;
-  buf.writeFloatLE(max, offset); offset += 4;
-  buf.writeFloatLE(slope, offset); offset += 4;
-  buf.writeFloatLE(inter, offset); offset += 4;
+  buf.writeUInt32LE(headerBuf.length, offset);
+  offset += 4;
+  headerBuf.copy(buf, offset);
+  offset += headerBuf.length;
+  buf.writeUInt32LE(factor, offset);
+  offset += 4;
+  buf.writeUInt32LE(outNx, offset);
+  offset += 4;
+  buf.writeUInt32LE(outNy, offset);
+  offset += 4;
+  buf.writeUInt32LE(outNz, offset);
+  offset += 4;
+  buf.writeFloatLE(min, offset);
+  offset += 4;
+  buf.writeFloatLE(max, offset);
+  offset += 4;
+  buf.writeFloatLE(slope, offset);
+  offset += 4;
+  buf.writeFloatLE(inter, offset);
+  offset += 4;
   voxelBuf.copy(buf, offset);
   compressResponse(buf, req, res, 'application/octet-stream');
 }
@@ -79,7 +89,9 @@ export async function handlePreviewVolume(
     const isGzip = fsPath ? fsPath.endsWith('.gz') : uriStr.endsWith('.gz');
 
     // A larger factor reduces conversion and transport, not the gzip inflate span.
-    const f = isGzip ? Math.max(8, Math.min(32, Math.floor(factor) || 8)) : Math.max(2, Math.min(8, Math.floor(factor) || 4));
+    const f = isGzip
+      ? Math.max(8, Math.min(32, Math.floor(factor) || 8))
+      : Math.max(2, Math.min(8, Math.floor(factor) || 4));
 
     // Local gzip: reuse the in-flight inflate (index + coarse volume).
     // HTTP gzip: sequential inflate until the last sampled z.
@@ -87,7 +99,9 @@ export async function handlePreviewVolume(
       const isHttpRemote = entry.uri.scheme === 'http' || entry.uri.scheme === 'https';
       if (fsPath || isHttpRemote) {
         const ac = new AbortController();
-        req.on('close', () => { if (!res.writableEnded) ac.abort(); });
+        req.on('close', () => {
+          if (!res.writableEnded) ac.abort();
+        });
         try {
           if (fsPath) {
             const session = host.ensureGzipScan(entry);
@@ -96,18 +110,36 @@ export async function handlePreviewVolume(
             if (lod && f >= lod.factor && f % lod.factor === 0) {
               const coarse = coarsenLod(lod, f);
               sendPreviewVolumeBuffer(
-                coarse.header, coarse.volume, f, coarse.outNx, coarse.outNy, coarse.outNz,
-                coarse.min, coarse.max, 1, 0,
-                req, res,
+                coarse.header,
+                coarse.volume,
+                f,
+                coarse.outNx,
+                coarse.outNy,
+                coarse.outNz,
+                coarse.min,
+                coarse.max,
+                1,
+                0,
+                req,
+                res,
               );
               return;
             }
             if (index) {
               const indexed = await extractStridedVolumeFromIndex(fsPath, index, f, ac.signal);
               sendPreviewVolumeBuffer(
-                indexed.header, indexed.volume, f, indexed.outNx, indexed.outNy, indexed.outNz,
-                indexed.min, indexed.max, indexed.header.scl_slope || 1, indexed.header.scl_inter || 0,
-                req, res,
+                indexed.header,
+                indexed.volume,
+                f,
+                indexed.outNx,
+                indexed.outNy,
+                indexed.outNz,
+                indexed.min,
+                indexed.max,
+                indexed.header.scl_slope || 1,
+                indexed.header.scl_inter || 0,
+                req,
+                res,
               );
               return;
             }
@@ -128,7 +160,11 @@ export async function handlePreviewVolume(
           loHeader.pixDims = [loHeader.dx, loHeader.dy, loHeader.dz];
           if (Array.isArray(result.header.sform)) {
             const sform = result.header.sform.map((row: number[]) => [...row]);
-            for (const row of sform) { row[0] *= f; row[1] *= f; row[2] *= f; }
+            for (const row of sform) {
+              row[0] *= f;
+              row[1] *= f;
+              row[2] *= f;
+            }
             loHeader.sform = sform;
           }
           const slope = result.header.scl_slope || 1;
@@ -141,16 +177,26 @@ export async function handlePreviewVolume(
           const totalLen = 4 + headerBuf.length + 4 * 8 + voxelBuf.length;
           const buf = Buffer.alloc(totalLen);
           let offset = 0;
-          buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-          headerBuf.copy(buf, offset); offset += headerBuf.length;
-          buf.writeUInt32LE(f, offset); offset += 4;
-          buf.writeUInt32LE(result.outNx, offset); offset += 4;
-          buf.writeUInt32LE(result.outNy, offset); offset += 4;
-          buf.writeUInt32LE(result.outNz, offset); offset += 4;
-          buf.writeFloatLE(result.min, offset); offset += 4;
-          buf.writeFloatLE(result.max, offset); offset += 4;
-          buf.writeFloatLE(slope, offset); offset += 4;
-          buf.writeFloatLE(inter, offset); offset += 4;
+          buf.writeUInt32LE(headerBuf.length, offset);
+          offset += 4;
+          headerBuf.copy(buf, offset);
+          offset += headerBuf.length;
+          buf.writeUInt32LE(f, offset);
+          offset += 4;
+          buf.writeUInt32LE(result.outNx, offset);
+          offset += 4;
+          buf.writeUInt32LE(result.outNy, offset);
+          offset += 4;
+          buf.writeUInt32LE(result.outNz, offset);
+          offset += 4;
+          buf.writeFloatLE(result.min, offset);
+          offset += 4;
+          buf.writeFloatLE(result.max, offset);
+          offset += 4;
+          buf.writeFloatLE(slope, offset);
+          offset += 4;
+          buf.writeFloatLE(inter, offset);
+          offset += 4;
           voxelBuf.copy(buf, offset);
           compressResponse(buf, req, res, 'application/octet-stream');
         } catch (err) {
@@ -213,7 +259,7 @@ export async function handlePreviewVolume(
     if (!isLocal && !isHttpRemote && !entry.dataCache) {
       await host.loadFileData(entry);
     }
-    const cachedData = (!isLocal && !isHttpRemote) ? entry.dataCache : null;
+    const cachedData = !isLocal && !isHttpRemote ? entry.dataCache : null;
 
     // If the full volume is already in the proxy-side VolumeCache (e.g. the
     // user viewed this file before and it hasn't been evicted), subsample
@@ -276,15 +322,32 @@ export async function handlePreviewVolume(
           const off = (rowBase + srcX) * bpv;
           let val: number;
           switch (datatype) {
-            case 2: val = sliceBytes[off]; break;
-            case 4: val = view.getInt16(off, le); break;
-            case 8: val = view.getInt32(off, le); break;
-            case 16: val = view.getFloat32(off, le); break;
-            case 64: val = view.getFloat64(off, le); break;
-            case 256: val = (sliceBytes[off] << 24) >> 24; break;
-            case 512: val = view.getUint16(off, le); break;
-            case 768: val = view.getUint32(off, le); break;
-            default: val = 0;
+            case 2:
+              val = sliceBytes[off];
+              break;
+            case 4:
+              val = view.getInt16(off, le);
+              break;
+            case 8:
+              val = view.getInt32(off, le);
+              break;
+            case 16:
+              val = view.getFloat32(off, le);
+              break;
+            case 64:
+              val = view.getFloat64(off, le);
+              break;
+            case 256:
+              val = (sliceBytes[off] << 24) >> 24;
+              break;
+            case 512:
+              val = view.getUint16(off, le);
+              break;
+            case 768:
+              val = view.getUint32(off, le);
+              break;
+            default:
+              val = 0;
           }
           output[outRowBase + outX] = val * slope + inter;
         }
@@ -301,7 +364,12 @@ export async function handlePreviewVolume(
           const z = nextZ++;
           active++;
           fetchAndExtractSlice(z)
-            .catch(err => { if (!settled) { settled = true; reject(err); } })
+            .catch((err) => {
+              if (!settled) {
+                settled = true;
+                reject(err);
+              }
+            })
             .finally(() => {
               active--;
               if (settled) return;
@@ -322,7 +390,8 @@ export async function handlePreviewVolume(
     });
 
     // ── Compute min/max from subsampled data ──
-    let min = Infinity, max = -Infinity;
+    let min = Infinity,
+      max = -Infinity;
     for (let i = 0; i < outCount; i++) {
       const v = output[i];
       if (v < min) min = v;
@@ -378,17 +447,27 @@ export async function handlePreviewVolume(
     const buf = Buffer.alloc(totalLen);
     let offset = 0;
 
-    buf.writeUInt32LE(headerBuf.length, offset); offset += 4;
-    headerBuf.copy(buf, offset); offset += headerBuf.length;
+    buf.writeUInt32LE(headerBuf.length, offset);
+    offset += 4;
+    headerBuf.copy(buf, offset);
+    offset += headerBuf.length;
 
-    buf.writeUInt32LE(f, offset); offset += 4;
-    buf.writeUInt32LE(outNx, offset); offset += 4;
-    buf.writeUInt32LE(outNy, offset); offset += 4;
-    buf.writeUInt32LE(outNz, offset); offset += 4;
-    buf.writeFloatLE(min, offset); offset += 4;
-    buf.writeFloatLE(max, offset); offset += 4;
-    buf.writeFloatLE(slope, offset); offset += 4;
-    buf.writeFloatLE(inter, offset); offset += 4;
+    buf.writeUInt32LE(f, offset);
+    offset += 4;
+    buf.writeUInt32LE(outNx, offset);
+    offset += 4;
+    buf.writeUInt32LE(outNy, offset);
+    offset += 4;
+    buf.writeUInt32LE(outNz, offset);
+    offset += 4;
+    buf.writeFloatLE(min, offset);
+    offset += 4;
+    buf.writeFloatLE(max, offset);
+    offset += 4;
+    buf.writeFloatLE(slope, offset);
+    offset += 4;
+    buf.writeFloatLE(inter, offset);
+    offset += 4;
 
     voxelBuf.copy(buf, offset);
 
@@ -407,17 +486,31 @@ export function coarsenLod(
 ): NonNullable<GzipScanSession['lod']> {
   if (factor === lod.factor) return lod;
   const step = factor / lod.factor;
-  const outNx = Math.max(1, Math.floor(lod.outNx / step)), outNy = Math.max(1, Math.floor(lod.outNy / step)), outNz = Math.max(1, Math.floor(lod.outNz / step));
+  const outNx = Math.max(1, Math.floor(lod.outNx / step)),
+    outNy = Math.max(1, Math.floor(lod.outNy / step)),
+    outNz = Math.max(1, Math.floor(lod.outNz / step));
   const volume = new Float32Array(outNx * outNy * outNz);
-  let min = Infinity, max = -Infinity;
-  for (let z = 0; z < outNz; z++) for (let y = 0; y < outNy; y++) for (let x = 0; x < outNx; x++) {
-    const v = lod.volume[((z * step) * lod.outNy + y * step) * lod.outNx + x * step];
-    volume[(z * outNy + y) * outNx + x] = v;
-    min = Math.min(min, v); max = Math.max(max, v);
-  }
-  const header: NiiHeader = { ...lod.header, nx: outNx, ny: outNy, nz: outNz, dx: lod.header.dx * step, dy: lod.header.dy * step, dz: lod.header.dz * step };
+  let min = Infinity,
+    max = -Infinity;
+  for (let z = 0; z < outNz; z++)
+    for (let y = 0; y < outNy; y++)
+      for (let x = 0; x < outNx; x++) {
+        const v = lod.volume[(z * step * lod.outNy + y * step) * lod.outNx + x * step];
+        volume[(z * outNy + y) * outNx + x] = v;
+        min = Math.min(min, v);
+        max = Math.max(max, v);
+      }
+  const header: NiiHeader = {
+    ...lod.header,
+    nx: outNx,
+    ny: outNy,
+    nz: outNz,
+    dx: lod.header.dx * step,
+    dy: lod.header.dy * step,
+    dz: lod.header.dz * step,
+  };
   header.pixDims = [header.dx, header.dy, header.dz];
-  const scaleRow = (row: number[]): number[] => row.map((v, i) => i < 3 ? v * step : v);
+  const scaleRow = (row: number[]): number[] => row.map((v, i) => (i < 3 ? v * step : v));
   header.srow_x = scaleRow(lod.header.srow_x);
   header.srow_y = scaleRow(lod.header.srow_y);
   header.srow_z = scaleRow(lod.header.srow_z);

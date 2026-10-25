@@ -20,14 +20,10 @@ export const VOLUME_FORMATS: VolumeFormat[] = [
 
 export { prepareParsedPayload } from './payload';
 
-export const VOLUME_EXTENSIONS = VOLUME_FORMATS.flatMap(f => f.extensions);
+export const VOLUME_EXTENSIONS = VOLUME_FORMATS.flatMap((f) => f.extensions);
 
 export function findVolumeFormat(filePath: string): VolumeFormat | undefined {
-  return VOLUME_FORMATS.find(f => formatMatches(f, filePath));
-}
-
-export function isHostParsedPath(filePath: string): boolean {
-  return !!findVolumeFormat(filePath);
+  return VOLUME_FORMATS.find((f) => formatMatches(f, filePath));
 }
 
 export async function parseVolumeFile(

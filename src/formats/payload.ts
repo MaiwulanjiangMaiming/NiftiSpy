@@ -49,9 +49,7 @@ export function prepareParsedPayload(header: NiiHeader, rawData: Uint8Array): Pr
 
   if (header.datatype === 64) {
     // Float64 → Float32: halves the transfer payload with no visible loss.
-    const src = new Float64Array(
-      rawData.buffer, rawData.byteOffset + header.voxOffset, totalVoxels,
-    );
+    const src = new Float64Array(rawData.buffer, rawData.byteOffset + header.voxOffset, totalVoxels);
     const dst = new Float32Array(totalVoxels);
     let lo = Infinity;
     let hi = -Infinity;
@@ -62,7 +60,10 @@ export function prepareParsedPayload(header: NiiHeader, rawData: Uint8Array): Pr
       if (v > hi) hi = v;
     }
     if (lo === hi) hi = lo + 1;
-    if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+    if (!isFinite(lo) || !isFinite(hi)) {
+      lo = 0;
+      hi = 1;
+    }
     header.datatype = 16;
     header.bitpix = 32;
     header.bytesPerVoxel = 4;

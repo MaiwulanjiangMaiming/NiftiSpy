@@ -90,29 +90,44 @@ export async function handleSlice(
 ): Promise<void> {
   const startedAt = performance.now();
   const ac = new AbortController();
-  res.once('close', () => { if (!res.writableEnded) ac.abort(); });
+  res.once('close', () => {
+    if (!res.writableEnded) ac.abort();
+  });
   try {
     const cacheKey = `${entry.id}:${axis}:${idx}:${timeIdx}:${factor}`;
     const cached = entry.sliceCache?.get(cacheKey);
     if (cached) {
       const h = entry.headerCache!;
-      compressResponse(cached.data, req, res, 'application/octet-stream',
-        sliceHeaders(h, axis, factor, startedAt, 'memory', cached.raw));
+      compressResponse(
+        cached.data,
+        req,
+        res,
+        'application/octet-stream',
+        sliceHeaders(h, axis, factor, startedAt, 'memory', cached.raw),
+      );
       return;
     }
 
     const headerFs = host.headerPath(entry);
     const dataFs = entry.unpackPath || host.dataPath(entry);
-    const isGzip = !entry.unpackPath && (dataFs ? dataFs.endsWith('.gz') : (entry.dataUri || entry.uri).toString().endsWith('.gz'));
+    const isGzip =
+      !entry.unpackPath && (dataFs ? dataFs.endsWith('.gz') : (entry.dataUri || entry.uri).toString().endsWith('.gz'));
 
     const reply = (slice: Float32Array, sampled = false) => {
       if (ac.signal.aborted) return;
       const h = entry.headerCache!;
-      if (!sampled && factor > 1) slice = sampleSlice(slice, axis === 'sagittal' ? h.ny : h.nx, axis === 'axial' ? h.ny : h.nz, factor);
+      if (!sampled && factor > 1)
+        slice = sampleSlice(slice, axis === 'sagittal' ? h.ny : h.nx, axis === 'axial' ? h.ny : h.nz, factor);
       const buf = Buffer.from(slice.buffer, slice.byteOffset, slice.byteLength);
       entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now() });
       trimSliceCache(entry);
-      compressResponse(buf, req, res, 'application/octet-stream', sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk' : 'source'));
+      compressResponse(
+        buf,
+        req,
+        res,
+        'application/octet-stream',
+        sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk' : 'source'),
+      );
     };
 
     const replyRaw = (slice: { data: Uint8Array; width: number; height: number }, raw: RawSliceMeta) => {
@@ -121,8 +136,13 @@ export async function handleSlice(
       const buf = Buffer.from(slice.data.buffer, slice.data.byteOffset, slice.data.byteLength);
       entry.sliceCache?.set(cacheKey, { data: buf, timestamp: Date.now(), raw });
       trimSliceCache(entry);
-      compressResponse(buf, req, res, 'application/octet-stream',
-        sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk-raw' : 'source-raw', raw));
+      compressResponse(
+        buf,
+        req,
+        res,
+        'application/octet-stream',
+        sliceHeaders(h, axis, factor, startedAt, entry.unpackPath ? 'disk-raw' : 'source-raw', raw),
+      );
     };
 
     if (dataFs && !isGzip) {
@@ -141,12 +161,20 @@ export async function handleSlice(
       const rawMeta = rawSliceMeta(header);
       if (rawMeta) {
         const raw = await extractLocalSliceRaw(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
-        if (!raw) { res.writeHead(404); res.end('Slice not found'); return; }
+        if (!raw) {
+          res.writeHead(404);
+          res.end('Slice not found');
+          return;
+        }
         replyRaw(raw, rawMeta);
         return;
       }
       const slice = await extractLocalSlice(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
-      if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
+      if (!slice) {
+        res.writeHead(404);
+        res.end('Slice not found');
+        return;
+      }
       reply(slice, true);
       return;
     }
@@ -168,12 +196,28 @@ export async function handleSlice(
       if (!entry.headerCache) {
         const headerBytes = await GzipIndex.readRange(dataFs, entry.gzipIndex, 0, 544);
         const header = host.parseEntryHeader(entry, headerBytes);
-        if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
+        if (!header) {
+          res.writeHead(500);
+          res.end('Failed to parse header');
+          return;
+        }
         entry.headerCache = header;
       }
       try {
-        const slice = await extractSliceFromGzipIndex(dataFs, entry.gzipIndex, entry.headerCache, axis, idx, timeIdx, ac.signal);
-        if (!slice) { res.writeHead(404); res.end('Slice not found'); return; }
+        const slice = await extractSliceFromGzipIndex(
+          dataFs,
+          entry.gzipIndex,
+          entry.headerCache,
+          axis,
+          idx,
+          timeIdx,
+          ac.signal,
+        );
+        if (!slice) {
+          res.writeHead(404);
+          res.end('Slice not found');
+          return;
+        }
         reply(slice);
         return;
       } catch {
@@ -195,10 +239,16 @@ export async function handleSlice(
           const headerUri = entry.uri.toString();
           const headerBytes = await readHttpPartial(headerUri, 0, 543);
           const header = host.parseEntryHeader(entry, headerBytes);
-          if (!header) { res.writeHead(500); res.end('Failed to parse header'); return; }
+          if (!header) {
+            res.writeHead(500);
+            res.end('Failed to parse header');
+            return;
+          }
           entry.headerCache = header;
         } catch {
-          res.writeHead(500); res.end('Failed to fetch header via HTTP Range'); return;
+          res.writeHead(500);
+          res.end('Failed to fetch header via HTTP Range');
+          return;
         }
       }
       const header = entry.headerCache;
@@ -222,12 +272,16 @@ export async function handleSlice(
         const { rawData } = await host.loadFileData(entry);
         const slice = extractSingleSlice(rawData, header, axis, idx, timeIdx);
         if (!slice) {
-          res.writeHead(404); res.end('Slice not found'); return;
+          res.writeHead(404);
+          res.end('Slice not found');
+          return;
         }
         reply(slice);
         return;
       } catch {
-        res.writeHead(500); res.end('Failed to fetch slice via HTTP Range'); return;
+        res.writeHead(500);
+        res.end('Failed to fetch slice via HTTP Range');
+        return;
       }
     }
 

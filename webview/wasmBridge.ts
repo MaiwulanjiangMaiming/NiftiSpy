@@ -15,10 +15,42 @@ import type { NiiHeader } from '../src/nifti/headerParser';
 export interface WasmBindings {
   parseHeader(data: Uint8Array): NiiHeader | null;
   extractSlice(data: Uint8Array, headerJson: string, axis: string, index: number): Float32Array | null;
-  extractPreview(data: Uint8Array): { header: NiiHeader; axial: Float32Array; coronal: Float32Array; sagittal: Float32Array; min: number; max: number } | null;
-  applyWindowLevel(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Uint8Array;
-  resampleSlice(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array;
-  getVolumeStats(data: Uint8Array, headerJson: string): { min: number; max: number; mean: number; std: number; p1: number; p5: number; p95: number; p99: number; histogram: number[] } | null;
+  extractPreview(data: Uint8Array): {
+    header: NiiHeader;
+    axial: Float32Array;
+    coronal: Float32Array;
+    sagittal: Float32Array;
+    min: number;
+    max: number;
+  } | null;
+  applyWindowLevel(
+    data: Float32Array,
+    windowLevel: number,
+    windowWidth: number,
+    globalMin: number,
+    globalMax: number,
+  ): Uint8Array;
+  resampleSlice(
+    data: Float32Array,
+    srcWidth: number,
+    srcHeight: number,
+    dstWidth: number,
+    dstHeight: number,
+  ): Float32Array;
+  getVolumeStats(
+    data: Uint8Array,
+    headerJson: string,
+  ): {
+    min: number;
+    max: number;
+    mean: number;
+    std: number;
+    p1: number;
+    p5: number;
+    p95: number;
+    p99: number;
+    histogram: number[];
+  } | null;
   hasSimd(): boolean;
 }
 
@@ -39,12 +71,24 @@ function bytesToFloat32(bytes: Uint8Array): Float32Array {
 }
 
 interface WasmExports {
-  wasm_parse_header(data: Uint8Array): string | null;
-  wasm_extract_slice(data: Uint8Array, headerJson: string, axis: string, index: number): Uint8Array | null;
-  wasm_extract_preview(data: Uint8Array): string | null;
-  wasm_apply_window_level(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Uint8Array;
-  wasm_resample_slice(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Uint8Array;
-  wasm_get_volume_stats(data: Uint8Array, headerJson: string): string | null;
+  wasm_parse_header(data: Uint8Array): string | undefined;
+  wasm_extract_slice(data: Uint8Array, headerJson: string, axis: string, index: number): Uint8Array | undefined;
+  wasm_extract_preview(data: Uint8Array): string | undefined;
+  wasm_apply_window_level(
+    data: Float32Array,
+    windowLevel: number,
+    windowWidth: number,
+    globalMin: number,
+    globalMax: number,
+  ): Uint8Array;
+  wasm_resample_slice(
+    data: Float32Array,
+    srcWidth: number,
+    srcHeight: number,
+    dstWidth: number,
+    dstHeight: number,
+  ): Uint8Array;
+  wasm_get_volume_stats(data: Uint8Array, headerJson: string): string | undefined;
   wasm_has_simd(): boolean;
 }
 
@@ -52,7 +96,7 @@ function wrapWasmExports(exports: WasmExports): WasmBindings {
   return {
     parseHeader(data: Uint8Array): NiiHeader | null {
       const json = exports.wasm_parse_header(data);
-      return json ? JSON.parse(json) as NiiHeader : null;
+      return json ? (JSON.parse(json) as NiiHeader) : null;
     },
 
     extractSlice(data: Uint8Array, headerJson: string, axis: string, index: number): Float32Array | null {
@@ -74,11 +118,23 @@ function wrapWasmExports(exports: WasmExports): WasmBindings {
       };
     },
 
-    applyWindowLevel(data: Float32Array, windowLevel: number, windowWidth: number, globalMin: number, globalMax: number): Uint8Array {
+    applyWindowLevel(
+      data: Float32Array,
+      windowLevel: number,
+      windowWidth: number,
+      globalMin: number,
+      globalMax: number,
+    ): Uint8Array {
       return new Uint8Array(exports.wasm_apply_window_level(data, windowLevel, windowWidth, globalMin, globalMax));
     },
 
-    resampleSlice(data: Float32Array, srcWidth: number, srcHeight: number, dstWidth: number, dstHeight: number): Float32Array {
+    resampleSlice(
+      data: Float32Array,
+      srcWidth: number,
+      srcHeight: number,
+      dstWidth: number,
+      dstHeight: number,
+    ): Float32Array {
       const bytes = exports.wasm_resample_slice(data, srcWidth, srcHeight, dstWidth, dstHeight);
       return bytesToFloat32(new Uint8Array(bytes));
     },
@@ -86,7 +142,17 @@ function wrapWasmExports(exports: WasmExports): WasmBindings {
     getVolumeStats(data: Uint8Array, headerJson: string) {
       const json = exports.wasm_get_volume_stats(data, headerJson);
       if (!json) return null;
-      return JSON.parse(json) as { min: number; max: number; mean: number; std: number; p1: number; p5: number; p95: number; p99: number; histogram: number[] };
+      return JSON.parse(json) as {
+        min: number;
+        max: number;
+        mean: number;
+        std: number;
+        p1: number;
+        p5: number;
+        p95: number;
+        p99: number;
+        histogram: number[];
+      };
     },
 
     hasSimd(): boolean {
@@ -110,7 +176,7 @@ export async function initWasmBindings(): Promise<WasmBindings | null> {
     // Initialize the WASM instance
     await wasmModule.default();
 
-    const bindings = wrapWasmExports(wasmModule as unknown as WasmExports);
+    const bindings = wrapWasmExports(wasmModule);
     wasmInstance = bindings;
 
     // Log SIMD status

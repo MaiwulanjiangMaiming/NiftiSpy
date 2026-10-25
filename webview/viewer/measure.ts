@@ -1,7 +1,23 @@
 export type Axis = 'axial' | 'coronal' | 'sagittal';
 
-interface LineMeasurement { type: 'line'; axis: Axis; x1: number; y1: number; x2: number; y2: number; distance: number; }
-interface RoiMeasurement { type: 'roi'; axis: Axis; x1: number; y1: number; x2: number; y2: number; area: number; }
+interface LineMeasurement {
+  type: 'line';
+  axis: Axis;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  distance: number;
+}
+interface RoiMeasurement {
+  type: 'roi';
+  axis: Axis;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  area: number;
+}
 export type Measurement = LineMeasurement | RoiMeasurement;
 export function drawMeasurements(measurements: Measurement[], highContrast: boolean): void {
   for (const axis of ['axial', 'coronal', 'sagittal'] as const) {
@@ -17,7 +33,7 @@ export function drawMeasurements(measurements: Measurement[], highContrast: bool
     if (!ctx) continue;
     ctx.clearRect(0, 0, measureCanvas.width, measureCanvas.height);
     ctx.scale(dpr, dpr);
-    const axisMeasurements = measurements.filter(m => m.axis === axis);
+    const axisMeasurements = measurements.filter((m) => m.axis === axis);
     for (const m of axisMeasurements) {
       if (m.type === 'line') {
         ctx.strokeStyle = '#00ff00';
@@ -49,4 +65,3 @@ export function drawMeasurements(measurements: Measurement[], highContrast: bool
     }
   }
 }
-

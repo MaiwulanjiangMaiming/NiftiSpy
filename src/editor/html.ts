@@ -6,7 +6,7 @@ export function buildViewerHtml(webview: vscode.Webview, extensionUri: vscode.Ur
   const workerUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'worker.js'));
   const regWorkerUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'regWorker.js'));
 
-  return /* html */`<!DOCTYPE html>
+  return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
