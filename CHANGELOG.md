@@ -2,6 +2,19 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [3.0.0] - 2026-10-25
+
+### Changed — Architecture
+- Split the remaining monoliths into focused modules without changing behaviour: `viewer.ts` keeps state and wiring while `viewer/interaction.ts` owns input handling; `worker.ts` keeps message routing and state while `worker/transfer.ts` owns chunked, parallel and streaming downloads; `LocalFileProxy.ts` delegates previews to `proxy/localPreview.ts`; the volume provider separates the chunk cache and the Zarr provider.
+- Replace the remaining `as unknown as` casts with typed payloads and shared `NiiHeader` handling, and add `npm run format:check` to CI so Prettier covers every source file.
+
+### Added — Coverage
+- Direct tests for `GzipVolumeLoader`, `webview/worker/net.ts`, `RegistrationController`, `LocalVolumeLoader`, the HTTP range stream, and the volume-mode arcball rotation.
+
+### Fixed — CI and packaging
+- Track the generated WASM bindings; a clean checkout previously failed `tsc` and `esbuild` on `./wasm/niftispy_wasm` because the directory ignored itself.
+- Replace the retired `macos-13` runner with `macos-15-intel` so the darwin-x64 binary is built and release packaging can finish.
+
 ## [2.3.3] - 2026-10-15
 
 ### Fixed — Remote loading and display

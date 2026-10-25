@@ -155,7 +155,7 @@ NiftiSpy uses a preview-first pipeline so large images become viewable quickly b
 4. Full-volume loading runs in workers and is debounced during rapid image switching.
 5. Slice requests, cached volumes, and cleanup logic reduce repeated decode and transfer cost.
 
-For Remote-SSH `.nii.gz` files, version 2.3.3 builds a seekable cache on the remote host in one streaming decompression pass. Later slices read from that cache; only the requested plane crosses the tunnel. Server-side downsampling reduces interactive slice payloads, and gzip transport compresses the Float32 values losslessly. Full-resolution source volumes retain their original data.
+For Remote-SSH `.nii.gz` files, version 3.0.0 builds a seekable cache on the remote host in one streaming decompression pass. Later slices read from that cache; only the requested plane crosses the tunnel. Server-side downsampling reduces interactive slice payloads, and gzip transport compresses the Float32 values losslessly. Full-resolution source volumes retain their original data.
 
 The first preview skips uniform background planes, then advances to the center plane and complete orthogonal views. Verified center previews and coarse volumes are persisted for repeat opens. Background previews stop changing the view after the user scrolls.
 
