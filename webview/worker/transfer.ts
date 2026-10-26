@@ -51,6 +51,13 @@ export interface TransferHost {
 // costs zero extra memory and zero re-download of completed bytes.
 const MAX_POOL_ROUNDS = 3;
 
+// A gzip low-res preview makes the proxy inflate the ENTIRE stream into a
+// seekable disk cache before it can answer (handlePreviewVolume →
+// ensureGzipScan → unpackGzipToCache). Below this compressed size the full
+// volume lands sooner than that preview, and the server-side unpack competes
+// with the tunnel for CPU and disk — so small gzip files skip the preview.
+const GZIP_PREVIEW_MIN_BYTES = 2 * 1024 * 1024;
+
 export class TransferEngine {
   constructor(private readonly host: TransferHost) {}
 
@@ -829,7 +836,9 @@ export class TransferEngine {
 
     // Now that the link is measured, fire the low-res preview fetch with a
     // factor scaled to the REAL bandwidth (it must not stall the first image).
-    firePreview?.(measuredBps);
+    // Small gzip files are the exception: the proxy would have to inflate the
+    // whole stream to answer, which is slower than just finishing the download.
+    if (!isGzip || totalSize >= GZIP_PREVIEW_MIN_BYTES) firePreview?.(measuredBps);
 
     const { chunkSize: CHUNK_SIZE, maxConcurrent: MAX_CONCURRENT } = computeAdaptiveParams(
       measuredBps || estimatedBps,
@@ -904,6 +913,12 @@ export class TransferEngine {
     let writeOffset = 0;
     let previewSent = false;
     let lastProgressTime = 0;
+    // Decompressor/write failures are fatal — refetching network bytes cannot
+    // fix a broken stream, so resume rounds must not be attempted for them.
+    // Declared BEFORE the reader loop so its failure handler can record the
+    // first fatal error and unblock the download pool instead of leaving it
+    // waiting for chunks that can never be fed.
+    let fatalStreamError: Error | null = null;
 
     // Concurrent decompression reader — runs alongside downloads
     const decompressPromise = (async () => {
@@ -923,7 +938,11 @@ export class TransferEngine {
         writeOffset += value.byteLength;
 
         if (!previewSent) {
-          previewSent = this.tryEmitEarlyPreview(result, writeOffset, id, true);
+          try {
+            previewSent = this.tryEmitEarlyPreview(result, writeOffset, id, true);
+          } catch {
+            // An unparseable header must not kill the decompression stream.
+          }
           if (previewSent) {
             self.postMessage({ id, type: 'progress', value: 0.5, stage: 'decompressing (parallel)' });
           }
@@ -937,7 +956,17 @@ export class TransferEngine {
           self.postMessage({ id, type: 'progress', value: pct, stage: 'decompressing (parallel)' });
         }
       }
-    })();
+    })().catch((err) => {
+      // The stream is dead. Keep the FIRST failure (it is the root cause) and
+      // abort the writable side so pending/future writes reject instead of
+      // waiting forever for a stream that will never drain again.
+      fatalStreamError = fatalStreamError || asError(err);
+      try {
+        writer.abort(fatalStreamError).catch(() => {});
+      } catch {
+        /* writer already released — stream cleanup is best effort */
+      }
+    });
 
     const remainingStart = probeSize;
     const numChunks = Math.ceil((totalSize - remainingStart) / chunkSize);
@@ -947,9 +976,6 @@ export class TransferEngine {
     const MAX_PENDING = maxConcurrent * 2;
     let nextFeedIdx = 0;
     let downloadError: Error | null = null;
-    // Decompressor/write failures are fatal — refetching network bytes cannot
-    // fix a broken stream, so resume rounds must not be attempted for them.
-    let fatalStreamError: Error | null = null;
 
     // Batch feed: merge consecutive pending chunks into a single writer.write()
     // to reduce await overhead and improve throughput.
@@ -1004,6 +1030,21 @@ export class TransferEngine {
       new Promise((resolve, reject) => {
         let running = 0;
         let launched = 0;
+        let settled = false;
+        const settle = (fn: () => void): void => {
+          if (settled) return;
+          settled = true;
+          fn();
+        };
+        // A broken decompressor never recovers. Reject the round the moment it
+        // is noticed instead of waiting for chunks that can never be fed — that
+        // wait is what left the worker (and the loading bar) hanging forever.
+        const rejectIfStreamBroken = (): boolean => {
+          const fatal = fatalStreamError;
+          if (!fatal) return false;
+          settle(() => reject(fatal));
+          return true;
+        };
         const tryLaunch = (): void => {
           while (running < effectiveMaxConcurrent && launched < numChunks && !fatalStreamError) {
             const idx = launched++;
@@ -1041,7 +1082,7 @@ export class TransferEngine {
               } catch (err) {
                 if (isAbortError(err)) {
                   downloadError = asError(err);
-                  reject(err);
+                  settle(() => reject(err));
                   return;
                 }
                 failureCount++;
@@ -1054,13 +1095,15 @@ export class TransferEngine {
                 if (!downloadError) downloadError = asError(err);
               }
               running--;
+              if (rejectIfStreamBroken()) return;
               if (launched >= numChunks && running === 0) {
-                resolve();
+                settle(resolve);
               } else tryLaunch();
             })();
           }
+          if (rejectIfStreamBroken()) return;
           if (launched >= numChunks && running === 0) {
-            resolve();
+            settle(resolve);
           }
         };
         tryLaunch();
@@ -1099,6 +1142,9 @@ export class TransferEngine {
       }
       await writer.close();
       await decompressPromise;
+      // Surface the original stream failure (corrupt gzip, dead reader) instead
+      // of returning a silently truncated volume.
+      if (fatalStreamError) throw fatalStreamError;
     } catch (err) {
       downloadError = downloadError || (err as Error);
     } finally {

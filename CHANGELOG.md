@@ -2,6 +2,12 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [3.0.1] - 2026-10-26
+
+### Fixed — Remote-SSH `.nii.gz`
+- Skip the low-resolution preview request for gzip files under 2 MB on the Remote-SSH fast path. The proxy can only answer that request after inflating the whole stream into a seekable disk cache, which competed with the tunnel for CPU and disk and delayed the first image by minutes; these files now finish the plain parallel download directly.
+- Reject the download round as soon as the streaming decompressor fails instead of waiting for chunks that can never be fed. A broken gzip now falls through to the streaming fallback with a real error instead of leaving the loading bar hanging.
+
 ## [3.0.0] - 2026-10-25
 
 ### Changed — Architecture
