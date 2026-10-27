@@ -79,7 +79,15 @@ export class LocalFileProxy {
   private readonly previewHost: PreviewHost;
   private readonly localPreviewHost: LocalPreviewHost;
 
-  constructor(volumeCache?: VolumeCache) {
+  constructor(
+    volumeCache?: VolumeCache,
+    /**
+     * Optional per-request trace sink (route + status + latency). The webview
+     * lives on another machine in Remote-SSH, so the only way to tell whether
+     * a slice never arrived or arrived broken is to log it host-side.
+     */
+    private readonly accessLog?: (line: string) => void,
+  ) {
     this.volumeCache = volumeCache || null;
     this.sliceHost = {
       headerPath: (entry) => this.headerPath(entry),
@@ -219,6 +227,16 @@ export class LocalFileProxy {
 
   getEntry(entryId: string): FileEntry | undefined {
     return this.files.get(entryId);
+  }
+
+  /**
+   * Loopback URL the extension host itself can fetch. In Remote-SSH the
+   * webview only reaches the proxy through VS Code's port forwarding, which
+   * can be slow to establish or unavailable; the host always can.
+   */
+  internalFileUrl(entryId: string): string | null {
+    if (!this.files.has(entryId)) return null;
+    return `http://127.0.0.1:${this.port}/${this.token}/file/${entryId}`;
   }
 
   getEntryIdByUri(uri: vscode.Uri): string | undefined {
@@ -434,6 +452,14 @@ export class LocalFileProxy {
       return;
     }
 
+    if (this.accessLog) {
+      const accessStart = Date.now();
+      // Log the route only: the path prefix is the session capability token.
+      _res.once('finish', () => {
+        this.accessLog?.(`[proxy] ${_req.method} ${routePath} -> ${_res.statusCode} ${Date.now() - accessStart}ms`);
+      });
+    }
+
     this.stats.totalRequests++;
 
     const statsMatch = routePath === '/stats';
@@ -539,6 +565,9 @@ export class LocalFileProxy {
               this.sliceHost,
               timeIdx,
               Math.max(1, Math.min(32, Math.floor(Number(query.get('factor'))) || 1)),
+              // fmt=f32 asks for scaled Float32 instead of raw int16; the
+              // host-side Remote-SSH relay cannot expand raw slices.
+              query.get('fmt') !== 'f32',
             );
             return;
           }

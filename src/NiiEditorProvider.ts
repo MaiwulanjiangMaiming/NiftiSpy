@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
+import * as http from 'http';
 import { LocalFileProxy } from './LocalFileProxy';
 import { LoadQueue } from './editor/loadQueue';
 import { computeVoxelStats } from './editor/stats';
@@ -46,6 +47,9 @@ interface PerfReportMessage {
   viewSetupMs?: number;
   ext?: PerfExt;
 }
+
+/** Cap for the on-disk webview trace; stops writing instead of growing forever. */
+const DIAG_FILE_MAX_BYTES = 4 * 1024 * 1024;
 
 export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   private proxy: LocalFileProxy | null = null;
@@ -103,6 +107,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
   // Persists across sessions via workspaceState. Initial value also honors
   // the "niftispy.showPerfReport" setting for backward compatibility.
   private debugMode = false;
+  /** Diagnostics file (see persistDiag); '' means unavailable this session. */
+  private diagFile: string | null = null;
+  private diagBytes = 0;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -173,6 +180,160 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
     this.perfChannel.appendLine(line);
     if (this.debugMode) {
       this.perfChannel.show(true);
+    }
+    this.persistDiag(line);
+  }
+
+  /**
+   * Mirror the perf/webview trace to a file inside the remote global storage.
+   * A Remote-SSH webview console is not written anywhere on disk, so after a
+   * "the image does not follow my scroll" report this file is the only
+   * evidence of what the webview and the proxy actually did.
+   */
+  private persistDiag(line: string): void {
+    if (this.diagFile === null) {
+      try {
+        const dir = this.context.globalStorageUri.fsPath;
+        fs.mkdirSync(dir, { recursive: true });
+        this.diagFile = path.join(dir, 'niftispy-webview.log');
+        const version = (this.context.extension?.packageJSON?.version as string | undefined) || '?';
+        const stamp = `${new Date().toISOString()} NiftiSpy ${version} remote=${vscode.env.remoteName || 'local'}\n`;
+        fs.writeFileSync(this.diagFile, stamp, 'utf8');
+        this.diagBytes = stamp.length;
+      } catch {
+        this.diagFile = '';
+        return;
+      }
+    }
+    if (!this.diagFile || this.diagBytes > DIAG_FILE_MAX_BYTES) return;
+    const entry = `${new Date().toISOString()} ${line}\n`;
+    this.diagBytes += entry.length;
+    try {
+      fs.appendFile(this.diagFile, entry, () => {});
+    } catch {
+      /* tracing must never break a load */
+    }
+  }
+
+  /**
+   * Serve one Remote-SSH slice over the host's own loopback proxy.
+   *
+   * The webview used to fetch the port-forwarded URL directly. In practice the
+   * forward can take tens of seconds to accept connections (or be refused),
+   * so the wheel changed sliceIdx while nothing came back. The host always
+   * reaches 127.0.0.1, and the payload is one plane (a few hundred KB), so
+   * relaying it through postMessage costs little.
+   */
+  private async handleHostSliceRequest(
+    msg: {
+      requestId?: number;
+      entryId?: string;
+      axis?: string;
+      index?: number;
+      factor?: number;
+      timeIdx?: number;
+    },
+    webview: vscode.Webview,
+  ): Promise<void> {
+    const requestId = Number(msg.requestId) || 0;
+    const entryId = String(msg.entryId || '');
+    const axis = msg.axis === 'coronal' || msg.axis === 'sagittal' ? msg.axis : 'axial';
+    const index = Math.max(0, Math.floor(Number(msg.index) || 0));
+    const factor = Math.max(1, Math.min(32, Math.floor(Number(msg.factor) || 1)));
+    const timeIdx = Math.max(0, Math.floor(Number(msg.timeIdx) || 0));
+
+    const reply = (payload: Record<string, unknown>) =>
+      void webview.postMessage({ type: 'sliceResponse', requestId, axis, index, factor, ...payload });
+
+    const base = this.proxy?.internalFileUrl(entryId);
+    if (!base) {
+      reply({ error: `proxy entry ${entryId || '(none)'} is not registered` });
+      return;
+    }
+
+    const sliceUrl = `${base.replace(/\/file\/\d+$/, '/slice/' + entryId)}/${axis}/${index}?t=${timeIdx}&factor=${factor}&fmt=f32`;
+    const startedAt = Date.now();
+    try {
+      const { status, headers, body } = await new Promise<{
+        status: number;
+        headers: http.IncomingHttpHeaders;
+        body: Buffer;
+      }>((resolve, reject) => {
+        const req = http.get(sliceUrl, { timeout: 30_000 }, (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () =>
+            resolve({ status: res.statusCode || 0, headers: res.headers, body: Buffer.concat(chunks) }),
+          );
+          res.on('error', reject);
+        });
+        req.on('timeout', () => {
+          req.destroy(new Error('host slice request timed out'));
+        });
+        req.on('error', reject);
+      });
+      if (status !== 200) {
+        reply({ error: `slice HTTP ${status}` });
+        return;
+      }
+      const width = Number(headers['x-width']) || 0;
+      const height = Number(headers['x-height']) || 0;
+      if (!width || !height || body.length !== width * height * 4) {
+        reply({ error: `slice payload ${body.length}B does not match ${width}x${height} float32` });
+        return;
+      }
+      // Copy out of Node's pooled Buffer so the ArrayBuffer is exactly the
+      // plane and can be structured-cloned to the webview as-is.
+      const out = new Uint8Array(body.length);
+      out.set(body);
+      reply({ width, height, data: out.buffer });
+      this.sliceRelayLogs++;
+      if (this.sliceRelayLogs <= 3 || this.sliceRelayLogs % 50 === 0) {
+        this.logPerf(
+          `[host-slice] ${axis} idx=${index} f=${factor} ${width}x${height} ${body.length}B ${Date.now() - startedAt}ms (#${this.sliceRelayLogs})`,
+        );
+      }
+      if (factor === 1) {
+        this.scheduleHostSlicePrefetch(base, entryId, axis, index, timeIdx, factor);
+      }
+    } catch (err) {
+      reply({ error: errorMessage(err) });
+      this.logPerf(`[host-slice] ${axis} idx=${index} failed: ${errorMessage(err)}`);
+    }
+  }
+
+  private sliceRelayLogs = 0;
+  private hostSlicePrefetchAt = new Map<string, number>();
+
+  /**
+   * Warm the proxy's slice cache for neighbouring planes so the next wheel
+   * step hits memory instead of the gzip index. Files above the full-volume
+   * relay cap stay in slice mode; this keeps their one-plane-per-step round
+   * trips from feeling like a slideshow.
+   */
+  private scheduleHostSlicePrefetch(
+    base: string,
+    entryId: string,
+    axis: string,
+    index: number,
+    timeIdx: number,
+    factor: number,
+  ): void {
+    const key = `${entryId}:${axis}`;
+    const now = Date.now();
+    if (now - (this.hostSlicePrefetchAt.get(key) || 0) < 400) return;
+    this.hostSlicePrefetchAt.set(key, now);
+    const sliceBase = base.replace(/\/file\/\d+$/, '/slice/' + entryId);
+    for (const delta of [-1, 1, 2]) {
+      const idx = index + delta;
+      if (idx < 0) continue;
+      const url = `${sliceBase}/${axis}/${idx}?t=${timeIdx}&factor=${factor}&fmt=f32`;
+      const req = http.get(url, { timeout: 15_000 }, (res) => {
+        res.resume();
+        res.on('end', () => {});
+      });
+      req.on('timeout', () => req.destroy());
+      req.on('error', () => {});
     }
   }
 
@@ -367,7 +528,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       fileUrl = isRemote ? uri.toString() : webview.asWebviewUri(uri).toString();
     } else if (isRemote) {
       if (!this.proxy) {
-        this.proxy = new LocalFileProxy(this.volumeCache);
+        this.proxy = new LocalFileProxy(this.volumeCache, (line) => this.logPerf(line));
         await this.proxy.start();
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
@@ -475,7 +636,9 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           // or a full fetch (small files). The webview skips the HTTP-preview
           // fallback timer while that message is in flight.
           isRemoteSsh: !isParsed && !isRemote && isWanRemote(),
-          deferFullVolume: isParsed ? false : isRemote || shouldUseSliceMode(fileSize),
+          deferFullVolume: isParsed
+            ? false
+            : isRemote || shouldUseSliceMode(fileSize, undefined, /\.nii\.gz$/i.test(uri.fsPath || uri.path)),
           skipHttpFallback: isParsed,
           hostParsed: isParsed,
           fileUrl,
@@ -584,6 +747,13 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         // Webview/worker stage trace. Only reachable from the perf channel, so
         // a stalled fast-path load can be diagnosed after the fact.
         this.logPerf(`[webview] ${String(msg.line || '')}`);
+      } else if (msg.type === 'sliceRequest') {
+        // Remote-SSH slice mode: the webview asks the host for one plane and
+        // the host reads it over its own loopback proxy. The webview's direct
+        // path depends on VS Code's port forwarding (slow to come up, and
+        // sometimes refused outright), which is why wheel scrolling appeared
+        // dead until the forwarded URL finally answered.
+        await this.handleHostSliceRequest(msg, webview);
       } else if (msg.type === 'perfReport') {
         this.handlePerfReport(msg);
       } else if (msg.type === 'selectImage') {
@@ -647,7 +817,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
 
           if (imgIsRemote) {
             if (!this.proxy) {
-              this.proxy = new LocalFileProxy(this.volumeCache);
+              this.proxy = new LocalFileProxy(this.volumeCache, (line) => this.logPerf(line));
               await this.proxy.start();
               this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
             }
@@ -899,7 +1069,7 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       }
 
       if (!this.proxy) {
-        this.proxy = new LocalFileProxy(this.volumeCache);
+        this.proxy = new LocalFileProxy(this.volumeCache, (line) => this.logPerf(line));
         await this.proxy.start();
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
@@ -941,6 +1111,8 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           isGzip: false,
           hostParsed: true,
           deferFullVolume: true,
+          hostSlices: true,
+          entryId,
           header,
           globalMin: preview?.globalMin ?? 0,
           globalMax: preview?.globalMax ?? 1,

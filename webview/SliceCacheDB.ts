@@ -22,6 +22,11 @@ export interface SliceCacheEntry {
 
 export class SliceCacheDB {
   private db: IDBDatabase | null = null;
+  private initPromise: Promise<IDBDatabase> | null = null;
+  // Set when opening the database failed, was blocked by another connection or
+  // requested a version change. The cache then stays off for this session so a
+  // wedged IndexedDB cannot stall the scroll path.
+  private broken = false;
   private _hits = 0;
   private _misses = 0;
 
@@ -29,18 +34,45 @@ export class SliceCacheDB {
 
   async init(): Promise<void> {
     if (this.db) return;
-    this.db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(STORE_NAME)) {
-          const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
-          store.createIndex('lastAccess', 'lastAccess', { unique: false });
-        }
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+    if (this.broken) throw new Error('Slice cache is unavailable');
+    // Concurrent slice fetches share one open request instead of racing.
+    if (!this.initPromise) {
+      this.initPromise = new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, DB_VERSION);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STORE_NAME)) {
+            const store = db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+            store.createIndex('lastAccess', 'lastAccess', { unique: false });
+          }
+        };
+        req.onsuccess = () => {
+          const db = req.result;
+          // Close instead of blocking an upgrade requested by another tab or
+          // a newer build; blocking forever is what freezes the readers.
+          db.onversionchange = () => {
+            db.close();
+            this.db = null;
+            this.broken = true;
+          };
+          resolve(db);
+        };
+        req.onerror = () => reject(req.error);
+        req.onblocked = () => reject(new Error('Slice cache blocked by another connection'));
+      })
+        .then((db) => {
+          this.db = db;
+          return db;
+        })
+        .catch((err) => {
+          this.broken = true;
+          throw err;
+        })
+        .finally(() => {
+          this.initPromise = null;
+        });
+    }
+    await this.initPromise;
   }
 
   // ── Core CRUD ──────────────────────────────────────────────────────
@@ -316,6 +348,7 @@ export class SliceCacheDB {
   // ── Helpers ────────────────────────────────────────────────────────
 
   private async ensureDB(): Promise<IDBDatabase> {
+    if (this.broken) throw new Error('Slice cache is unavailable');
     if (!this.db) await this.init();
     return this.db!;
   }

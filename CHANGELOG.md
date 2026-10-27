@@ -2,6 +2,36 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [3.0.4] - 2026-10-27
+
+### Fixed — Remote-SSH `.nii.gz` slice mode could not scroll
+
+- Relay slice planes through the extension host instead of the webview fetching the port-forwarded proxy URL. In Remote-SSH the forward can refuse connections (`ECONNREFUSED`) or take tens of seconds to accept them, so the wheel changed the slice index while every request stalled until the 15 s worker timeout. The viewer now asks the host (`sliceRequest`), the host reads the plane from its own loopback proxy in a few milliseconds, and the plane comes back as a `Float32Array` over `postMessage`. Small-file streaming, local files and the browser worker path are unchanged.
+- Ship the full volume in the background for Remote-SSH slice-mode files up to 64 MB (compressed bytes for `.nii.gz`, the webview inflates locally) over the same postMessage channel small files already use. Slice-by-slice scrolling costs one webview→host round trip per wheel step, which felt janky next to in-memory formats like npz; once the relay lands, scrolling runs entirely from memory and keeps the user's current slice position. Files above the cap stay in slice mode with host-side neighbour prefetch warming the proxy cache.
+- Ask the proxy for scaled Float32 (`fmt=f32`) on the relay path. The default slice response is raw int16 for 8/16-bit volumes, which only the browser worker knows how to expand; relaying those bytes would have produced a malformed frame. The host validates the payload against `X-Width` × `X-Height` before forwarding.
+- Restore wheel scrolling in slice mode. Fast wheel steps request downsampled frames; the coordinate readout indexed that smaller buffer with full-resolution voxel coordinates and threw `TypeError: ... reading 'toFixed'` inside `renderAllViews`. The exception rejected `refreshSlices`, so every repaint was aborted while panning (which does not refresh slices) kept working. The value is now sampled through the frame's own grid, and a missing sample clears the readout instead of throwing.
+- Settle slice-worker requests on abort, timeout (15 s) or worker crash, and retire/replace the worker so fast scrolling cannot exhaust the pool. Previously an aborted request held its worker forever and a crashed worker left its promise pending.
+- Bound IndexedDB slice-cache reads to 2 s in the worker and disable that cache after a failure, so a wedged database adds at most one deadline instead of one per wheel tick. Disk writes no longer delay a slice that already downloaded.
+- Open the slice cache once (single-flight) and treat `blocked`/`versionchange` as unavailable rather than waiting forever.
+- Isolate failures per axis with throttled logging, so one failed axis no longer suppresses the other two.
+- Stop initializing the WASM module at the top of the worker bundle. Its dynamic import cannot resolve from a `blob:` worker base, and the failing fetch surfaced as `[NiftiSpy] Worker error: undefined` (compounded by VS Code stripping the COOP/COEP headers, which makes SharedArrayBuffer unavailable). The worker only fetches bytes and slices planes, so it no longer imports WASM at all. The webview-side WASM probe failure is also silenced: the wasm package is not shipped in this build and the JS fallback covers everything.
+
+### Added — Remote-SSH slice diagnostics that survive the session
+
+- Mirror the webview/perf trace, slice-mode dispatch parameters and every HTTP proxy request (route, status, latency) into `niftispy-webview.log` inside the extension's global storage. A Remote-SSH webview console is not persisted anywhere, so "scroll does nothing" could not be diagnosed after the fact.
+- Trace wheel → slice refresh → worker frame result inside the viewer, including transport errors with the forwarded proxy origin, and show a toast after repeated slice failures instead of failing silently.
+- Guard the slice repaint: a painter exception is now reported and isolated instead of aborting the refresh with an unhandled rejection.
+
+## [3.0.3] - 2026-10-27
+
+### Fixed — Remote gzip preview before download completion
+
+- Always start Remote-SSH `.nii.gz` files with a host-side slice preview, including highly compressed files below the normal slice-mode size threshold. Compressed file size no longer decides whether users must wait for a whole-volume download before seeing an image.
+- Stream-decompress small gzip downloads while their response body arrives. Previously both probe-sized files and the single-request path buffered the entire compressed body before decompression, leaving the viewer at `Streaming volume (fast path)... / downloading` on slow tunnels.
+- Keep an existing host preview visible during background downloads; a later Worker z=0 preview no longer resets the slice position or replaces anatomy with empty background.
+- Reuse the probe bytes and request only the remaining range through the same decompressor; keep cancellation, range-length checks and the existing streaming fallback.
+- Add gated-download regressions proving that a visible slice arrives before EOF, with byte-for-byte final-volume validation, cancellation, truncated-range checks and WAN-only routing controls.
+
 ## [3.0.2] - 2026-10-27
 
 ### Fixed — Remote-SSH `.nii.gz` still stalled on the fast path

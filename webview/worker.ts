@@ -4,20 +4,11 @@ import { SliceService } from './worker/slices';
 import { MAX_RETRIES, fetchWithRetry, setVolumeFetchPriority } from './worker/net';
 import { TransferEngine, type TransferHost } from './worker/transfer';
 import { errorMessage, isAbortError } from '../src/errors';
-import { initWasmBindings } from './wasmBridge';
 
-// Initialize WASM SIMD module (async, non-blocking)
-let wasmReady = false;
-initWasmBindings()
-  .then((bindings) => {
-    wasmReady = !!bindings;
-    if (wasmReady) {
-      console.log('[Worker] WASM SIMD acceleration enabled');
-    }
-  })
-  .catch(() => {
-    console.log('[Worker] WASM SIMD not available, using JS fallback');
-  });
+// No WASM here on purpose: this worker only fetches bytes and slices planes.
+// The eager import of ./wasm/niftispy_wasm used to run at module scope, where
+// its relative URL cannot resolve inside a blob: worker — the failing fetch
+// surfaced as an unhandled worker error and took slice requests down with it.
 
 const MAX_SLICE_CACHE = 96;
 const volumeControllers = new Map<number, AbortController>();

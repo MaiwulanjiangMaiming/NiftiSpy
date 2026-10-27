@@ -58,11 +58,8 @@ const MAX_POOL_ROUNDS = 3;
 // with the tunnel for CPU and disk — so small gzip files skip the preview.
 const GZIP_PREVIEW_MIN_BYTES = 2 * 1024 * 1024;
 
-// At or below this compressed size a gzip volume is fetched with ONE range
-// request and decompressed in one pass. The parallel pool only pays off on
-// multi-MB streams; on a tunnel it adds a per-chunk round trip and an
-// ordered-feed/back-pressure bookkeeping layer that can stall a small load
-// (Remote-SSH .nii.gz spinner) while the same bytes succeed in one request.
+// Small gzip files use one continuous decompressor across the probe and
+// remaining range. Do not buffer the whole download before emitting a slice.
 const SINGLE_SHOT_GZIP_MAX_BYTES = 24 * 1024 * 1024;
 
 export class TransferEngine {
@@ -115,11 +112,9 @@ export class TransferEngine {
       // The proxy exposes /preview-volume/{id}?factor=N which streams the
       // remote file, subsamples every N-th voxel, and returns a complete
       // low-res Float32 volume. For .nii it uses parallel Range requests;
-      // for .nii.gz it stream-decompresses just enough slices (factor=16 →
-      // ~6% of the compressed stream on VPN-class links) and closes the
-      // connection early.  This gives a full three-view preview in ~1-3 s
-      // for a 100 MB remote file.  Falls back silently if the endpoint is
-      // unavailable.
+      // for .nii.gz it scans through the last sampled z, near the stream
+      // end. Subsampling shrinks the response, not the required inflate span.
+      // Falls back silently if the endpoint is unavailable.
       //
       // The preview is NOT fired here: the factor choice depends on the REAL
       // link bandwidth, which is only known after the range probe inside the
@@ -843,6 +838,24 @@ export class TransferEngine {
     const isLocalhost = url.startsWith('http://127.0.0.1') || url.startsWith('http://localhost');
     const isRemote = !isLocalhost || probeResp.headers.get('X-Remote-Source') === 'true';
 
+    // Start decoding the probe body immediately. Waiting for its EOF hides
+    // slices already received on slow links, even when the entire file fits
+    // in this one response. Small gzip downloads continue with only the
+    // missing range, through the same decompressor (no prefix re-download).
+    if (isGzip && hasNativeDecompress && totalSize <= SINGLE_SHOT_GZIP_MAX_BYTES) {
+      const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(contentRange);
+      if (!match || Number(match[1]) !== 0 || !probeResp.body) throw new Error('Invalid gzip probe range');
+      return this.streamingGzipRanges(
+        url,
+        probeResp,
+        Number(match[2]) + 1,
+        totalSize,
+        id,
+        signal,
+        clampIdleTimeout(estimatedRttMs),
+      );
+    }
+
     // ── Measure the link BEFORE launching anything bandwidth-hungry ──
     // The probe is the only ground truth for THIS link right now; stale
     // session defaults (10Mbps) would pick 6MB+ chunks on a VPN.
@@ -876,25 +889,6 @@ export class TransferEngine {
         return nativeDecompressFromBuffer(probeData, signal);
       }
       return probeData;
-    }
-
-    // ── Small gzip: single request + single-pass decompression ──
-    // Deliberately simple: no chunk pool, no ordered feed, no resume rounds.
-    // The request is watchdog-protected and retried, so a stalled tunnel turns
-    // into an error (which the caller/fallback can act on) instead of a load
-    // that never finishes.
-    if (isGzip && hasNativeDecompress && totalSize <= SINGLE_SHOT_GZIP_MAX_BYTES) {
-      this.log(id, `gz single-shot ${totalSize}B (probe ${PROBE_SIZE}B, ${Math.round(measuredBps / 1024)}kB/s)`);
-      self.postMessage({ id, type: 'progress', value: 0.3, stage: 'downloading (single request)' });
-      const compressed = await fetchRangeBytesWithRetry(url, 0, totalSize - 1, idleMs, signal);
-      throwIfAborted(signal);
-      if (compressed.byteLength !== totalSize) {
-        throw new Error(`Short gzip download: ${compressed.byteLength}/${totalSize} bytes`);
-      }
-      self.postMessage({ id, type: 'progress', value: 0.55, stage: 'decompressing' });
-      const raw = await nativeDecompressFromBuffer(compressed, signal);
-      this.log(id, `gz single-shot done ${compressed.byteLength}B -> ${raw.byteLength}B`);
-      return raw;
     }
 
     const settledProbe = Promise.resolve(probeData);
@@ -1308,13 +1302,78 @@ export class TransferEngine {
     return result;
   }
 
+  /** Feed the probe and remaining bytes into one backpressured gzip stream. */
+  private async streamingGzipRanges(
+    url: string,
+    probe: Response,
+    probeEnd: number,
+    totalSize: number,
+    id: number,
+    signal: AbortSignal,
+    idleMs: number,
+  ): Promise<Uint8Array> {
+    let reader = probe.body!.getReader();
+    let received = 0,
+      rangeEnd = probeEnd;
+    const abort = () => {
+      void reader.cancel(signal.reason).catch(() => {});
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    const body = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          for (;;) {
+            throwIfAborted(signal);
+            const chunk = await readStreamChunkWithWatchdog(reader, idleMs);
+            throwIfAborted(signal);
+            if (!chunk.done) {
+              received += chunk.value.byteLength;
+              if (received > rangeEnd) throw new Error('Gzip range exceeded its declared length');
+              controller.enqueue(chunk.value);
+              return;
+            }
+            reader.releaseLock();
+            if (received !== rangeEnd) throw new Error(`Short gzip range: ${received}/${rangeEnd} bytes`);
+            if (received === totalSize) {
+              controller.close();
+              return;
+            }
+            const response = await fetchHeadersWatchdog(
+              url,
+              { headers: { Range: `bytes=${received}-${totalSize - 1}` } },
+              idleMs,
+              signal,
+            );
+            const expected = `bytes ${received}-${totalSize - 1}/${totalSize}`;
+            if (response.status !== 206 || response.headers.get('Content-Range') !== expected || !response.body) {
+              await response.body?.cancel();
+              throw new Error('Invalid remaining gzip range');
+            }
+            reader = response.body.getReader();
+            rangeEnd = totalSize;
+          }
+        } catch (error) {
+          void reader.cancel(error).catch(() => {});
+          controller.error(error);
+        }
+      },
+      cancel: (reason) => reader.cancel(reason),
+    });
+    this.log(id, `gz streaming ${totalSize}B (probe ${probeEnd}B, incremental preview)`);
+    try {
+      return await this.streamingGzipLoadFromResponse(new Response(body), id, signal);
+    } finally {
+      signal.removeEventListener('abort', abort);
+    }
+  }
+
   /**
    * Stream-decompress a gzip Response from a full (non-range) response.
    * Used when the server doesn't support range requests.
    */
   private async streamingGzipLoadFromResponse(resp: Response, id: number, signal: AbortSignal): Promise<Uint8Array> {
     const ds = new DecompressionStream('gzip');
-    const decompressedStream = resp.body!.pipeThrough(ds);
+    const decompressedStream = resp.body!.pipeThrough(ds, { signal });
     const reader = decompressedStream.getReader() as ReadableStreamDefaultReader<Uint8Array>;
 
     let result = new Uint8Array(16 * 1024 * 1024);

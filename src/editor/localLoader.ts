@@ -100,7 +100,7 @@ export class LocalVolumeLoader {
   ): Promise<void> {
     const uriKey = uri.toString();
     const cached = this.volumeCache.get(uriKey);
-    if (cached && !shouldUseSliceMode(fileSize)) {
+    if (cached && !shouldUseSliceMode(fileSize, undefined, /\.nii\.gz$/i.test(uri.fsPath))) {
       this.volumeCache.setActive(uriKey, webviewId);
       // Pass the full underlying buffer + voxOffset to avoid a costly
       // buffer.slice() copy on cache-hit (second open of same file).
@@ -470,10 +470,10 @@ export class LocalVolumeLoader {
    * port-forward it via vscode.env.asExternalUri, then let the webview
    * Worker fetch the forwarded URL directly.
    *
-   * Large files (≥8MB) keep the compressed object on the remote disk: the
-   * host extracts a cheap z=0 / ortho preview and the webview scrolls via
-   * /slice. Small files still stream the whole compressed object — the
-   * extra round trips of slice mode are a net loss below that size.
+   * Gzip files always show a host preview before any full-volume transfer;
+   * their compressed byte count is not a reliable measure of image size.
+   * Other files keep the size-based choice between slices and streaming.
+   * Full volume loading remains available for MIP and registration.
    *
    * Returns true if the fast path was dispatched (webview will drive the
    * load); false if port forwarding is unavailable (caller falls back to
@@ -491,7 +491,7 @@ export class LocalVolumeLoader {
   ): Promise<boolean> {
     try {
       if (!this.proxy) {
-        this.proxy = new LocalFileProxy(this.volumeCache);
+        this.proxy = new LocalFileProxy(this.volumeCache, (line) => this.logPerf(line));
         await this.proxy.start();
         this.context.subscriptions.push({ dispose: () => this.proxy?.stop() });
       }
@@ -503,8 +503,8 @@ export class LocalVolumeLoader {
       // (e.g. restricted remote environments).
       const external = await vscode.env.asExternalUri(vscode.Uri.parse(proxyUrl));
 
-      const sliceMode = shouldUseSliceMode(fileSize);
-      const isGzip = fsPath.endsWith('.gz');
+      const isGzip = /\.nii\.gz$/i.test(fsPath);
+      const sliceMode = shouldUseSliceMode(fileSize, undefined, isGzip);
 
       this.remoteHttpFallbacks.set(loadId, {
         webview,
@@ -551,6 +551,10 @@ export class LocalVolumeLoader {
           validationToken,
           isGzip,
           deferFullVolume: true,
+          // The webview asks the host for planes instead of fetching the
+          // forwarded proxy URL (which may not accept connections yet).
+          hostSlices: true,
+          entryId,
           header: preview?.header,
           globalMin: preview?.globalMin ?? 0,
           globalMax: preview?.globalMax ?? 1,
@@ -569,6 +573,23 @@ export class LocalVolumeLoader {
         if (!ok) {
           this.remoteHttpFallbacks.delete(loadId);
           return false;
+        }
+        this.logPerf(
+          `[remote-ssh-slice] dispatched gz=${isGzip} size=${fileSize} header=${preview?.header ? `${preview.header.nx}x${preview.header.ny}x${preview.header.nz}` : 'missing'} url=${external.toString().split('/')[2]} preview=${preview ? 'yes' : 'none'}`,
+        );
+        // Background full-volume relay. Slice-by-slice scrolling costs one
+        // webview→host round trip per wheel step (remote RPC + proxy), which
+        // feels janky next to the in-memory volumes small files get. Files
+        // that fit comfortably in the tunnel get the whole volume shipped
+        // over the same postMessage channel: compressed bytes for .nii.gz
+        // (the webview inflates locally), raw chunks otherwise. Once it
+        // lands, the viewer scrolls from memory — no per-step latency.
+        const FULL_VOLUME_RELAY_MAX_BYTES = 64 * 1024 * 1024;
+        if (fileSize > 0 && fileSize <= FULL_VOLUME_RELAY_MAX_BYTES && !signal.aborted) {
+          const relay = isGzip
+            ? this.remoteSshCompressedLoad(webview, fsPath, fileSize, validationToken, signal)
+            : this.remoteSshChunkedLoad(webview, fsPath, fileSize, validationToken, signal, false);
+          void relay.catch((err) => this.logPerf(`[remote-ssh-slice] full-volume relay failed: ${String(err)}`));
         }
         if (isGzip) {
           const unsubscribe = this.proxy.subscribeGzipPreview(entryId, (ortho) => {

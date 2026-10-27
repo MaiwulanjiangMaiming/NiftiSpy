@@ -263,6 +263,29 @@ let currentWebviewId = '';
 // several images (Add Image / compare), so fallback messages must carry the
 // loadId instead of relying on webviewId alone.
 let currentLoadId = '';
+// Remote-SSH slice mode: when the host offers to relay planes, every wheel
+// step goes through postMessage instead of the port-forwarded proxy URL. The
+// forward can be unavailable (connection refused) or take tens of seconds to
+// come up, during which the slice index changed but no pixels ever arrived.
+let hostSliceMode = false;
+let hostSliceEntryId = '';
+let hostSliceSeq = 0;
+const hostSlicePending = new Map<
+  number,
+  {
+    resolve: (v: {
+      type: 'slice';
+      axis: Axis;
+      index: number;
+      factor: number;
+      width: number;
+      height: number;
+      data: Float32Array;
+    }) => void;
+    reject: (e: unknown) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }
+>();
 let fullVolumeLoaded = false;
 let interactionInitialized = false;
 // Low-res preview state (Stage 1: strided sub-sampling)
@@ -523,7 +546,12 @@ function makeAbortError(): Error {
 }
 
 let nextWorkerRequestId = 1;
-const workerRequests = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>();
+// Requests are tracked together with the worker that owns them so a crashed
+// or wedged worker can be settled instead of leaving the caller hanging.
+const workerRequests = new Map<
+  number,
+  { worker: Worker; resolve: (value: unknown) => void; reject: (reason?: unknown) => void }
+>();
 const sliceQualityTimers: Partial<Record<Axis, number>> = {};
 let workerStreamListener: ((message: WorkerStreamMessage) => void) | null = null;
 
@@ -876,6 +904,11 @@ const AXIS_TO_WORKER_IDX: Record<Axis, number> = { axial: 0, coronal: 1, sagitta
 let cachedBlobUrl: string | null = null;
 let blobUrlPromise: Promise<string> | null = null;
 const WORKER_SCRIPT_TIMEOUT_MS = 20_000;
+// A slice the viewer asked for must settle (or be abandoned) inside this
+// window. Requests used to hang forever when a worker died or an IndexedDB
+// lookup wedged, and because refreshSlices waited on all three axes the
+// viewer simply stopped repainting while pan/zoom kept working.
+const SLICE_REQUEST_TIMEOUT_MS = 15_000;
 
 type WorkerPayload = Record<string, unknown> & { signal?: AbortSignal };
 
@@ -885,6 +918,7 @@ class SliceWorkerPool {
   private maxSize: number;
   private blobUrl: string | null = null;
   private queue: Array<{ payload: WorkerPayload; resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+  private terminated = false;
 
   constructor(maxSize: number) {
     this.maxSize = maxSize;
@@ -934,32 +968,73 @@ class SliceWorkerPool {
       return;
     }
     const id = nextWorkerRequestId++;
+    let settled = false;
+    // Bare setTimeout (not window.setTimeout) keeps this pool usable in the
+    // isolated worker test runtime, which injects only global timers.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (kind: 'resolve' | 'reject', value: unknown) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      workerRequests.delete(id);
+      if (kind === 'resolve') resolve(value);
+      else reject(value);
+      this.release(worker);
+    };
+    const onAbort = () => {
+      // Without this the pool kept every aborted request's worker pinned until
+      // the request settled on its own; fast scrolling starved all workers and
+      // no slice was ever rendered again.
+      const pending = workerRequests.get(id);
+      if (pending) pending.reject(makeAbortError());
+    };
     workerRequests.set(id, {
-      resolve: (msg: unknown) => {
-        resolve(msg);
-        this.release(worker);
-      },
-      reject: (err: unknown) => {
-        reject(err);
-        this.release(worker);
-      },
+      worker,
+      resolve: (msg: unknown) => finish('resolve', msg),
+      reject: (err?: unknown) => finish('reject', err),
     });
+    // A request that never answers must not wedge the pool: reject it, then
+    // replace the worker because its fetch may still be stuck.
+    timer = setTimeout(() => {
+      const pending = workerRequests.get(id);
+      if (!pending) return;
+      pending.reject(new Error(`Slice request timed out after ${SLICE_REQUEST_TIMEOUT_MS / 1000}s`));
+      this.retire(worker);
+    }, SLICE_REQUEST_TIMEOUT_MS);
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
       worker.postMessage({ ...message, id });
     } catch (err) {
-      workerRequests.delete(id);
-      reject(err);
-      this.release(worker);
+      workerRequests.get(id)?.reject(err);
     }
   }
 
   private release(worker: Worker): void {
+    if (this.terminated || !this.workers.includes(worker)) return;
     if (this.queue.length > 0) {
       const next = this.queue.shift()!;
       this.exec(worker, next.payload, next.resolve, next.reject);
-    } else {
+    } else if (!this.idle.includes(worker)) {
       this.idle.push(worker);
     }
+  }
+
+  /** Drop a worker that crashed or never answered and replace it, so wedged
+   *  requests can never exhaust the pool. */
+  retire(worker: Worker): void {
+    if (!this.workers.includes(worker)) return;
+    this.workers = this.workers.filter((w) => w !== worker);
+    this.idle = this.idle.filter((w) => w !== worker);
+    worker.terminate();
+    for (const [, pending] of [...workerRequests]) {
+      if (pending.worker === worker) pending.reject(new Error('Slice worker was replaced'));
+    }
+    if (this.terminated || !this.blobUrl || this.workers.length >= this.maxSize) return;
+    const replacement = new Worker(this.blobUrl);
+    attachWorkerRouter(replacement);
+    this.workers.push(replacement);
+    this.release(replacement);
   }
 
   broadcast(message: Record<string, unknown>): void {
@@ -974,7 +1049,15 @@ class SliceWorkerPool {
   }
 
   terminate(): void {
-    for (const w of this.workers) w.terminate();
+    this.terminated = true;
+    const workers = this.workers;
+    for (const w of workers) {
+      for (const [, pending] of [...workerRequests]) {
+        if (pending.worker === w) pending.reject(makeAbortError());
+      }
+      w.terminate();
+    }
+    for (const entry of this.queue) entry.reject(makeAbortError());
     this.workers = [];
     this.idle = [];
     this.queue = [];
@@ -1055,11 +1138,18 @@ function attachWorkerRouter(worker: Worker) {
   // Worker crash recovery
   worker.onerror = (e: ErrorEvent) => {
     console.error('[NiftiSpy] Worker error:', e.message);
+    // A dead worker can never answer the requests queued on it; settle them so
+    // the caller can retry instead of waiting forever.
+    for (const [, pending] of [...workerRequests]) {
+      if (pending.worker === worker) pending.reject(new Error(e.message || 'Slice worker crashed'));
+    }
     // Find which axis this worker belongs to and restart it
     const idx = sliceWorkers.indexOf(worker);
     if (idx >= 0) {
       const axis = (['axial', 'coronal', 'sagittal'] as Axis[])[idx];
       if (axis) restartCrashedWorker(axis);
+    } else if (slicePool) {
+      slicePool.retire(worker);
     }
   };
 }
@@ -1070,6 +1160,7 @@ async function getSlicePool(): Promise<SliceWorkerPool> {
     const pool = new SliceWorkerPool(maxWorkers);
     slicePool = pool;
     slicePoolInit = pool.init().catch((err) => {
+      sliceDiag('pool', `[slice] worker pool init failed: ${errorMessage(err)}`, 2);
       pool.terminate();
       slicePool = null;
       slicePoolInit = null;
@@ -1133,6 +1224,9 @@ function cancelAutoVolumeLoads(): void {
 
 function onUserScrollSlices(): void {
   lastScrollTime = Date.now();
+  // Prove the wheel/slider actually reached the slice-mode navigation path;
+  // without this, a missing repaint is indistinguishable from a lost event.
+  sliceDiag('scroll', '[slice] user scroll');
   cancelAutoVolumeLoads();
 }
 
@@ -1582,7 +1676,15 @@ async function ensureImageData(
             img.url,
             gz,
             (msg) => {
-              if (msg.type === 'preview' && !isLowResPreview && images[activeImageIdx] === img && !img.data) {
+              if (
+                msg.type === 'preview' &&
+                !isLowResPreview &&
+                images[activeImageIdx] === img &&
+                !img.data &&
+                !(msg.partialPreview && img.preview?.axial.length)
+              ) {
+                // A host preview can already show meaningful anatomy at the user's
+                // current position. A later streaming z=0 must not replace it.
                 showPartialPreviewFromMessage(msg, { fetchMissingSlices: false });
               }
               if (msg.type === 'previewVolume' && images[activeImageIdx] === img && !img.data) {
@@ -1707,6 +1809,115 @@ function getActiveDownsample(): number {
   return 1;
 }
 
+const HOST_SLICE_TIMEOUT_MS = 12_000;
+
+/**
+ * Ask the extension host for one plane. In Remote-SSH the host reads it over
+ * its own loopback proxy, which avoids depending on VS Code's port forward.
+ */
+function requestSliceFromHost(
+  axis: Axis,
+  factor: number,
+  index: number,
+  signal: AbortSignal,
+): Promise<{
+  type: 'slice';
+  axis: Axis;
+  index: number;
+  factor: number;
+  width: number;
+  height: number;
+  data: Float32Array;
+}> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(makeAbortError());
+      return;
+    }
+    const requestId = ++hostSliceSeq;
+    const settle = (fn: () => void) => {
+      const pending = hostSlicePending.get(requestId);
+      if (!pending) return;
+      hostSlicePending.delete(requestId);
+      clearTimeout(pending.timer);
+      signal.removeEventListener('abort', onAbort);
+      fn();
+    };
+    const onAbort = () =>
+      settle(() => {
+        reject(makeAbortError());
+      });
+    const timer = setTimeout(() => {
+      settle(() => {
+        reject(new Error(`Host slice request timed out after ${HOST_SLICE_TIMEOUT_MS / 1000}s`));
+      });
+    }, HOST_SLICE_TIMEOUT_MS);
+    hostSlicePending.set(requestId, { resolve, reject, timer });
+    signal.addEventListener('abort', onAbort, { once: true });
+    vscode.postMessage({
+      type: 'sliceRequest',
+      requestId,
+      entryId: hostSliceEntryId,
+      webviewId: currentWebviewId,
+      axis,
+      index,
+      factor,
+      timeIdx,
+    });
+  });
+}
+
+function handleSliceResponse(msg: {
+  requestId?: number;
+  axis?: Axis;
+  index?: number;
+  factor?: number;
+  width?: number;
+  height?: number;
+  data?: ArrayBuffer | ArrayBufferView | number[];
+  error?: string;
+}): void {
+  const requestId = Number(msg.requestId) || 0;
+  const pending = hostSlicePending.get(requestId);
+  if (!pending) return;
+  hostSlicePending.delete(requestId);
+  clearTimeout(pending.timer);
+  if (msg.error) {
+    pending.reject(new Error(msg.error));
+    return;
+  }
+  const raw = msg.data;
+  let data: Float32Array;
+  if (raw instanceof ArrayBuffer) {
+    data = new Float32Array(raw);
+  } else if (ArrayBuffer.isView(raw)) {
+    data = new Float32Array(raw.buffer, raw.byteOffset, Math.floor(raw.byteLength / 4));
+  } else if (Array.isArray(raw)) {
+    data = new Float32Array(raw);
+  } else {
+    pending.reject(new Error('malformed host slice response'));
+    return;
+  }
+  pending.resolve({
+    type: 'slice',
+    axis: msg.axis || 'axial',
+    index: Number(msg.index) || 0,
+    factor: Number(msg.factor) || 1,
+    width: Number(msg.width) || 0,
+    height: Number(msg.height) || 0,
+    data,
+  });
+}
+
+function resetHostSlicePending(): void {
+  // Abandoned, not failed: a new image or load path superseded them.
+  for (const [, pending] of hostSlicePending) {
+    clearTimeout(pending.timer);
+    pending.reject(makeAbortError());
+  }
+  hostSlicePending.clear();
+}
+
 async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
   if (!header) return;
   // Abort any previous slice request for this axis
@@ -1716,31 +1927,40 @@ async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
   sliceAbortControllers.set(axis, controller);
   const signal = controller.signal;
 
-  const pool = await getSlicePool();
   const geometry = getAxisGeometry(axis);
+  const requestedIndex = sliceIdx[axis];
   try {
-    const response = await pool.dispatch<{
-      type: 'slice';
-      axis: Axis;
-      index: number;
-      factor: number;
-      width: number;
-      height: number;
-      data: Float32Array;
-    }>({
-      type: 'fetchSlice',
-      url: fileUrl,
-      directUrl: directUrl,
-      axis,
-      index: sliceIdx[axis],
-      factor,
-      prefetch: slicePrefetchCount(),
-      maxIndex: geometry.maxIndex,
-      timeIdx,
-      signal,
-    });
+    const response = hostSliceMode
+      ? await requestSliceFromHost(axis, factor, requestedIndex, signal)
+      : await (
+          await getSlicePool()
+        ).dispatch<{
+          type: 'slice';
+          axis: Axis;
+          index: number;
+          factor: number;
+          width: number;
+          height: number;
+          data: Float32Array;
+        }>({
+          type: 'fetchSlice',
+          url: fileUrl,
+          directUrl: directUrl,
+          axis,
+          index: requestedIndex,
+          factor,
+          prefetch: slicePrefetchCount(),
+          maxIndex: geometry.maxIndex,
+          timeIdx,
+          signal,
+        });
     if (signal.aborted) return;
     if (response.index !== sliceIdx[axis]) return;
+    sliceDiag(
+      `frame-ok:${axis}`,
+      `[slice] ${axis} idx=${response.index}/${geometry.maxIndex} factor=${response.factor || factor} ${response.width}x${response.height} bytes=${response.data?.length || 0}`,
+      3,
+    );
     setCurrentSlice(
       axis,
       response.data,
@@ -1750,18 +1970,80 @@ async function requestSliceFrame(axis: Axis, factor = 1): Promise<void> {
     );
   } catch (err) {
     if (isAbortError(err)) return;
+    sliceDiag(
+      `frame-fail:${axis}`,
+      `[slice] ${axis} idx=${requestedIndex} factor=${factor} -> ${errorMessage(err)}`,
+      4,
+    );
     throw err;
   }
+}
+
+// Consecutive per-axis failures, used to report a broken slice endpoint once
+// instead of on every wheel tick.
+const sliceFailureCounts: Record<Axis, number> = { axial: 0, coronal: 0, sagittal: 0 };
+
+/**
+ * Bounded slice-mode trace. The host mirrors every 'webviewLog' line into its
+ * output channel and a diagnostics file, which is the only way to see what a
+ * Remote-SSH webview did after the fact (its DevTools console is not on disk).
+ */
+const sliceDiagCounts: Record<string, number> = {};
+function sliceDiag(key: string, line: string, max = 4): void {
+  const count = (sliceDiagCounts[key] || 0) + 1;
+  sliceDiagCounts[key] = count;
+  if (count > max) return;
+  vscode.postMessage({ type: 'webviewLog', line });
+}
+
+function reportSliceFailure(axis: Axis, error: unknown): void {
+  const count = ++sliceFailureCounts[axis];
+  if (count === 1 || count === 5 || count % 25 === 0) {
+    vscode.postMessage({
+      type: 'webviewLog',
+      line: `[slice] ${axis} fetch failed (${count}x): ${errorMessage(error)}`,
+    });
+  }
+  if (count === 5) showToast('Slice fetch failed — see the NiftiSpy output for details');
 }
 
 async function refreshSlices(axes: Axis[], interactive = false) {
   if (!header) return;
   const factor = interactive ? getActiveDownsample() : 1;
-  await Promise.all(axes.map((axis) => requestSliceFrame(axis, factor)));
   const renderAt = performance.now();
-  renderAllViews();
-  perfMonitor.renderTimes.push(performance.now() - renderAt);
-  if (perfMonitor.renderTimes.length > 100) perfMonitor.renderTimes.shift();
+  let anyRendered = false;
+
+  // One axis must never be able to freeze the others: a stuck worker, proxy or
+  // IndexedDB lookup previously left the whole viewer unpainted (pan kept
+  // working because it does not go through refreshSlices).
+  await Promise.all(
+    axes.map(async (axis) => {
+      try {
+        await requestSliceFrame(axis, factor);
+      } catch (err) {
+        if (isAbortError(err)) return;
+        reportSliceFailure(axis, err);
+        return;
+      }
+      sliceFailureCounts[axis] = 0;
+      anyRendered = true;
+      // Until every axis settles, repaint the ones that already have pixels so
+      // a slow sibling cannot hide progress.
+      if (axes.length > 1) updateSingleView(axis);
+    }),
+  );
+
+  if (anyRendered) {
+    try {
+      renderAllViews();
+    } catch (err) {
+      // A throwing painter used to abort the whole slice refresh silently:
+      // the wheel changed sliceIdx but the canvas never repainted.
+      sliceDiag('render', `[slice] render failed: ${errorMessage(err)}`, 3);
+    }
+    perfMonitor.renderTimes.push(performance.now() - renderAt);
+    if (perfMonitor.renderTimes.length > 100) perfMonitor.renderTimes.shift();
+  }
   publishPerfMonitor();
   if (interactive && factor > 1) {
     for (const axis of axes) {
@@ -3141,7 +3423,19 @@ function updateCoordInfoFromCenter() {
   if (volumeData) {
     val = volumeData[cz * header.ny * header.nx + cy * header.nx + cx] * dataSlope + dataInter;
   } else if (currentSlices.axial) {
-    val = currentSlices.axial.data[cy * currentSlices.axial.width + cx];
+    // Slice mode frames can be downsampled (factor > 1), so the full-resolution
+    // voxel coordinate has to be mapped into the slice's own grid. Indexing the
+    // small buffer with cx/cy returned undefined and .toFixed() threw inside
+    // renderAllViews, which aborted every scroll repaint.
+    const slice = currentSlices.axial;
+    const sx = Math.min(slice.width - 1, Math.max(0, Math.round((cx / header.nx) * slice.width)));
+    const sy = Math.min(slice.height - 1, Math.max(0, Math.round((cy / header.ny) * slice.height)));
+    const sample = slice.data[sy * slice.width + sx];
+    if (!Number.isFinite(sample)) {
+      coordEl.textContent = '';
+      return;
+    }
+    val = sample;
   } else {
     coordEl.textContent = '';
     return;
@@ -3882,7 +4176,15 @@ window.addEventListener('DOMContentLoaded', () => {
 window.addEventListener('message', async (e) => {
   const msg = e.data;
 
+  if (msg.type === 'sliceResponse') {
+    handleSliceResponse(msg);
+    return;
+  }
+
   if (msg.type === 'newImage') {
+    hostSliceMode = false;
+    hostSliceEntryId = '';
+    resetHostSlicePending();
     currentLoadId = msg.loadId || currentLoadId;
     const target = msg.directUrl || msg.fileUrl;
     injectPreconnectHint(target);
@@ -3922,6 +4224,9 @@ window.addEventListener('message', async (e) => {
     // Worker streams the forwarded URL — full tunnel bandwidth, overlapping
     // decompression, early preview — instead of one postMessage per chunk.
     directPreviewReceived = true;
+    hostSliceMode = false;
+    hostSliceEntryId = '';
+    resetHostSlicePending();
     if (directPreviewTimer) {
       window.clearTimeout(directPreviewTimer);
       directPreviewTimer = null;
@@ -4026,10 +4331,32 @@ window.addEventListener('message', async (e) => {
     fileUrl = msg.url;
     directUrl = '';
     fileName = msg.fileName || fileName;
-    isGzip = false;
+    // Prefer host-relayed planes when the host offers them: no dependency on
+    // the port-forward accepting connections.
+    hostSliceMode = !!msg.hostSlices && !!msg.entryId;
+    hostSliceEntryId = hostSliceMode ? String(msg.entryId) : '';
+    resetHostSlicePending();
+    // Keep the compressed flag truthful instead of assuming raw: formats the
+    // host already parsed (npz/npy/...) arrive as raw voxels, while .nii.gz
+    // stays compressed for the gzip-aware paths.
+    isGzip = msg.isGzip !== undefined ? !!msg.isGzip : !msg.hostParsed && /\.nii\.gz$/i.test(fileName);
     isRemoteSource = true;
     deferFullVolume = true;
     if (msg.fileSize) currentFileSize = msg.fileSize;
+    {
+      let origin = '(unparsable)';
+      try {
+        origin = new URL(fileUrl).origin;
+      } catch {
+        /* keep placeholder */
+      }
+      const h = msg.header;
+      sliceDiag(
+        'mode',
+        `[slice-mode] gz=${isGzip} size=${msg.fileSize || 0} header=${h ? `${h.nx}x${h.ny}x${h.nz}` : 'none'} url=${origin} route=${fileUrl.includes('/file/') ? 'file' : 'other'} hostParsed=${!!msg.hostParsed} hostSlices=${hostSliceMode ? `entry=${hostSliceEntryId}` : 'no'}`,
+        1,
+      );
+    }
     // Slice mode also supports host-parsed formats: slices come from the
     // remote /slice endpoint and the header is already NIfTI-shaped.
     if (msg.hostParsed) msg.preParsedHeader = msg.header;
@@ -4166,6 +4493,11 @@ window.addEventListener('message', async (e) => {
   directUrl = msg.directUrl || '';
   currentWebviewId = msg.webviewId || '';
   currentLoadId = msg.loadId || '';
+  // A new dispatch (local file, or a non-slice remote path) must not inherit
+  // the previous image's host-relay routing.
+  hostSliceMode = false;
+  hostSliceEntryId = '';
+  resetHostSlicePending();
   const targetUrl = directUrl || fileUrl;
   injectPreconnectHint(targetUrl);
   void warmupConnection(targetUrl);
@@ -4981,22 +5313,35 @@ function handleCachedVolume(msg: CachedVolumeMessage): void {
   const receiveTime = performance.now();
   const extTiming = msg.perfExtTiming || null;
   const voxelBytes = msg.perfVoxelBytes || 0;
-  const wasPartialPreview = sliceIdx.axial === 0 && header && header.nz > 1;
+  // A full volume can arrive while Remote-SSH slice streaming is active
+  // (background relay). Retire the relay so scrolling switches to the
+  // in-memory volume, and keep the slice position the user is looking at
+  // instead of jumping to the message's defaults.
+  const wasSliceRelay = hostSliceMode;
+  if (hostSliceMode) {
+    hostSliceMode = false;
+    hostSliceEntryId = '';
+    resetHostSlicePending();
+  }
+  deferFullVolume = false;
+  const wasPartialPreview = !wasSliceRelay && sliceIdx.axial === 0 && header && header.nz > 1;
   header = msg.header;
   computeViewFlips();
   globalMin = msg.globalMin;
   globalMax = msg.globalMax;
   dataSlope = msg.slope || 1;
   dataInter = msg.inter || 0;
-  sliceIdx.axial = msg.sliceIdx.axial;
-  sliceIdx.coronal = msg.sliceIdx.coronal;
-  sliceIdx.sagittal = msg.sliceIdx.sagittal;
+  if (!wasSliceRelay || !header) {
+    sliceIdx.axial = msg.sliceIdx.axial;
+    sliceIdx.coronal = msg.sliceIdx.coronal;
+    sliceIdx.sagittal = msg.sliceIdx.sagittal;
 
-  // If we were showing z=0 preview, navigate to center slice now
-  if (wasPartialPreview && header) {
-    sliceIdx.axial = Math.floor(header.nz / 2);
-    sliceIdx.coronal = Math.floor(header.ny / 2);
-    sliceIdx.sagittal = Math.floor(header.nx / 2);
+    // If we were showing z=0 preview, navigate to center slice now
+    if (wasPartialPreview && header) {
+      sliceIdx.axial = Math.floor(header.nz / 2);
+      sliceIdx.coronal = Math.floor(header.ny / 2);
+      sliceIdx.sagittal = Math.floor(header.nx / 2);
+    }
   }
 
   const datatype = msg.datatype || 16;

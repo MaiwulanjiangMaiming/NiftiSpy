@@ -30,8 +30,11 @@ export function isWanRemote(remoteName?: string | null): boolean {
   return classifyRemote(name) === 'sshWan';
 }
 
-export function shouldUseSliceMode(fileSize: number, remoteName?: string | null): boolean {
+export function shouldUseSliceMode(fileSize: number, remoteName?: string | null, isGzip = false): boolean {
   if (!isWanRemote(remoteName)) return false;
+  // Compressed size says little about voxel volume size. Always show a host
+  // preview first for WAN gzip files, including highly compressible masks.
+  if (isGzip) return true;
   // Unknown size: be conservative and avoid a huge structured-clone / scp.
   return fileSize <= 0 || fileSize >= SLICE_MODE_MIN_BYTES;
 }

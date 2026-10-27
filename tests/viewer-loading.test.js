@@ -217,3 +217,20 @@ test('cancelling a full-volume download frees a queue slot for the next image', 
   assert.equal(ctx.activeVolumeLoads, 0);
   assert.equal(ctx.volumeLoadQueue.length, 0);
 });
+
+test('background gzip download keeps the visible host preview instead of resetting to an empty z=0 slice', async () => {
+  const plane = new Float32Array(hdr.nx * hdr.ny).fill(7);
+  let duringDownload;
+  const ctx = viewer({
+    images: [image({ header: hdr, state: 'preview', preview: { axial: plane, coronal: new Float32Array(hdr.nx * hdr.nz), sagittal: new Float32Array(hdr.ny * hdr.nz) } })],
+    header: hdr, sliceIdx: { axial: 2, coronal: 3, sagittal: 4 },
+    currentSlices: { axial: { data: plane, width: hdr.nx, height: hdr.ny, factor: 1 }, coronal: null, sagittal: null },
+    loadVolumeViaWorker: async (_key, _url, _gz, progress) => {
+      progress({ type: 'preview', partialPreview: true, header: hdr, slices: { axial: new Float32Array(hdr.nx * hdr.ny), coronal: new Float32Array(), sagittal: new Float32Array() }, sliceIdx: { axial: 0, coronal: 3, sagittal: 4 }, globalMin: 0, globalMax: 1 });
+      duringDownload = { axial: ctx.sliceIdx.axial, value: ctx.currentSlices.axial.data[0] };
+      return result();
+    },
+  });
+  await ctx.ensureImageData(0, 'active', 'auto');
+  assert.deepEqual(duringDownload, { axial: 2, value: 7 });
+});

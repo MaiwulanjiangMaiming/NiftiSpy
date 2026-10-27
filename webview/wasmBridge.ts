@@ -187,8 +187,9 @@ export async function initWasmBindings(): Promise<WasmBindings | null> {
     }
 
     return bindings;
-  } catch (e) {
-    console.warn('[WASM] Failed to initialize WASM module:', e);
+  } catch {
+    // The wasm package is not shipped in every build; the JS fallback covers
+    // everything. Keep the console quiet — this is not an error state.
     wasmInstance = null;
     return null;
   }

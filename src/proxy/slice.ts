@@ -87,6 +87,12 @@ export async function handleSlice(
   host: SliceHost,
   timeIdx = 0,
   factor = 1,
+  /**
+   * Raw (unscaled int16) slices save bytes for the browser worker, which knows
+   * how to expand them. A relay that only forwards bytes (the host-side
+   * Remote-SSH path) needs Float32 instead, so it opts out with allowRaw=false.
+   */
+  allowRaw = true,
 ): Promise<void> {
   const startedAt = performance.now();
   const ac = new AbortController();
@@ -94,7 +100,7 @@ export async function handleSlice(
     if (!res.writableEnded) ac.abort();
   });
   try {
-    const cacheKey = `${entry.id}:${axis}:${idx}:${timeIdx}:${factor}`;
+    const cacheKey = `${entry.id}:${axis}:${idx}:${timeIdx}:${factor}${allowRaw ? '' : ':f32'}`;
     const cached = entry.sliceCache?.get(cacheKey);
     if (cached) {
       const h = entry.headerCache!;
@@ -158,7 +164,7 @@ export async function handleSlice(
         entry.headerCache = header;
       }
       const header = entry.headerCache;
-      const rawMeta = rawSliceMeta(header);
+      const rawMeta = allowRaw ? rawSliceMeta(header) : null;
       if (rawMeta) {
         const raw = await extractLocalSliceRaw(dataFs, header, axis, idx, timeIdx, factor, ac.signal);
         if (!raw) {
@@ -189,7 +195,7 @@ export async function handleSlice(
     }
 
     if (entry.unpackPath) {
-      return handleSlice(entry, axis, idx, res, req, host, timeIdx, factor);
+      return handleSlice(entry, axis, idx, res, req, host, timeIdx, factor, allowRaw);
     }
 
     if (dataFs && isGzip && entry.gzipIndex) {

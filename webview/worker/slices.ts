@@ -70,8 +70,36 @@ function createVolumeView(
  * becomes detached.
  */
 export class SliceService {
+  // IndexedDB open/get can hang indefinitely in a sandboxed webview (the same
+  // failure mode the volume cache already guards against). A slice read must
+  // never wait on the disk cache: after this deadline the read counts as a miss
+  // and the worker goes straight to the network. Both the budget and the helper
+  // live on the class so an isolated test runtime can instantiate the service
+  // without supplying any top-level symbols.
+  private static readonly CACHE_READ_TIMEOUT_MS = 2000;
+
+  private static withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
   private readonly pendingSliceFetches = new Map<string, Promise<CachedSlice>>();
   private readonly sliceCache = new Map<string, CachedSlice>();
+  // Set once a cache backend has timed out: retrying a wedged IndexedDB on
+  // every wheel tick would add the full deadline to each scroll step.
+  private sliceDbDisabled = false;
+  private legacyCacheDisabled = false;
 
   constructor(private readonly deps: SliceDeps) {}
 
@@ -138,11 +166,19 @@ export class SliceService {
     const fileHash = this.deps.getFileHash();
     const request = (async () => {
       // Check new SliceCacheDB first (primary L3 disk cache)
-      if (fileHash) {
+      if (fileHash && !this.sliceDbDisabled) {
         try {
-          const db = await this.deps.ensureSliceCacheDB();
+          const db = await SliceService.withDeadline(
+            this.deps.ensureSliceCacheDB(),
+            SliceService.CACHE_READ_TIMEOUT_MS,
+            'Slice cache open',
+          );
           const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
-          const dbData = await db.get(dbKey);
+          const dbData = await SliceService.withDeadline(
+            db.get(dbKey),
+            SliceService.CACHE_READ_TIMEOUT_MS,
+            'Slice cache read',
+          );
           const frame = dbData ? decodeSliceFrame(dbData, factor) : null;
           if (frame) {
             recordCacheHit('l3');
@@ -151,33 +187,57 @@ export class SliceService {
             return slice;
           }
         } catch {
-          // SliceCacheDB not available; fall through
+          // Unavailable or wedged disk cache: fall through to the network and
+          // stop paying the deadline on every subsequent slice.
+          this.sliceDbDisabled = true;
         }
       }
 
       // Fall back to legacy IndexedDB cache
       const idbKey = `v2|${fileHash}|${makeCacheKey(url, axis, index)}|t${timeIdx}|f${factor}`;
-      const idbData = await getCachedChunk(idbKey);
-      const legacyFrame = idbData ? decodeSliceFrame(idbData, factor) : null;
-      if (legacyFrame) {
-        recordCacheHit('l3');
-        const slice: CachedSlice = { ...legacyFrame, timestamp: Date.now() };
-        this.setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
-        return slice;
+      if (!this.legacyCacheDisabled) {
+        try {
+          const idbData = await SliceService.withDeadline(
+            getCachedChunk(idbKey),
+            SliceService.CACHE_READ_TIMEOUT_MS,
+            'Legacy slice cache read',
+          );
+          const legacyFrame = idbData ? decodeSliceFrame(idbData, factor) : null;
+          if (legacyFrame) {
+            recordCacheHit('l3');
+            const slice: CachedSlice = { ...legacyFrame, timestamp: Date.now() };
+            this.setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
+            return slice;
+          }
+        } catch {
+          this.legacyCacheDisabled = true;
+        }
       }
       recordCacheMiss('l3');
 
       const startedAt = performance.now();
       recordL4Fetch();
       if (signal?.aborted) throw this.deps.abortError();
-      const resp = await this.deps.fetchWithRetry(
-        this.buildSliceUrl(url, axis, index, factor, timeIdx),
-        undefined,
-        this.deps.maxRetries,
-        signal,
-      );
+      const sliceUrl = this.buildSliceUrl(url, axis, index, factor, timeIdx);
+      // Keep the origin in every transport error: a webview that cannot reach
+      // the port-forwarded proxy fails with a bare "Failed to fetch", which
+      // used to hide whether the port or CORS was the problem.
+      let sliceOrigin = '';
+      try {
+        sliceOrigin = new URL(sliceUrl).origin;
+      } catch {
+        /* malformed URL: leave it out of the message */
+      }
+      let resp: Response;
+      try {
+        resp = await this.deps.fetchWithRetry(sliceUrl, undefined, this.deps.maxRetries, signal);
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        const e = err as Error;
+        throw new Error(`${e?.name || 'Error'}: ${e?.message || String(err)} @ ${sliceOrigin}`);
+      }
       if (!resp.ok) {
-        throw new Error(`Slice fetch failed: ${resp.status}`);
+        throw new Error(`Slice fetch failed: HTTP ${resp.status} @ ${sliceOrigin}`);
       }
 
       const headersAt = performance.now();
@@ -211,20 +271,28 @@ export class SliceService {
       };
       this.setCachedSlice(url, axis, index, factor, slice, timeIdx, fileHash);
 
-      // Store in new SliceCacheDB (primary)
-      if (fileHash) {
+      // Store in new SliceCacheDB (primary). This must not delay the slice:
+      // a wedged IndexedDB would otherwise hold back every frame that was
+      // already downloaded.
+      if (fileHash && !this.sliceDbDisabled) {
         try {
-          const db = await this.deps.ensureSliceCacheDB();
+          const db = await SliceService.withDeadline(
+            this.deps.ensureSliceCacheDB(),
+            SliceService.CACHE_READ_TIMEOUT_MS,
+            'Slice cache open',
+          );
           const dbKey = makeSliceCacheKey(fileHash, axis, index, timeIdx, factor);
           db.put(dbKey, persisted).catch(() => {});
           db.evictLRU().catch(() => {});
         } catch {
-          /* An unavailable disk cache must not fail a successful slice fetch. */
+          this.sliceDbDisabled = true;
         }
       }
 
       // Also store in legacy cache for backward compatibility
-      setCachedChunk(idbKey, persisted).catch(() => {});
+      if (!this.legacyCacheDisabled) {
+        setCachedChunk(idbKey, persisted).catch(() => {});
+      }
 
       this.deps.postMessage({
         id: -1,

@@ -13,6 +13,7 @@ function poolRuntime(overrides = {}) {
       }
       terminate() {}
     },
+    SLICE_REQUEST_TIMEOUT_MS: 15000,
     navigator: { hardwareConcurrency: 1 }, slicePool: null, slicePoolInit: null,
     ensureWorkerBlobUrl: async () => 'blob:ready', attachWorkerRouter: () => {},
     makeAbortError: () => Object.assign(new Error('Cancelled'), { name: 'AbortError' }),
