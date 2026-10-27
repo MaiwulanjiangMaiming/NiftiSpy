@@ -381,7 +381,11 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
       fileUrl = webview.asWebviewUri(pair.dataUri).toString();
     }
 
-    webview.html = buildViewerHtml(webview, this.context.extensionUri);
+    webview.html = buildViewerHtml(
+      webview,
+      this.context.extensionUri,
+      (this.context.extension.packageJSON as { version?: string }).version || 'unknown',
+    );
 
     webviewPanel.onDidChangeViewState(() => {
       if (webviewPanel.active) {
@@ -551,7 +555,20 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
         // chunked postMessage transfer from the stashed context.
         const fb = this.remoteHttpFallbacks.get(fallbackId);
         this.remoteHttpFallbacks.delete(fallbackId);
-        if (!fb || fb.signal.aborted) return;
+        if (!fb || fb.signal.aborted) {
+          // No stashed context: this webview was created by an earlier
+          // extension host (now restarted) or the dispatch already fell back.
+          // Silently returning left the spinner up forever, so log it and tell
+          // the webview to stop pretending it is loading.
+          this.logPerf(
+            `[remote-ssh-http] fallback requested (${String(msg.reason || 'unknown')}) but no active context for load ${fallbackId} — reopening the file is required`,
+          );
+          void webview.postMessage({
+            type: 'loadError',
+            message: 'The remote connection was interrupted. Close and reopen the file to retry.',
+          });
+          return;
+        }
         this.logPerf(
           `[remote-ssh-http] webview fetch failed (${String(msg.reason || 'unknown')}), falling back to chunked transfer`,
         );
@@ -563,6 +580,10 @@ export class NiiEditorProvider implements vscode.CustomReadonlyEditorProvider {
           fb.signal,
           fb.isGzip,
         );
+      } else if (msg.type === 'webviewLog') {
+        // Webview/worker stage trace. Only reachable from the perf channel, so
+        // a stalled fast-path load can be diagnosed after the fact.
+        this.logPerf(`[webview] ${String(msg.line || '')}`);
       } else if (msg.type === 'perfReport') {
         this.handlePerfReport(msg);
       } else if (msg.type === 'selectImage') {

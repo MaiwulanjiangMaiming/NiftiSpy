@@ -83,6 +83,8 @@ interface WorkerStreamMessage extends PreviewData {
   value?: number;
   stage?: string;
   error?: string;
+  /** Diagnostic line forwarded to the host output channel ('log' messages). */
+  line?: string;
   bytes?: number;
   durationMs?: number;
   rttMs?: number;
@@ -305,6 +307,80 @@ let remotePreviewToken = '';
 const MAX_RESIDENT_IMAGE_DATA = 4;
 const MAX_PARALLEL_VOLUME_LOADS = 2;
 const ACTIVE_FULL_LOAD_DEBOUNCE_MS = 180;
+
+// ── Fast-path stall watchdog ─────────────────────────────────────────
+// The Remote-SSH fast path fetches the port-forwarded proxy URL from a
+// Worker. When the tunnel stalls without erroring (no rejection, no timeout,
+// no message), the spinner used to stay up forever and nothing was reported
+// to the host, so its chunked-transfer fallback never ran. Any progress from
+// the worker resets this timer; silence beyond the budget falls back to the
+// host-side chunked transfer explicitly.
+const FAST_PATH_STALL_MS = 15_000;
+interface FastPathWatchdog {
+  loadId: string;
+  timer: number | null;
+  lastSignal: number;
+  fired: boolean;
+}
+let fastPathWatchdog: FastPathWatchdog | null = null;
+
+function clearFastPathWatchdog(): void {
+  if (!fastPathWatchdog) return;
+  if (fastPathWatchdog.timer !== null) window.clearTimeout(fastPathWatchdog.timer);
+  fastPathWatchdog = null;
+}
+
+/** Any byte of progress proves the tunnel is alive — reset the stall timer. */
+function noteFastPathSignal(): void {
+  if (fastPathWatchdog) fastPathWatchdog.lastSignal = Date.now();
+}
+
+function startFastPathWatchdog(loadId: string): void {
+  clearFastPathWatchdog();
+  const state: FastPathWatchdog = { loadId, timer: null, lastSignal: Date.now(), fired: false };
+  fastPathWatchdog = state;
+  const tick = (): void => {
+    if (fastPathWatchdog !== state || state.fired) return;
+    const idle = Date.now() - state.lastSignal;
+    if (idle < FAST_PATH_STALL_MS) {
+      state.timer = window.setTimeout(tick, 1000);
+      return;
+    }
+    state.fired = true;
+    const reason = `fast path stalled: no progress for ${Math.round(idle / 1000)}s`;
+    vscode.postMessage({ type: 'webviewLog', line: `[remote-ssh-http] ${reason} — falling back` });
+    vscode.postMessage({
+      type: 'remoteHttpFallback',
+      webviewId: currentWebviewId,
+      loadId,
+      reason,
+    });
+    loadingText.textContent = 'Retrying with chunked transfer...';
+    updateProgress(0.02, 'Retrying with chunked transfer...');
+    // Stop the stalled worker so it cannot race the host-side transfer.
+    volumeWorkerCancels.get(fileUrl)?.();
+    clearFastPathWatchdog();
+  };
+  state.timer = window.setTimeout(tick, 1000);
+}
+
+/** Race a promise against a deadline so a hung browser API cannot block a load. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        window.clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 let activeVolumeLoads = 0;
 type VolumeLoadPriority = 'active' | 'background';
 type VolumeLoadReason = 'user' | 'auto';
@@ -798,6 +874,8 @@ const compareRenderer = new CompareRenderer({
 const sliceWorkers: (Worker | null)[] = [];
 const AXIS_TO_WORKER_IDX: Record<Axis, number> = { axial: 0, coronal: 1, sagittal: 2 };
 let cachedBlobUrl: string | null = null;
+let blobUrlPromise: Promise<string> | null = null;
+const WORKER_SCRIPT_TIMEOUT_MS = 20_000;
 
 type WorkerPayload = Record<string, unknown> & { signal?: AbortSignal };
 
@@ -913,13 +991,35 @@ let slicePoolInit: Promise<void> | null = null;
 async function ensureWorkerBlobUrl(): Promise<string> {
   if (win.__NII_WORKER_BLOB_URL__) return win.__NII_WORKER_BLOB_URL__!;
   if (cachedBlobUrl) return cachedBlobUrl;
-  const workerResp = await fetch(win.WORKER_URL!);
-  if (!workerResp.ok) throw new Error(`Worker fetch failed: ${workerResp.status}`);
-  const workerSrc = await workerResp.text();
-  const blob = new Blob([workerSrc], { type: 'application/javascript' });
-  cachedBlobUrl = URL.createObjectURL(blob);
-  win.__NII_WORKER_BLOB_URL__ = cachedBlobUrl;
-  return cachedBlobUrl;
+  // Memoize the in-flight fetch: without this, every caller started its own
+  // request for the worker script, and a request that never settles left the
+  // volume spinner up forever (no error, no host fallback).
+  if (!blobUrlPromise) {
+    blobUrlPromise = (async () => {
+      const ctrl = new AbortController();
+      const timer = window.setTimeout(() => ctrl.abort(new Error('worker script timeout')), WORKER_SCRIPT_TIMEOUT_MS);
+      let workerSrc: string;
+      try {
+        const workerResp = await fetch(win.WORKER_URL!, { signal: ctrl.signal });
+        if (!workerResp.ok) throw new Error(`Worker fetch failed: ${workerResp.status}`);
+        workerSrc = await workerResp.text();
+      } catch (err) {
+        if (ctrl.signal.aborted) {
+          throw new Error(`Worker script load timed out after ${WORKER_SCRIPT_TIMEOUT_MS / 1000}s`);
+        }
+        throw err;
+      } finally {
+        window.clearTimeout(timer);
+      }
+      const blob = new Blob([workerSrc], { type: 'application/javascript' });
+      cachedBlobUrl = URL.createObjectURL(blob);
+      win.__NII_WORKER_BLOB_URL__ = cachedBlobUrl;
+      return cachedBlobUrl;
+    })().finally(() => {
+      blobUrlPromise = null;
+    });
+  }
+  return blobUrlPromise;
 }
 
 function attachWorkerRouter(worker: Worker) {
@@ -1227,6 +1327,9 @@ function applyImageState(img: VolumeImage, preserveSlices = false) {
 // Both worker downloads and IndexedDB restores must finish the visible UI.
 // Worker "done" only means parsing finished; the image is ready after render.
 function displayLoadedImage(img: VolumeImage): void {
+  // The volume is in memory — the fast path (if any) finished, so stop
+  // watching for a stall.
+  clearFastPathWatchdog();
   const h = img.header;
   if (isLowResPreview && lowResFactor > 1) {
     sliceIdx.axial = Math.min(h!.nz - 1, Math.round(sliceIdx.axial * lowResFactor));
@@ -1278,7 +1381,13 @@ async function loadVolumeViaWorker(
       const msg = ev.data as WorkerStreamMessage;
       if (msg.id !== requestId) return;
       if (msg.type === 'progress' || msg.type === 'preview' || msg.type === 'previewVolume') {
+        noteFastPathSignal();
         progress?.(msg);
+        return;
+      }
+      if (msg.type === 'log') {
+        noteFastPathSignal();
+        if (msg.line) vscode.postMessage({ type: 'webviewLog', line: `[worker] ${msg.line}` });
         return;
       }
       if (msg.type === 'bandwidthSample') {
@@ -1440,7 +1549,10 @@ async function ensureImageData(
       // re-downloading from the remote server.  This is what makes repeated
       // clicking between images feel instant.
       try {
-        const cached = await getVolumeCacheDB().get(loadKey);
+        // Guard against a wedged IndexedDB: open/get can hang indefinitely in a
+        // sandboxed webview, and the volume download must never wait on the
+        // cache (that hang looked exactly like a stuck fast-path load).
+        const cached = await withTimeout(getVolumeCacheDB().get(loadKey), 3000, 'Volume cache read');
         if (cached) {
           img.header = cached.header;
           img.data = makeTypedArrayFromBuffer(cached.voxelData, cached.datatype);
@@ -3819,7 +3931,9 @@ window.addEventListener('message', async (e) => {
     directUrl = ''; // force the Worker to fetch the proxy URL
     fileName = msg.fileName || fileName;
     currentLoadId = msg.loadId || currentLoadId;
-    isGzip = false;
+    // Trust the host: it knows whether this entry is gzip-backed. Falling back
+    // to the file name keeps older hosts working.
+    isGzip = msg.isGzip !== undefined ? !!msg.isGzip : fileName.endsWith('.gz');
     isRemoteSource = true;
     deferFullVolume = false;
 
@@ -3873,8 +3987,17 @@ window.addEventListener('message', async (e) => {
     updateProgress(0.02, 'Streaming volume (fast path)...', 'Stream');
     setupInteraction();
 
+    // A tunnel that goes silent must not leave the spinner up: 15s without
+    // progress reports back to the host, which resumes the chunked transfer.
+    startFastPathWatchdog(msg.loadId || currentLoadId);
+
     void ensureImageData(activeImageIdx, 'active').catch((err) => {
       if (isAbortError(err)) return;
+      clearFastPathWatchdog();
+      vscode.postMessage({
+        type: 'webviewLog',
+        line: `[remote-ssh-http] fast path failed: ${(err as Error)?.message || String(err)}`,
+      });
       vscode.postMessage({
         type: 'remoteHttpFallback',
         webviewId: currentWebviewId,

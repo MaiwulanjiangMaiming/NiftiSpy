@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 
 /** Static shell document for the custom editor; assets are loaded from dist. */
-export function buildViewerHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+export function buildViewerHtml(webview: vscode.Webview, extensionUri: vscode.Uri, version: string): string {
   const viewerUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'viewer.js'));
   const workerUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'worker.js'));
   const regWorkerUri = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, 'dist', 'regWorker.js'));
@@ -218,7 +218,7 @@ canvas{display:block;image-rendering:pixelated;cursor:crosshair}
     <p><b>A/C/S/M</b> Maximize view</p>
     <p><b>Auto</b> Auto contrast</p>
     <p><b>Reset</b> Reset all views</p>
-    <div class="ver">v2.1.4 | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
+    <div class="ver">v${version} | <a href="https://github.com/MaiwulanjiangMaiming/NiftiSpy">GitHub</a></div>
   </div>
 </div>
 <div id="a11y-announce" aria-live="polite" aria-atomic="true" style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)"></div>

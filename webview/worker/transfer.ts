@@ -58,8 +58,28 @@ const MAX_POOL_ROUNDS = 3;
 // with the tunnel for CPU and disk — so small gzip files skip the preview.
 const GZIP_PREVIEW_MIN_BYTES = 2 * 1024 * 1024;
 
+// At or below this compressed size a gzip volume is fetched with ONE range
+// request and decompressed in one pass. The parallel pool only pays off on
+// multi-MB streams; on a tunnel it adds a per-chunk round trip and an
+// ordered-feed/back-pressure bookkeeping layer that can stall a small load
+// (Remote-SSH .nii.gz spinner) while the same bytes succeed in one request.
+const SINGLE_SHOT_GZIP_MAX_BYTES = 24 * 1024 * 1024;
+
 export class TransferEngine {
   constructor(private readonly host: TransferHost) {}
+
+  /**
+   * Stage trace for the host's "NiftiSpy Performance" output channel. Sent
+   * through the worker message port (the viewer forwards it) so a stalled
+   * Remote-SSH load can be diagnosed from the extension host log alone.
+   */
+  private log(id: number, line: string): void {
+    try {
+      self.postMessage({ id, type: 'log', line });
+    } catch {
+      /* diagnostics must never break a transfer */
+    }
+  }
 
   async handleLoadVolume(
     id: number,
@@ -146,6 +166,7 @@ export class TransferEngine {
         self.postMessage({ id, type: 'progress', value: 0.9, stage: 'processing' });
       } catch (err) {
         if (isAbortError(err)) throw err;
+        this.log(id, `primary path failed (${asError(err).message}) — fallback 1`);
 
         // If direct fetch failed and we have a different proxy URL, retry via proxy
         const retryUrl = fetchUrl !== url ? url : fetchUrl;
@@ -171,6 +192,7 @@ export class TransferEngine {
           self.postMessage({ id, type: 'progress', value: 0.85, stage: 'processing' });
         } catch (err2) {
           if (isAbortError(err2)) throw err2;
+          this.log(id, `fallback 1 failed (${asError(err2).message}) — fallback 2`);
           // Fallback 2: parallel chunked download + buffer decompress
           const compressedData = await this.downloadChunked(retryUrl, id, isGzip, signal);
           self.postMessage({ id, type: 'progress', value: 0.35, stage: 'decompressing' });
@@ -856,6 +878,25 @@ export class TransferEngine {
       return probeData;
     }
 
+    // ── Small gzip: single request + single-pass decompression ──
+    // Deliberately simple: no chunk pool, no ordered feed, no resume rounds.
+    // The request is watchdog-protected and retried, so a stalled tunnel turns
+    // into an error (which the caller/fallback can act on) instead of a load
+    // that never finishes.
+    if (isGzip && hasNativeDecompress && totalSize <= SINGLE_SHOT_GZIP_MAX_BYTES) {
+      this.log(id, `gz single-shot ${totalSize}B (probe ${PROBE_SIZE}B, ${Math.round(measuredBps / 1024)}kB/s)`);
+      self.postMessage({ id, type: 'progress', value: 0.3, stage: 'downloading (single request)' });
+      const compressed = await fetchRangeBytesWithRetry(url, 0, totalSize - 1, idleMs, signal);
+      throwIfAborted(signal);
+      if (compressed.byteLength !== totalSize) {
+        throw new Error(`Short gzip download: ${compressed.byteLength}/${totalSize} bytes`);
+      }
+      self.postMessage({ id, type: 'progress', value: 0.55, stage: 'decompressing' });
+      const raw = await nativeDecompressFromBuffer(compressed, signal);
+      this.log(id, `gz single-shot done ${compressed.byteLength}B -> ${raw.byteLength}B`);
+      return raw;
+    }
+
     const settledProbe = Promise.resolve(probeData);
 
     // ── Step 2: For gzip — streaming decompress with ordered chunk feeding ──
@@ -1096,13 +1137,15 @@ export class TransferEngine {
               }
               running--;
               if (rejectIfStreamBroken()) return;
-              if (launched >= numChunks && running === 0) {
-                settle(resolve);
-              } else tryLaunch();
+              // tryLaunch() launches whatever is still allowed and settles the
+              // round once nothing is in flight — the only terminal condition.
+              // (Settling here purely on `running === 0` would cut a round
+              // short on slow links where concurrency is 1.)
+              tryLaunch();
             })();
           }
           if (rejectIfStreamBroken()) return;
-          if (launched >= numChunks && running === 0) {
+          if (running === 0) {
             settle(resolve);
           }
         };
@@ -1125,6 +1168,10 @@ export class TransferEngine {
           }
         }
         const progressBefore = fetchedIdx.size;
+        this.log(
+          id,
+          `gz pool round ${round}: chunks=${numChunks} fetched=${progressBefore} gap=${firstGapIdx} conc=${effectiveMaxConcurrent}`,
+        );
         await runPoolRound(firstGapIdx);
         if (fatalStreamError) throw fatalStreamError;
         if (fetchedIdx.size >= numChunks) break;

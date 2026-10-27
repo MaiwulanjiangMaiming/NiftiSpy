@@ -2,28 +2,47 @@
 
 All notable changes to NiftiSpy will be documented in this file.
 
+## [3.0.2] - 2026-10-27
+
+### Fixed — Remote-SSH `.nii.gz` still stalled on the fast path
+
+- Small gzip volumes (≤ 24 MB compressed) now use ONE range request plus a single-pass decompression instead of the parallel chunk pool. The pool's ordered-feed/back-pressure bookkeeping could end a round with no request in flight and no settled promise — the loading bar then waited forever with no error, which is exactly the Remote-SSH `.nii.gz` spinner (npz/parsed formats never touch that path).
+- A download round now always settles when nothing is in flight, so a failed gap chunk resumes or fails with a real error instead of hanging.
+- The webview watches the fast path for 15 s of silence and then reports back to the host, which resumes the proven chunked transfer; a stalled tunnel can no longer leave an endless spinner.
+- The worker-script fetch and the IndexedDB volume-cache read are now bounded (previously both could block a load indefinitely).
+- Fast-path gzip detection now treats the host-provided `isGzip` flag as authoritative, keeping the file-name check only as a fallback for older hosts.
+
+### Fixed — Help popup version
+
+- The help popup now prints the installed extension version (`package.json`) instead of a hard-coded `v2.1.4` string.
+
 ## [3.0.1] - 2026-10-26
 
 ### Fixed — Remote-SSH `.nii.gz`
+
 - Skip the low-resolution preview request for gzip files under 2 MB on the Remote-SSH fast path. The proxy can only answer that request after inflating the whole stream into a seekable disk cache, which competed with the tunnel for CPU and disk and delayed the first image by minutes; these files now finish the plain parallel download directly.
 - Reject the download round as soon as the streaming decompressor fails instead of waiting for chunks that can never be fed. A broken gzip now falls through to the streaming fallback with a real error instead of leaving the loading bar hanging.
 
 ## [3.0.0] - 2026-10-25
 
 ### Changed — Architecture
+
 - Split the remaining monoliths into focused modules without changing behaviour: `viewer.ts` keeps state and wiring while `viewer/interaction.ts` owns input handling; `worker.ts` keeps message routing and state while `worker/transfer.ts` owns chunked, parallel and streaming downloads; `LocalFileProxy.ts` delegates previews to `proxy/localPreview.ts`; the volume provider separates the chunk cache and the Zarr provider.
 - Replace the remaining `as unknown as` casts with typed payloads and shared `NiiHeader` handling, and add `npm run format:check` to CI so Prettier covers every source file.
 
 ### Added — Coverage
+
 - Direct tests for `GzipVolumeLoader`, `webview/worker/net.ts`, `RegistrationController`, `LocalVolumeLoader`, the HTTP range stream, and the volume-mode arcball rotation.
 
 ### Fixed — CI and packaging
+
 - Track the generated WASM bindings; a clean checkout previously failed `tsc` and `esbuild` on `./wasm/niftispy_wasm` because the directory ignored itself.
 - Replace the retired `macos-13` runner with `macos-15-intel` so the darwin-x64 binary is built and release packaging can finish.
 
 ## [2.3.3] - 2026-10-15
 
 ### Fixed — Remote loading and display
+
 - Complete the visible loading state after a Worker volume arrives or is restored from IndexedDB. The Remote-SSH fast path no longer leaves `Streaming volume (fast path)... / done...` covering a rendered image.
 - Keep the pending image and its load promise when an early preview arrives; initialize center slices when there was no usable preview and update full-volume readiness when switching images.
 - Reject cancelled volume loads so their queue slots are released instead of leaving later downloads waiting forever.
@@ -31,6 +50,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - Correct the preview-volume binary payload size and unaligned Float32 decoding, avoid applying intensity scaling twice, and keep subsampled preview headers out of full-resolution parsing.
 
 ### Improved — Remote image loading
+
 - Honor slice downsampling on the server, publish exact response dimensions, and preserve dimensions, factor, timepoint and file identity in persistent slice caches.
 - Compress Remote-SSH slice responses losslessly even when VS Code forwards a localhost port. Large responses compress asynchronously; existing `.nii.gz` file downloads are not recompressed.
 - Prefer a seekable disk cache built with native streaming gzip. Validate source identity, publish atomically, deduplicate concurrent builds, enforce a configurable disk budget with LRU eviction, and clean up failed or cancelled builds. Keep gzip indexes as the disk-limited fallback. Two new settings control this: `niftispy.remoteCacheBudgetMB` (default `4096`, `0` disables the unpacked cache) and `niftispy.remoteCacheDirectory` (empty uses the host temporary directory).
@@ -39,30 +59,36 @@ All notable changes to NiftiSpy will be documented in this file.
 - Prevent late previews from changing a file or slice position after navigation. Report server queue/read/encode timing separately from transfer/decode and viewer rendering.
 
 ### Validation
+
 - Add regression coverage for loading completion, cache lifecycle, endian/scaling/4D slices, preview persistence, navigation races, Worker pool initialization, and real proxy-to-Worker `.nii` / `.nii.gz` round trips.
 
 ### Packaging
+
 - Shrink `Icon.png` from 1024×1024 to 512×512 (297 KB) so it stays under the Marketplace's 1024 KB icon limit, and keep the unused 1 MB `File-Icons.png` out of the VSIX.
 
 ## [2.3.2] - 2026-09-09
 
 ### Changed — Gzip random access
+
 - **Correct random-access index**: the sidecar next to a `.nii.gz` now stores deflate block boundaries with leftover bits and a 32KB window, so `/slice` can inflate only the needed range instead of the whole file.
 - **One sequential inflate on the host**: the same pass produces the first axial slice, mid-plane coronal and sagittal views, a coarse strided preview volume, and the index. Repeat opens reuse `.niftispy-index`.
 - **Coronal and sagittal from one inflate walk**: scrolling Y/X no longer restarts gzip decode for every z-row. If the index cannot be built, the host decompresses once to a seekable `.niftispy-unpack.nii` sidecar instead of holding the volume in RAM for every `/slice`.
 
 ### Changed — Full volume on a remote link
+
 - **Adaptive full-volume policy** (new default): files ≤8MB and local/WSL/container opens still load the volume immediately. Medium files (8–80MB) on a healthy link debounce a background `/file` download. Files above 80MB, or a link under ~2 Mbps / RTT above 400ms, stay on `/slice` until MIP or registration asks for voxels.
 - **Scrolling preempts background downloads**: wheel and slider motion cancel auto `/file` transfers (MIP/registration loads are left alone). The proxy aborts an in-flight background stream when the client disconnects or a slice is queued.
 - **Slice prefetch follows the link**: ±1 neighbour on a slow link, ±4 when the link is fast.
 
 ### Added — 4D timepoints and Analyze pairs
+
 - **Time slider** for `dim[4] > 1`. Host header parsing now reads `nt`/`dt`; `/slice` accepts `?t=` so later volumes do not require a full 4D download.
 - **`.hdr` + `.img`**: opening an Analyze/NIfTI header looks up the sibling voxel file. Voxel I/O uses the `.img`; the header file stays 348/540 bytes.
 
 ## [2.3.1] - 2026-09-09
 
 ### Changed — Remote loading
+
 - **First axial slice paints immediately**: streaming / chunked / compressed paths no longer discard `partialPreview`. The first slice is shown as soon as it is decompressed instead of waiting for the full volume.
 - **WSL and Dev Containers stay local-fast**: `vscode.env.remoteName` is classified. WSL and Dev Containers use the local rapidgzip/mmap path; only SSH / Codespaces / Tunnels set `X-Remote-Source` and avoid pulling whole volumes by default.
 - **On-demand slices for large remote files** (≥8MB): Remote-SSH no longer downloads the whole `.nii` / `.nii.gz` across the tunnel by default. The host extracts a cheap preview on the remote disk and the webview scrolls via `/slice`. HTTP remotes follow the same preview-first path. Full volume still loads for small files, local/WSL, and when the user needs MIP/registration.
@@ -71,6 +97,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.3.0] - 2026-08-30
 
 ### Added — Image Registration (Align / To MNI)
+
 - **Intensity-based affine registration engine** (`webview/regWorker.ts`, new): a dedicated Web Worker running 9-DOF rigid+scale affine registration (translation + rotation + per-axis anisotropic scaling, no shear) in the ITK-SNAP style:
   - Physical-mm multi-resolution pyramid (≈8/5/3.5 mm levels) with per-level downsampling on BOTH images, so thin axes of anisotropic volumes (e.g. 1×1×5 mm) are never over-compressed.
   - Initialization from background-suppressed weighted centroids (COM-to-COM) plus world-space bounding-box extents for the initial scale (correct for oblique acquisitions / storage-axis swaps).
@@ -83,10 +110,12 @@ All notable changes to NiftiSpy will be documented in this file.
 - **Compare image selection**: image-list entries now have checkboxes (up to two); the Compare button uses the checked pair instead of hard-coded first-two images.
 
 ### Added — Remote-SSH HTTP Fast Path & Network Hardening
+
 - **Direct HTTP loading over forwarded ports** (`tryRemoteSshHttpLoad`): on Remote-SSH, files are served through the local proxy with `vscode.env.asExternalUri` port forwarding and fetched directly by the webview worker (native TCP stream, full tunnel bandwidth, download/decompress overlap), replacing the per-2MB-chunk RPC round-trip path. Automatic fallback to chunked transfer if the direct fetch fails.
 - **Idle-fetch watchdog in the worker**: all fetch phases (TTFB, body streaming, decompression streaming, parallel range pool) get an idle timeout (default 20 s, adaptive 5–30 s from measured RTT) with retry + exponential backoff — a frozen VPN/SSH tunnel now fails over to retry instead of hanging the load forever.
 
 ### Fixed — Rendering & Interaction
+
 - **MIP view fully rewritten — smooth roll-free trackball**: replaced the Euler-angle incremental integration (which mixed roll into the axes and left the volume wildly tilted after a few gestures) with a screen-space arcball: each gesture is a single rotation around the screen-plane axis perpendicular to the drag, composed against the pose captured at drag start, so direction is always consistent with the screen and no roll can accumulate. `computeMIP` now raycasts through a 3×3-rotated world-mm box with square output pixels (true proportions for anisotropic volumes, replacing the `dz/√(dx·dy)` aspect approximation). Dragging renders a reduced-quality preview coalesced to one render per display frame (~10× cheaper); full quality is recomputed on release.
 - **Overlay mode geometry**: overlay slices now use the same full-container canvas + physical-aspect frame + centering + pan as single-image mode, fixing images drawn outside the viewport and broken panning/click positioning. Canvas CSS size is re-synced every frame (fixes images drifting out of the container after layout changes). Per-image flip handling instead of a global flip state.
 - **Side-by-side click mapping** (four independent bugs): unified physical-aspect mapping box for both halves; click inverse-mapping honors each painter's flips; the third axis is mapped through world coordinates when the two volumes differ in extent/origin; aligned right-half clicks use the base image's voxel mapping (previously rejected by bounds checks).
@@ -98,6 +127,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **Preview factor clamp**: internal [2,8] clamp silently downgraded factor=16/32 previews back to 8 (4× extra data on slow links); now [2,32].
 
 ### Changed — Performance & Architecture
+
 - **rAF-coalesced slice scrolling**: wheel/slider redraws are coalesced to one render per axis per display frame; slice-render cache hits blit directly instead of re-running normalize+colormap; crosshair updates use cached container sizes (no forced layout in the scroll hot path).
 - **Compare render caches**: per-image slice canvases (colormap/W/L-keyed) and aligned-resample results are cached with timestamp eviction.
 - **Pipelined Remote-SSH chunked transfer**: 4 MB chunks with a 6-deep in-flight window (~6× throughput vs. awaiting each chunk round-trip); non-gzip chunks pass through raw.
@@ -105,6 +135,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **Unified GPU architecture**: all GPU paths (WebGL2 slices, WebGPU slices, volume raycasting) render offscreen and blit to the 2D display canvas; the display canvas always keeps a plain 2D context.
 
 ### Removed — Dead & Broken Paths
+
 - **OffscreenCanvas worker rendering** (worker + viewer): `transferControlToOffscreen()` irreversibly transfers canvas ownership, after which `getContext('2d')` returns null and every main-thread painter dies. The path had never worked; removed in favor of the unified private-canvas + blit architecture.
 - **Half-finished WebGPU raycasting path** in `volumeRaycaster.ts` (compute-pass result was never displayed) and the async WebGPU upgrade for `auto` backend (integer-volume incompatibilities); slice rendering stays on the equally fast WebGL2 path.
 - **HTTP/2 support in LocalFileProxy**: browsers cannot do h2c (cleartext HTTP/2), so every webview request was rejected with a protocol error; HTTP/1.1 only.
@@ -114,14 +145,17 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.2.1] - 2026-08-03
 
 ### Fixed — Remote-SSH IDE Freeze
+
 - **Stopped IDE freeze on large `.nii.gz` over Remote-SSH**: a single `postMessage` of a large `ArrayBuffer` (e.g. 142MB) serialized via structured clone on the extension-host main thread and saturated the RPC channel for the entire SSH transfer, freezing the whole IDE. Files larger than 4MB now use chunked transfer: the compressed file is read in 2MB chunks, each `postMessage`d separately with a `setImmediate` yield between chunks so other extensions, the UI, and the command palette stay responsive.
 - **Streaming decompression in the webview**: chunks are fed in order to a browser-native `DecompressionStream`, with early progress shown as data arrives. Only the compressed payload crosses the SSH tunnel (3–5× smaller than the decompressed volume).
 - **Race condition on file switch**: opening a second file mid-transfer previously let the stale `readDecompressedStream` overwrite the new volume on completion. A generation counter now aborts stale readers before render.
 
 ### Added — Debug Mode Toggle
+
 - **Interactive debug toggle in the status bar**: perf reports now default to OFF. Click the `$(bug) NiftiSpy Debug` status bar item (or run `NiftiSpy: Toggle Debug Mode` from the command palette) to turn debug mode on/off. State persists across sessions via `workspaceState`. The `niftispy.showPerfReport` setting is retained but only seeds the initial value at startup.
 
 ### Changed — Remote-SSH Dispatch
+
 - **Size-aware Remote-SSH routing**: small files (≤4MB) keep the one-shot compressed `postMessage` fast path; large files use the chunked streaming path. Local file loading is unchanged.
 
 ---
@@ -129,6 +163,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.2.0] - 2026-07-18
 
 ### Performance — Multi-Core Parallel Gzip Decompression
+
 - **Cross-platform multi-core parallel decompression for local `.nii.gz` files**: replaced the single-threaded libdeflate path with `rusty-rapidgzip`, a parallel gzip decompressor built on libdeflate's `fast_inflate` kernel. Uses a 3-stage concurrent pipeline (speculative DEFLATE block-boundary scan → multi-core decode → ordered serialize + CRC32/ISIZE validation). Works on ANY gzip file, not just pigz/BGZF with flush markers.
   - Benchmark on `recon_hr.nii.gz` (342MB compressed → 465MB decompressed): ~1150ms (zlib streaming) → ~300ms (multi-core parallel), a **3.8× speedup**.
   - Runs entirely on a libuv worker thread via napi-rs `AsyncTask`, so the extension host event loop stays responsive.
@@ -141,6 +176,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.1.4] - 2026-07-09
 
 ### Performance — Faster Loading & Switching
+
 - **Parallelized preview + full download**: `handleLoadVolume` now fires the low-res preview fetch concurrently with the full parallel download instead of awaiting it serially, saving 1-2s on first load for 100MB remote files.
 - **Anticipatory next-image preload**: the viewer speculatively loads the next image in the background after the current image finishes, so clicking "next" is instant or nearly-instant.
 - **Preconnect next-image origin**: before preloading, the viewer injects `<link rel="preconnect">` and warms the HTTP connection to the next image's origin, eliminating TCP/TLS RTT on switch.
@@ -150,6 +186,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **Fixed GPU 3D texture stale data bug**: `applyImageState` now calls `clearVolume3D()` before re-uploading, ensuring the correct image is rendered after switching.
 
 ### Performance — Low-Resolution Fast Preview
+
 - **Strided sub-sampled preview volume for .nii files**: the proxy exposes a new `/preview-volume/{id}?factor=N` endpoint that fetches only every N-th voxel in each axis via parallel RANGE requests (16-way concurrency) and returns a complete low-res Float32 volume. For a 100MB remote .nii file at factor=4, only ~1.5MB of data is transferred, giving a full three-view preview in ~1-2s instead of waiting for the entire download.
 - **Streaming gzip preview for .nii.gz files**: `streamingGunzipPreviewVolume()` in `compression.ts` stream-downloads + decompresses a .nii.gz file and extracts the sub-sampled volume as soon as enough z-slices are available (factor=8 → 12.5% of the file), then closes the HTTP connection early. This brings .nii.gz preview time down from "wait for full download" to ~2-3s for a 100MB file.
 - **`previewVolume` message in worker → viewer pipeline**: the worker fetches the low-res volume before starting the full download, sends it as a `previewVolume` message (with transferable `Float32Array`), and the viewer immediately renders all three orthogonal views with a "低分辨率预览" badge. When the full-resolution volume arrives, the viewer seamlessly replaces the preview, scales slice indices back to full-res space, and hides the badge.
@@ -161,6 +198,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.1.3] - 2026-06-20
 
 ### Performance
+
 - **Parallel range-request download for remote volumes**: replaced the single-stream GET with 16-way concurrent byte-range downloads (8MB chunks for remote, 32MB for local proxy). Bandwidth utilization jumps from ~15% to ~90% on high-latency links.
 - **1MB range probe eliminates HEAD RTT**: the worker's primary path now issues a 1MB range request to discover `Content-Length` and fetch header data in one round-trip, instead of a separate HEAD request that adds a full RTT before any data flows.
 - **Streaming decompress overlap for .nii.gz**: gzip volumes are decompressed via `DecompressionStream` concurrently with download — chunks are fed in order to the decompressor as they arrive, so decompression runs in parallel with the remaining downloads.
@@ -171,6 +209,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **`X-Remote-Source` header**: the proxy adds this header to all remote file responses so the worker can auto-tune chunk size and concurrency for local vs. remote files.
 
 ### Fixed
+
 - **Auto Contrast in Overlay/SBS modes**: clicking "Auto Contrast" had no effect in Side-by-Side mode (both images ignored W/L) and only affected the base image in Overlay mode (the overlay image ignored W/L). Both modes now correctly apply the global window/level to all images.
 - **Auto Contrast sampling for compare mode**: `autoContrast()` previously only sampled the primary volume, producing a W/L that was suboptimal for the secondary image. It now samples both volumes, normalizing each to [0,1] using its own min/max, so the computed W/L works well for both images simultaneously.
 
@@ -179,6 +218,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.1.2] - 2026-06-18
 
 ### Performance
+
 - **Local .nii.gz single-pass load**: eliminated the previous double read/decompress bug — the file is now stream-decompressed once, the z=0 preview is parsed from the same decompression pass, and the full volume is sent in the same postMessage. For a 350MB gz volume the extension host now does 1x read + 1x decompress instead of 2x of each.
 - **Native Rust fast gzip for local files**: when the native module is available, `fastDecompressGzip` (flate2) is used for the local `.nii.gz` path — typically 2-3x faster than Node.js `zlib`.
 - **Local .nii direct full read**: local `.nii` files skip the partial-read preview and use a single full `readFile` (SSD < 0.5s for 500MB) plus the native `mmapGetVolumeStats` fast-path. Preview and full volume now share the same buffer slice.
@@ -193,9 +233,11 @@ All notable changes to NiftiSpy will be documented in this file.
   - HTTP/HTTPS agents: `maxSockets` 32 → 64, `maxFreeSockets` 16 → 32.
 
 ### Fixed
+
 - **No more "strange" intermediate image on load**: the early z=0 partial preview (only axial slice, empty coronal/sagittal) is no longer rendered. The viewer now keeps the loading spinner visible and only paints when the full volume arrives. The worker flags these partial previews with `partialPreview: true`, and the webview ignores them.
 
 ### Internal
+
 - New `streamingLocalGzLoad` in `NiiEditorProvider` consolidates gzip streaming + early preview + full volume in a single pass.
 - New `sendEarlyPreviewFromHeader` / `sendEarlyPreviewFromRawData` helpers extract a z=0 slice from in-progress decompression without buffering the entire volume twice.
 - `processRawVolume` min/max and conversion paths simplified: no intermediate sampled arrays, no redundant header reparse.
@@ -207,6 +249,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.1.1] - 2026-06-08
 
 ### Fixed / Performance
+
 - **Remote image loading speed** (30-60s → 1-3s for 300MB): The remote loading path was downloading and decompressing the entire volume in the extension host before showing anything. Reworked into a two-phase pipeline:
   - Phase 1 streams just the header + z=0 slice (a few hundred KB) and renders it instantly
   - Phase 2 streams the full volume in the background via parallel ranged downloads
@@ -223,6 +266,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **CI**: bumped GitHub Actions to Node.js 20/22, added `npm test` to the matrix build, fixed the `npm ci` failure caused by a missing `package-lock.json` (now generated and committed).
 
 ### Internal
+
 - Added `getEntryIdByUri` to `LocalFileProxy` for URI-based entry lookup.
 - Removed dead `centerSliceNeeded` and `firstSliceSent` variables from `compression.ts`.
 - Replaced the manual `Promise + resolve/reject` semaphore in `downloadChunked` with a clean bounded-concurrency pool pattern.
@@ -240,6 +284,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.1.0] - 2026-06-08
 
 ### Added
+
 - **WASM SIMD acceleration path**: New `native-wasm` Rust crate compiled to `wasm32-unknown-unknown` with `wasm-bindgen`. Provides browser-side SIMD128 acceleration for:
   - Header parsing (`wasm_parse_header`)
   - Slice extraction (`wasm_extract_slice`) with SIMD-optimized Float32 fast path
@@ -254,10 +299,12 @@ All notable changes to NiftiSpy will be documented in this file.
 - **WASM-accelerated window/level**: Both `paintCanvas2d` and `SliceRenderWorker` now use `wasm.applyWindowLevel()` for SIMD128-parallel Float32→Uint8 normalization when WASM is available.
 
 ### Changed
+
 - **Status bar labels**: Updated to reflect new acceleration paths — "Native+WASM" (when native available) or "WASM+JS" (native unavailable).
 - **Fallback message**: Changed from "using JavaScript fallback" to "using WASM SIMD + JavaScript fallback".
 
 ### Architecture
+
 - **Acceleration hierarchy**:
   1. **Native** (`napi-rs`, Node.js side): mmap, batch slice extraction, volume stats — fastest, requires compiled `.node` binary
   2. **WASM SIMD** (`wasm-bindgen`, browser Worker): header parsing, slice extraction, window/level, resampling — fast, SIMD128 auto-vectorized, no native binary needed
@@ -268,6 +315,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.0.1] - 2026-06-08
 
 ### Fixed
+
 - **Header Info visibility**: Changed header panel layout from horizontal (key|val side-by-side) to vertical (key above, val below) so long values like sform matrices are fully visible in the 180px sidebar.
 - **Orientation never shows "Unknown"**: Added `computeOrientationFromQform()` that reconstructs the rotation matrix from the qform quaternion (b, c, d) when sform is unavailable. Falls back to "RAS" (NIfTI default) only when both sform_code and qform_code are 0. The `orientation` field in `parseNiiHeaderFromBuffer` now defaults to empty string instead of `'unknown'`.
 - **Tooltip system**: Implemented JavaScript-driven `data-tip` tooltip system (inspired by Project_Manager) replacing the broken CSS `::after` pseudo-element approach. Tooltips now work correctly in VS Code Webview with viewport clamping and 80ms hide delay.
@@ -276,6 +324,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **README Version section**: Simplified to show only current version number with link to CHANGELOG.
 
 ### Changed
+
 - **Orientation computation**: Now uses a 3-tier fallback: sform → qform quaternion → RAS default. Based on ITK-SNAP's `ImageCoordinateGeometry` direction cosine analysis and niivue's quaternion-to-matrix reconstruction.
 
 ---
@@ -283,6 +332,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [2.0.0] - 2026-06-08
 
 ### Added
+
 - **Measurement Tools**: New 📏 toolbar button toggles measure mode. In measure mode, click two points to draw a line measurement (distance in mm using voxelToWorld), or click-and-drag to draw a rectangle ROI (area in mm²). Measurements persist until cleared with the 🗑️ button. Overlay drawn on per-axis measurement canvases.
 - **Accessibility - ARIA Labels**: Added `role="application"` on main container, `aria-label` on all canvases (e.g., "Axial slice viewer"), sliders ("Window width", "Window level"), buttons, and sidebar. Range inputs have `role="slider"` with `aria-valuemin`, `aria-valuemax`, `aria-valuenow`.
 - **Accessibility - Keyboard Navigation**: Tab key cycles through canvases (via `tabindex="0"`). Arrow keys scroll slices when a canvas has focus. Escape key exits measure mode.
@@ -297,16 +347,19 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.10.1] - 2026-06-08
 
 ### Added
+
 - **CI/CD Pipeline**: GitHub Actions workflows for automated build, type checking, native compilation across platforms, and VSIX packaging on push/PR to main and on version tags.
 - **ESLint + Prettier**: Code quality tooling with `@typescript-eslint` parser, ESLint recommended config, and Prettier formatting. New npm scripts: `lint`, `format`, `format:check`.
 - **WebGPU MIP Rendering Path**: New WebGPU compute-based ray marching path in `VolumeRaycaster` alongside the existing WebGL2 path. Includes `isWebGPUAvailable()` async check, `initWebGPU()` initialization with WGSL compute shader, `uploadVolumeWebGPU()` for 3D texture upload, and `renderWebGPU()` for compute-based rendering. The `render()` method automatically uses WebGPU when initialized, falling back to WebGL2.
 
 ### Fixed
+
 - **Header Info Panel**: Added `max-height` and `overflow-y:auto` to the header panel and content container for proper scrolling with long content.
 - **Orientation Labels**: Replaced hardcoded orientation labels with dynamic computation from the sform matrix using ITK-SNAP's direction cosine analysis. Labels now correctly reflect the actual anatomical orientation of each view axis, accounting for flip state.
 - **Orientation in Header Panel**: When orientation is 'unknown', it is now computed from the sform matrix using the same ITK-SNAP column-based algorithm.
 
 ### Changed
+
 - **Release Notes Migration**: Removed the "Release Notes" section from README.md; all version history now lives exclusively in CHANGELOG.md.
 
 ---
@@ -314,6 +367,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.10.0] - 2026-06-08
 
 ### Added
+
 - **Keyboard Shortcuts System**: New keybindings for common actions when the NiftiSpy editor is active:
   - `Alt+Up` / `Alt+Down`: Scroll slice up/down
   - `Alt+A` / `Alt+C` / `Alt+S`: Switch to Axial / Coronal / Sagittal view
@@ -330,10 +384,12 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.9.3] - 2026-06-08
 
 ### Changed
+
 - **WebGL auto-detection**: `detectBestRenderBackend()` is now async and properly probes WebGPU via `navigator.gpu.requestAdapter()`, WebGL2 3D texture via `MAX_3D_TEXTURE_SIZE`, WebGL2 2D, and falls back to Canvas 2D. The `"auto"` config value triggers this detection; `"webgl"` and `"canvas"` still work as manual overrides.
 - **VolumeCache strict LRU eviction**: Replaced timestamp-based eviction with a proper doubly-linked list + Map LRU implementation for O(1) lookup and reordering. Added `maxEntries` limit (default 5 volumes) and `getCacheInfo()` method.
 
 ### Added
+
 - **Slice loading AbortController**: Per-axis `AbortController` in the viewer cancels stale slice requests when a new slice is requested, preventing wasted bandwidth and memory from outdated fetches. Worker `fetchSlice()` now accepts and propagates an `AbortSignal`.
 - **Cache usage status bar**: New `$(database) NiftiSpy: X/Y vol, Z MB` status bar item showing current volume cache usage.
 - **HTTP connection pooling**: Persistent `http.Agent` and `https.Agent` with keep-alive enabled for all Range requests in `readHttpPartial()`, reducing TCP connection overhead for remote file access.
@@ -343,11 +399,13 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.9.2] - 2026-06-08
 
 ### Changed
+
 - **Config namespace migration**: All configuration keys renamed from `niiFastView.*` to `niftispy.*`. Existing settings are automatically migrated on activation (global and workspace scopes).
 - **Configuration title**: Changed from "NIfTI Fast View" to "NiftiSpy".
 - **`renderBackend` default**: Changed from `"canvas"` to `"auto"`. New `"auto"` enum value selects the best available backend automatically.
 
 ### Added
+
 - **Native acceleration status bar**: Shows `$(bolt) NiftiSpy: Native` (green) when native module is loaded, or `$(code) NiftiSpy: JS` (yellow) when using JavaScript fallback.
 - **One-time fallback notification**: Shows an information message on first silent fallback to JavaScript: "NiftiSpy: Native acceleration unavailable, using JavaScript fallback. Performance may be reduced."
 - **HTTP proxy port conflict handling**: `LocalFileProxy.start()` now retries up to 3 times with incrementing port numbers when the configured port is already in use (EADDRINUSE).
@@ -355,6 +413,7 @@ All notable changes to NiftiSpy will be documented in this file.
 - **Server error logging**: Added `onError` handler to the proxy server that logs errors.
 
 ### Fixed
+
 - Port 0 (auto-assign) now works correctly with the retry logic (no retries needed for auto-assign).
 
 ---
@@ -362,11 +421,13 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.5.3] - 2026-06-03
 
 ### Added
+
 - **Rendering backend auto-selection**: New `detectBestRenderBackend()` function that probes WebGPU → WebGL2 3D texture → WebGL2 2D → Canvas 2D in priority order. The detected `renderBackend` is stored globally and used in `paintSlice()` to skip unnecessary capability checks on every frame.
 - **Performance profile detection**: `detectPerformance()` now also probes `MAX_3D_TEXTURE_SIZE` from the WebGL2 context and stores it in the `PerformanceProfile` object. This is used to decide whether 3D texture upload is feasible on the current GPU.
 - **Smart volume upload**: `tryUploadVolume3D()` now checks estimated volume size (nx × ny × nz × 4 bytes) before uploading to GPU. Volumes exceeding 1GB skip 3D texture upload entirely, preventing GPU out-of-memory crashes on large datasets.
 
 ### Changed
+
 - **paintSlice() rendering dispatch**: The rendering path selection now uses the pre-detected `renderBackend` variable instead of re-checking WebGPU availability every frame. WebGPU renderer initialization is only attempted when `renderBackend === 'webgpu'`. The 2D WebGL2 fallback path (`renderer.renderSlice()`) is always attempted for non-canvas2d backends regardless of zoom/pan state, since `renderSlice()` handles transforms via the canvas context.
 
 ---
@@ -374,6 +435,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.9.1] - 2026-06-03
 
 ### Added
+
 - **VolumeProvider abstract class v1.9.1 API**: New public methods on the `VolumeProvider` abstract class for standardized chunked volume access:
   - `getDimensions()`: Returns `{ nx, ny, nz }` of the volume.
   - `getVoxelSize()`: Returns `{ dx, dy, dz }` voxel spacing.
@@ -403,15 +465,18 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.9.0] - 2026-06-03
 
 ### Changed
+
 - **WebGPU persistent uniform buffers**: `renderSlice3D()` and `computeHistogram()` no longer create and destroy a uniform buffer every frame. Persistent buffers are created during pipeline setup and updated via `device.queue.writeBuffer()`, eliminating per-frame GPU allocation overhead.
 - **WebGPU colormap & flip support**: The `_colormap`, `_flipX`, `_flipY` parameters in `renderSlice3D()` are now fully implemented. Flip is applied in the vertex shader via UV coordinate inversion; colormap LUT textures are generated from the shared `COLORMAPS` table and uploaded to GPU on change.
 
 ### Added
+
 - **VolumeRaycaster `setConfig()`**: New method to update ray marching parameters (step size, max steps, lighting) without recreating the renderer.
 - **VolumeRaycaster `getTransferFunction()`**: New method that returns a copy of the current transfer function control points.
 - **Arcball rotation**: Volume 3D rotation now uses proper arcball rotation instead of simple Euler angles. Mouse drag is mapped onto a virtual sphere to compute rotation quaternions, providing intuitive and gimbal-lock-free 3D interaction.
 
 ### Fixed
+
 - **Rendering fallback when volume3D not ready**: `paintSlice()` now gracefully falls back to 2D rendering when the 3D volume texture is not yet uploaded (e.g., still loading), instead of skipping the 2D WebGL2 path. The zoom/pan restriction on the 2D WebGL2 fallback has been removed.
 
 ---
@@ -419,6 +484,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.5.1] - 2026-06-01
 
 ### Fixed
+
 - **Overlay display**: `paintOverlaySlice()` now correctly uses the pre-registered `data1` parameter instead of re-extracting slices via `resampleOverlaySlice()`, ensuring both images display simultaneously with proper spatial registration.
 - **SBS registration**: `paintSideBySideSlice()` now uses unified physical extent (`max(pw0, pw1)`, `max(ph0, ph1)`) for both images, ensuring consistent anatomical scale and correct crosshair alignment when comparing volumes with different resolutions or slice thickness.
 - **Auto Contrast on load**: Removed automatic data-driven window/level calculation in `handleCachedVolume()`. W/L now defaults to `[0, 1]` on initial load; users must click "Auto Contrast" to apply data-driven W/L.
@@ -428,6 +494,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.5.0] - 2026-05-30
 
 ### Added
+
 - Volume Ray Marching renderer (`webview/volumeRaycaster.ts`): `VolumeRaycaster` class implementing GPU-based 3D volume rendering using WebGL2 ray marching. Features include:
   - Ray-box intersection for bounding volume traversal
   - Front-to-back compositing with early ray termination (alpha > 0.95)
@@ -443,6 +510,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.4.1] - 2026-05-30
 
 ### Added
+
 - Rust mmap memory-mapped file I/O (`native/src/lib.rs`): `mmap_parse_header()`, `mmap_extract_slice()`, `mmap_extract_preview()` functions use `memmap2` for zero-copy file access. Memory-mapped files avoid explicit `readFile()` calls, reducing memory pressure for large NIfTI volumes.
 - Rust fast GZIP decompression (`native/src/lib.rs`): `fast_decompress_gzip()` function using `flate2::GzDecoder` with pre-allocated output buffer, providing faster decompression than Node.js `zlib.gunzipSync()`.
 - Native bridge extensions (`src/nativeBridge.ts`): new `mmapParseHeader()`, `mmapExtractSlice()`, `mmapExtractPreview()`, `fastDecompressGzip()` bindings exposed through the native bridge with automatic JSON serialization/deserialization.
@@ -453,6 +521,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.4.0] - 2026-05-30
 
 ### Added
+
 - Chunked Volume data model (`src/nifti/volumeProvider.ts`): abstract `VolumeProvider` class with 64³ chunk-based volume access. Supports `getChunksForSlice()` to identify which chunks are needed for a given slice, `extractSliceFromChunks()` to assemble slices from loaded chunks, and automatic LRU chunk eviction (max 512 chunks). `LocalVolumeProvider` extends this for local `.nii` files with on-demand chunk loading.
 - LOD Pyramid (`src/nifti/lodPyramid.ts`): `LODPyramid` class implementing progressive LOD loading strategy. LOD2 (1/4 resolution) loads in ~50ms, LOD1 (1/2 resolution) in ~200ms, LOD0 (full resolution) in ~1000ms. Each level triggers a callback for progressive rendering, providing a smooth loading experience from low-res preview to full quality.
 
@@ -461,6 +530,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.3.1] - 2026-05-30
 
 ### Added
+
 - Multi-level cache architecture with hit/miss statistics: L1 (GPU texture, managed by WebGL/WebGPU renderer), L2 (in-memory LRU `sliceCache`), L3 (IndexedDB disk cache with LRU eviction, max 500MB), L4 (remote fetch).
 - Cache statistics API (`webview/cache.ts`): `recordCacheHit()`, `recordCacheMiss()`, `recordL4Fetch()`, `getCacheStats()`, `resetCacheStats()`, `getCacheSize()` for monitoring cache effectiveness at each level.
 - IndexedDB cache touch-on-read: `getCachedChunk()` now updates the `timestamp` field on read, improving LRU accuracy for frequently accessed slices.
@@ -472,6 +542,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.3.0] - 2026-05-30
 
 ### Added
+
 - WebGPU rendering path (`webview/webgpuRenderer.ts`): new `WebGPURenderer` class that uses the WebGPU API for slice rendering when available. Automatically detects `navigator.gpu` adapter support and falls back to WebGL2 when WebGPU is not available.
 - WebGPU 3D texture: volume data uploaded as `GPUTexture` (3D, `r32float` format) with WGSL fragment shader performing GPU-side slice extraction and window/level normalization.
 - Compute Shader histogram: `WebGPURenderer.computeHistogram()` uses a WGSL compute pipeline to calculate a 256-bin intensity histogram from the 3D volume texture, enabling real-time histogram display without CPU involvement.
@@ -483,6 +554,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.2.2] - 2026-05-30
 
 ### Added
+
 - HTTP/2 multiplexed proxy: `LocalFileProxy` server upgraded from HTTP/1.1 to `http2.createServer()`, enabling concurrent multiplexed requests. Fast scrolling no longer causes request queuing; multiple slice requests are served in parallel over a single connection.
 - GZIP index for random access (`src/io/gzipIndex.ts`): zran-style GZIP index builder that scans the compressed stream once and records deflate block boundaries with 32KB sliding window snapshots. Subsequent slice requests for `.nii.gz` files use the index to decompress only the needed range, avoiding full-file decompression.
 - Indexed GZIP integration in `LocalFileProxy.handleSlice()`: when a `.nii.gz` file's GZIP index is ready, axial/coronal/sagittal slice extraction uses `extractRangeFromGzipIndex()` for direct random access. Index is built lazily in the background on first slice request.
@@ -492,6 +564,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.2.1] - 2026-05-30
 
 ### Added
+
 - SharedArrayBuffer zero-copy communication: when the browser supports `SharedArrayBuffer` (requires COOP/COEP headers), volume data is placed in a `SharedArrayBuffer` and broadcast to all Web Workers. Workers can extract slices directly from shared memory without data copying or network requests.
 - COOP/COEP headers: HTTP proxy server (`LocalFileProxy.ts`) sets `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp` response headers to enable `SharedArrayBuffer` in the extension webview.
 - COOP/COEP meta tags: `NiiEditorProvider.ts` adds `<meta http-equiv="Cross-Origin-Opener-Policy">` and `<meta http-equiv="Cross-Origin-Embedder-Policy">` tags as a fallback for environments where HTTP headers cannot be set.
@@ -502,6 +575,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.2.0] - 2026-05-28
 
 ### Added
+
 - GPU 3D texture rendering: when volume data is fully loaded, upload entire volume as `TEXTURE_3D` (R32F) to GPU. Slice scrolling becomes pure uniform update (`u_sliceIndex`), achieving 60fps+ with zero CPU data transfer.
 - 3D texture shader: `sampler3D` with `u_axis` (0=axial, 1=coronal, 2=sagittal) and `u_sliceIndex` for GPU-side slice extraction in any orientation.
 - Automatic GPU memory detection and fallback: checks `MAX_3D_TEXTURE_SIZE` and estimated memory before upload. Large volumes (>1GB) that exceed GPU limits automatically fall back to 2D texture mode.
@@ -512,6 +586,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.1.2] - 2026-05-28
 
 ### Added
+
 - IndexedDB disk cache (`webview/cache.ts`): remote file slices are cached to IndexedDB with LRU eviction (max 500MB). Repeated access to remote files loads from disk cache instead of re-downloading.
 - OffscreenCanvas support: WebGL2 renderer now attempts to use `transferControlToOffscreen()` first, moving GL context to OffscreenCanvas for reduced main thread blocking. Falls back to regular canvas context if unavailable.
 
@@ -520,9 +595,11 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.1.1] - 2026-05-28
 
 ### Changed
+
 - GPU-side window/level: WebGL2 shader now receives raw `u_windowLevel` and `u_windowWidth` uniforms and computes normalization entirely on GPU, eliminating CPU-side min/max normalization step. W/L adjustment now runs at full GPU speed with zero CPU involvement.
 
 ### Added
+
 - Predictive prefetch engine (`PredictivePrefetcher`): tracks scroll velocity per axis using exponential moving average, dynamically adjusts prefetch range (up to 15 slices forward at high velocity vs. default PRELOAD_RANGE at rest), and prioritizes forward-direction prefetching based on scroll direction.
 
 ---
@@ -530,6 +607,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.1.0] - 2026-05-28
 
 ### Added
+
 - Worker pool for parallel slice extraction (`SliceWorkerPool`) with dynamic scaling up to `min(hardwareConcurrency, 6)` workers
 - HTTP Range request support for remote NIfTI files (`readHttpPartial`)
 - Streaming HTTP gzip preview for remote `.nii.gz` files (`streamingHttpGunzipPreview`)
@@ -542,6 +620,7 @@ All notable changes to NiftiSpy will be documented in this file.
   - `src/io/compression.ts` — Gzip compression/decompression + streaming preview
 
 ### Fixed
+
 - Worker memory double-holding: in-place Float32Array conversion when `scl_slope≠1` or `scl_inter≠0`, reducing peak memory from 2x to 1x for Float32 volumes
 - Minimap coordinate inversion: fixed indicator position and click handler mapping to correctly reflect viewport position regardless of flip state
 
@@ -550,6 +629,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.0.4] - 2026-05-2x
 
 ### Fixed
+
 - Replace blocking `gunzipSync` with async `gunzip` in Worker to prevent main thread freeze
 
 ---
@@ -557,6 +637,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.0.3] - 2026-05-2x
 
 ### Fixed
+
 - Optimize `throwIfAborted` call frequency in tight loops (every 4096 iterations instead of every pixel)
 
 ---
@@ -564,6 +645,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.0.2] - 2026-05-2x
 
 ### Fixed
+
 - Worker `needsConversion` memory double-hold bug: release `rawData` reference after conversion
 
 ---
@@ -571,6 +653,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.0.1] - 2026-05-2x
 
 ### Changed
+
 - Documentation updates: Marketplace/VSX links, badges, icon sizing
 
 ---
@@ -578,6 +661,7 @@ All notable changes to NiftiSpy will be documented in this file.
 ## [1.0.0] - 2026-05-2x
 
 ### Added
+
 - Initial release of NiftiSpy
 - Side-by-side compare mode with dual crosshairs
 - Pointer info for both images

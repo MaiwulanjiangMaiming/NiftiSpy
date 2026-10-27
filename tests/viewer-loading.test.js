@@ -18,7 +18,7 @@ function viewer(overrides = {}) {
   return sourceRuntime('webview/viewer.ts', [
     'ensureImageData', 'applyImageState', 'showPartialPreviewFromMessage',
     'setPrimaryImageFromDirectPreview',
-    'setCurrentSlice', 'updateProgress', 'displayLoadedImage',
+    'setCurrentSlice', 'updateProgress', 'displayLoadedImage', 'withTimeout',
   ], {
     toFloat32Array: codec.toFloat32Array, sliceHasSignal: codec.sliceHasSignal,
     images: [image()], activeImageIdx: 0, header: null, volumeData: null,
@@ -36,6 +36,7 @@ function viewer(overrides = {}) {
     window: { setTimeout, clearTimeout },
     reprioritizeVolumeLoad: async () => {}, queueVolumeLoad: (_key, task) => task(),
     getVolumeCacheDB: () => ({ get: async () => null, put: async () => {} }),
+    clearFastPathWatchdog: noop, noteFastPathSignal: noop,
     makeTypedArrayFromBuffer: buffer => new Float32Array(buffer),
     hideLowResBadge: noop, updateFileInfo: noop, updateSliderValues: noop,
     renderAllViews: noop, updateImagePicker: noop, setupInteraction: noop,
@@ -170,6 +171,7 @@ test('terminating a volume worker settles the pending promise as AbortError', as
     nextStreamRequestId: 2000, volumeWorkers: new Map(), volumeWorkerCancels: new Map(),
     volumeLoadReasons: new Map(), activeVolumeLoadKey: 'remote',
     publishPerfMonitor: noop, bandwidthEstimator: {},
+    noteFastPathSignal: noop, vscode: { postMessage: noop },
     makeAbortError: () => Object.assign(new Error('Cancelled'), { name: 'AbortError' }),
   });
   const pending = ctx.loadVolumeViaWorker('remote', '/file/1', true);
@@ -198,6 +200,7 @@ test('cancelling a full-volume download frees a queue slot for the next image', 
     volumeWorkers: new Map(), volumeWorkerCancels: new Map(), volumeLoadReasons: new Map(),
     activeVolumeLoadKey: null, activeVolumeLoads: 0, MAX_PARALLEL_VOLUME_LOADS: 1,
     volumeLoadQueue: [], publishPerfMonitor: noop, bandwidthEstimator: {},
+    noteFastPathSignal: noop, vscode: { postMessage: noop },
     makeAbortError: () => Object.assign(new Error('Cancelled'), { name: 'AbortError' }),
   });
   const first = ctx.queueVolumeLoad('one', () => ctx.loadVolumeViaWorker('one', '/one', true));
